@@ -20,7 +20,7 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| | | | |
+| Guide settings: line colours, thickness and length, saved between runs | overlay | Codingchancer (Claude) | `codingchancer/guide-settings` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Set up:** install the Claude desktop app, open the Code tab in your `Pool_Overlay` folder (not a cloud session), run `setup.bat`, then `run.bat` with the phone mirrored. Your Claude can then run the app next to the real game.
@@ -32,7 +32,6 @@ Border rules:
 
 ## Next — Codingchancer (overlay + simulator)
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
-- [ ] **Guide settings:** line colours, thickness and length, saved between runs.
 - [ ] **Steadier guide:** less flicker between frames when the shot hasn't changed.
 
 ## Done
