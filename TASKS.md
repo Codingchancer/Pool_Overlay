@@ -20,9 +20,6 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| Real-game precision | detector | Jartartarta | `jartartarta/real-game-precision` |
-| Prediction: more cushion bounces | detector | Jartartarta | `jartartarta/more-bounces` |
-| Any cloth colour: the detector only works on blue tables; make it work on green, red, purple, etc. | detector | Jartartarta | `jartartarta/any-cloth-colour` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Real-game precision:** play with the guide on; wherever the guide's aim line, target ball or object/cue path does not sit exactly on the game's own white lines, save the frame (set `POOL_OVERLAY_DEBUG_DIR`, keep `capture.png`/`cleaned.png`) and have your Claude fix the detector. Keep real screenshots out of git (`outputs/` is ignored; the repo is public).
@@ -30,7 +27,6 @@ Border rules:
 - [ ] Ghost ring hidden when the struck ball nearly touches the cue ball: find another cue for that case.
 - [ ] Balls boxed in inside a rack can be off by ~0.5 radius.
 - [ ] Raise the synthetic pass rate (`stress_test.py --count 300`) from 283/300 towards 297+/300 without making real-game results worse.
-- [ ] **Prediction: more cushion bounces.** The object-ball and cue-ball paths now stop after one bounce (`max_bounces=1` in `collision_paths` / `predict_shot`). Follow them through 2-3 bounces (losing a little angle accuracy each time), stopping at a pocket or the first ball in the way. Check on the synthetic table that the extra segments match `fake_game`'s truth.
 - [ ] **Prediction: pot or miss.** Say whether the object ball drops: does its path reach a pocket mouth inside the jaws, or hit the jaw/cushion point? Add the result to `Detection` as a new field (e.g. `pot: "pot" | "jaw" | None` and the pocket), not by renaming fields. Drawing it (e.g. a green/red ring on the pocket) is in `capture.py`, so open a GitHub issue for Codingchancer with the field name when it's ready.
 - [ ] **Prediction: paths through other balls.** Today a path stops at the first ball in the way (orange dotted ring). Predict what happens next: the blocking ball's direction after the hit and where the original ball deflects to (same ghost-ball/90° rule as the main shot), at least one level deep. Keep `blockers` as it is; add new fields for the extra paths and tell Codingchancer so the overlay can draw them.
 
@@ -38,6 +34,9 @@ Border rules:
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
 
 ## Done
+- [x] Any cloth colour (Jartartarta, #9): the detector measured only blue (0/40 shots on green/red/purple); now it measures the cloth hue. Synthetic, 100 shots each: blue 95, green 91, red 86, brown 92, teal 92, purple 66 (test purple = ball 4's colour). Not yet checked on a real non-blue table.
+- [x] Prediction: more cushion bounces (Jartartarta, #9): live paths follow up to 3 cushions (`PATH_BOUNCES`), checked against exact truth (`fake_game.truth_path`); simulator keeps 1. Also fixed the drawn cue path ignoring the corrected cue direction (up to 7 deg off).
+- [x] Real-game precision, first round (Jartartarta, #9): guide no longer reads its own 1 px threads as the game's line, stick-butt rings are not balls, cue path rebounds off an empty cushion. Not yet re-checked live; keep saving bad frames (task stays under Next).
 - [x] Real-time overlay: ~15 guide updates/s while aiming instead of 3-5 (tracking mode, no settle wait, faster ghost search with identical results; live 12/12). Jartartarta: pull main, `detector.py` changed (speed only).
 - [x] Set up (Jartartarta): `setup.bat` + `run.bat` work on Jartartarta's Windows PC (Python 3.15.1; 71 tests OK, 19 skipped without screenshots; stress test 280/300).
 - [x] Steadier guide: on a still shot the guide is redrawn on 0 of 144 noisy frames instead of 132; real changes show on the next frame.
