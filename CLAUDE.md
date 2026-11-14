@@ -1,6 +1,15 @@
 # Pool Practice Overlay — notes for Claude
 
-Windows overlay (PySide6 + OpenCV + mss) for Miniclip 8 Ball Pool mirrored from an iPhone through an AirPlay receiver. Two people work on this repo, each with their own Claude Code session: pull before you start, keep commits small, and don't rewrite shared history.
+Windows overlay (PySide6 + OpenCV + mss) for Miniclip 8 Ball Pool mirrored from an iPhone through an AirPlay receiver. Two people work on this repo, each with their own Claude Code session (some run in the cloud on Linux and can't run the Windows overlay; real-screen testing happens on the Windows PCs).
+
+## Working together (every session follows this)
+1. At the start: `git checkout main && git pull`, then read `TASKS.md`.
+2. Claim a task before starting: move it to "In progress" in `TASKS.md` with your name and branch, commit only that edit to `main` and push it. If someone else already holds that task or area, pick another or ask.
+3. Work on your own short branch, named `<name>/<task>` (e.g. `sam/ball-detection`). Never commit code directly to `main`, never force-push `main`, never rewrite shared history.
+4. Only touch files and code in your task's area (areas are listed in `TASKS.md`). Big moves — splitting or renaming files, reformatting — get their own task and the other person is told first.
+5. Commit small, push often, and pull `main` into your branch regularly.
+6. Before merging, run the checks below; all must pass.
+7. Open a pull request, merge it within hours rather than days, then move the task to "Done" in `TASKS.md`.
 
 ## Hard rule
 It is a **visual practice aid only**. Never add code that clicks, aims, moves the mouse, sends input, or takes shots in the game.
