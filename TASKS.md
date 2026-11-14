@@ -20,7 +20,7 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| | | | |
+| Simulator spin: top, back and side spin in `pool_physics.py` + spin control | simulator | Codingchancer (Claude) | `codingchancer/simulator-spin` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Set up:** install the Claude desktop app, open the Code tab in your `Pool_Overlay` folder (not a cloud session), run `setup.bat`, then `run.bat` with the phone mirrored. Your Claude can then run the app next to the real game.
@@ -31,7 +31,6 @@ Border rules:
 - [ ] Raise the synthetic pass rate (`stress_test.py --count 300`) from 283/300 towards 297+/300 without making real-game results worse.
 
 ## Next — Codingchancer (overlay + simulator)
-- [ ] **Simulator spin:** top spin, back spin and side spin (english) in `pool_physics.py`, with a spin control in the simulator.
 - [ ] **Simulator 8-ball rules:** break, solids/stripes, turns, fouls (scratch, wrong ball first, no rail), ball in hand, win/lose on the 8.
 - [ ] **Simulator UI:** place the cue ball by hand, a power bar, show whose turn it is and which group they have.
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
