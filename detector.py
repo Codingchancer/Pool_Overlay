@@ -35,6 +35,11 @@ class Detection:
     # centre in frame pixels.
     pot: str | None = None
     pot_pocket: tuple[int, int] | None = None
+    # How far the cue stick is pulled back: the gap from the cue ball's rim
+    # to the stick's tip, in ball radii (None when no stick lies behind the
+    # cue ball). It grows as the player drags the power bar; turning it into
+    # a power percentage needs measurements from the real game.
+    stick_pull: float | None = None
     note: str = "Guide is off"
 
 
@@ -685,8 +690,116 @@ def collision_paths(cue: tuple[int, int, int], target: tuple[int, int, int],
     return approach, cue_path, object_path, (int(bx), int(by), int(br))
 
 
+# Weighted Lab distance (lightness halved, as in ``felt_distance_image``) at
+# which a pixel on the stick's line no longer looks like the cloth beside it.
+STICK_CONTRAST = 10.0
+
+
+def stick_pull(roi: np.ndarray, cue_local: tuple[float, float], aim: tuple[float, float],
+               radius: float) -> float | None:
+    """Gap from the cue ball's rim to the cue stick's tip, in ball radii.
+
+    Samples only the line behind the cue ball (opposite the aim) and two
+    lines 1.4 radii to either side of it, so each spot is compared with the
+    cloth right beside it (lighting and cloth colour do not matter). The tip
+    is where the line stops looking like cloth and keeps differing for four
+    radii (a stick is long; a ball or shadow is not). None when there is no
+    stick there, e.g. on the opponent's turn.
+    """
+    if aim is None or radius <= 0:
+        return None
+    cx, cy = cue_local
+    ux, uy = aim
+    norm = float(np.hypot(ux, uy))
+    if norm < 1e-6:
+        return None
+    ux, uy = ux / norm, uy / norm
+    height, width = roi.shape[:2]
+    # Start just outside the cue ball's shadow-darkened rim.
+    steps = np.arange(radius * 1.12, radius * 16, .5, dtype=np.float32)
+    side = radius * 1.4
+    xs = cx - ux * steps
+    ys = cy - uy * steps
+    points = [(xs, ys), (xs - uy * side, ys + ux * side), (xs + uy * side, ys - ux * side)]
+    valid = [(px >= 0) & (px <= width - 1) & (py >= 0) & (py <= height - 1) for px, py in points]
+    # The line can run off the table (the stick crosses the cushion); only
+    # the part on the cloth is used.
+    count = int(np.argmin(valid[0])) if not valid[0].all() else len(steps)
+    if count < 8:
+        return None
+    lab = []
+    for px, py in points:
+        mapx = np.clip(px[:count], 0, width - 1).reshape(1, -1).astype(np.float32)
+        mapy = np.clip(py[:count], 0, height - 1).reshape(1, -1).astype(np.float32)
+        sampled = cv2.remap(roi, mapx, mapy, cv2.INTER_LINEAR)
+        lab.append(cv2.cvtColor(sampled, cv2.COLOR_BGR2LAB)[0].astype(np.float32))
+    weights = np.array([.5, 1.0, 1.0], np.float32)
+
+    def apart(a, b):
+        return np.sqrt((((a - b) * weights) ** 2).sum(axis=1))
+
+    # A ball beside the line spoils one side; the other side is cloth. A
+    # side off the table does not count.
+    far = np.float32(1e6)
+    left = np.where(valid[1][:count], apart(lab[0], lab[1]), far)
+    right = np.where(valid[2][:count], apart(lab[0], lab[2]), far)
+    contrast = np.minimum(left, right)
+    usable = contrast < far
+    # Two limits: a firm one where the tip starts, a lower one to follow a
+    # dark stick whose colour comes close to the cloth's.
+    on = (contrast > STICK_CONTRAST) & usable
+    along = (contrast > STICK_CONTRAST * .6) & usable
+    full = int(round(radius * 4 / .5))
+    least = int(round(radius * 1.5 / .5))
+    solid = max(2, int(round(radius / .5)))
+    tip_index = None
+    for i in np.nonzero(on)[0]:
+        # The stick keeps going for four radii, or until the line leaves the
+        # table (at least 1.5 radii of it on the cloth).
+        stretch = along[i:i + full]
+        if len(stretch) < least or stretch.mean() < .85:
+            continue
+        # The tip starts a solid stretch: the cue ball's drop shadow is a
+        # short dark patch with cloth after it.
+        if on[i:i + solid].mean() < .9 and not along[i:i + least].all():
+            continue
+        if len(stretch) < full and i + full <= count:
+            continue
+        tip_index = int(i)
+        break
+    if tip_index is None:
+        return None
+    i = tip_index
+    if i == 0:
+        # Already stick at the first sample: the tip touches the cue ball.
+        return float(steps[0] / radius - 1)
+    # Sub-sample tip: where the contrast crosses halfway between the cloth
+    # just before it and the stick just after.
+    level = (float(contrast[i - 1]) + float(np.median(contrast[i:i + full]))) / 2
+    a, b = float(contrast[i - 1]), float(contrast[i])
+    frac = 0.0 if b <= a else float(np.clip((level - a) / (b - a), 0, 1))
+    tip = float(steps[i - 1] + .5 * frac)
+    return tip / radius - 1
+
+
 def predict_shot(roi: np.ndarray, table: tuple[int, int, int, int],
                  balls: list[tuple[int, int, int, str]], cue: tuple[int, int, int]) -> dict:
+    """Follow the game's aim graphics and estimate cue/object paths.
+
+    Returns a dict with aim/cue/object segments, target, ghost, blockers,
+    pot call, stick pull and a note. All coordinates are in frame pixels (the
+    same frame ``table`` is in).
+    """
+    shot = _predict_paths(roi, table, balls, cue)
+    pull = None
+    if shot.get("aim_dir") is not None:
+        ball_r = float(np.median([br for _, _, br, _ in balls])) if balls else float(cue[2])
+        pull = stick_pull(roi, (cue[0] - table[0], cue[1] - table[1]), shot["aim_dir"], ball_r)
+    return {**shot, "stick_pull": pull}
+
+
+def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
+                   balls: list[tuple[int, int, int, str]], cue: tuple[int, int, int]) -> dict:
     """Follow the game's aim graphics and estimate cue/object paths.
 
     Returns a dict with aim/cue/object segments, target, ghost, blockers and a
@@ -1576,6 +1689,6 @@ def detect(frame: np.ndarray) -> Detection:
                          cue_segments=shot["cue"], object_segments=shot["object"],
                          target=shot["target"], ghost=shot["ghost"], blockers=shot["blockers"],
                          aim_dir=shot["aim_dir"], object_dir=shot["object_dir"], cue_dir=shot["cue_dir"],
-                         pot=shot["pot"], pot_pocket=shot["pot_pocket"],
+                         pot=shot["pot"], pot_pocket=shot["pot_pocket"], stick_pull=shot["stick_pull"],
                          note=f"{shot['note']} · {len(balls)} ball candidates")
     return Detection(table=table, balls=balls, note="Table found · cue ball not confidently identified")

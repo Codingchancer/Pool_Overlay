@@ -263,6 +263,45 @@ class PotTests(unittest.TestCase):
         self.assertLessEqual(wrong, 1)
 
 
+class StickPullTests(unittest.TestCase):
+    def test_stick_pull_matches_the_truth(self):
+        errors, missing = [], 0
+        for seed in range(9000, 9040):
+            scene = fg.random_scene(seed)
+            frame, _ = fg.render(scene)
+            d = main.detect(frame)
+            if d.cue is None or d.aim_dir is None:
+                continue
+            if d.stick_pull is None:
+                missing += 1
+                continue
+            errors.append(abs(d.stick_pull - (scene.stick_pull + fg.STICK_REST)))
+        self.assertLessEqual(missing, 6)
+        self.assertLessEqual(np.median(errors), .12)
+        self.assertLessEqual(np.percentile(errors, 90), .4)
+
+    def test_no_stick_reads_none(self):
+        from dataclasses import replace
+
+        quiet = 0
+        for seed in range(9000, 9010):
+            frame, _ = fg.render(replace(fg.random_scene(seed), show_stick=False))
+            d = main.detect(frame)
+            quiet += d.stick_pull is None
+        self.assertGreaterEqual(quiet, 9)
+
+    def test_pull_grows_with_power(self):
+        from dataclasses import replace
+
+        scene = fg.random_scene(9004)
+        readings = []
+        for pull in (0.5, 1.5, 2.5, 3.5):
+            frame, _ = fg.render(replace(scene, stick_pull=pull))
+            readings.append(main.detect(frame).stick_pull)
+        self.assertTrue(all(v is not None for v in readings), readings)
+        self.assertTrue(all(b > a for a, b in zip(readings, readings[1:])), readings)
+
+
 class GameLineReaderTests(unittest.TestCase):
     def test_one_pixel_guide_thread_is_not_read_as_the_game_line(self):
         # Real frame: only a short stub of Miniclip's thick object line shows

@@ -51,6 +51,7 @@ class Scene:
     aim_degrees: float
     show_guide: bool = True
     stick_pull: float = 0.0                           # extra stick gap (in radii)
+    show_stick: bool = True                           # False: opponent's turn, no stick
     jpeg_quality: int | None = None
     blur: float = 0.0
     letterbox: float = .07
@@ -87,6 +88,10 @@ POT_DROP_RADII = .4
 POT_JAW_RADII = .5
 # How far past the end of a leg (where it meets the cushion) a pocket counts.
 POT_REACH_RADII = 6.0
+
+
+# Gap from the cue ball's rim to the stick tip at zero pull, in radii.
+STICK_REST = 1.25 - .16 - 1.0
 
 
 def pocket_holes(table):
@@ -466,27 +471,30 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     truth = solve_truth(scene)
     a = np.radians(scene.aim_degrees)
     ux, uy = float(np.cos(a)), float(np.sin(a))
-    # Cue stick behind the cue ball, with decorative rings and joints.
-    start = r * (1.25 + scene.stick_pull)
-    length = span * .52
-    steps = 48
-    for k in range(steps):
-        t0 = start + length * k / steps
-        t1 = start + length * (k + 1) / steps
-        width = r * (.32 + .45 * k / steps)
-        colour = (235, 235, 230) if k == 0 else ((70, 80, 40) if k % 9 < 6 else (160, 90, 30))
-        stroke_line(canvas, (cx - ux * t0, cy - uy * t0), (cx - ux * t1, cy - uy * t1), width, colour)
-    for frac in (.18, .31, .62, .78):
-        t = start + length * frac
-        stroke_ring(canvas, cx - ux * t, cy - uy * t, r * .42, r * .12, (200, 205, 200))
-    # Round metal joints on the shaft, about 0.8 ball radii, like the real
-    # stick's decorations (the real frame has one the detector saw as a ball).
-    for frac in (.1, .45):
-        t = start + length * frac
-        jx, jy = cx - ux * t, cy - uy * t
-        fill_disc(canvas, jx, jy, r * .8, (95, 100, 95))
-        stroke_ring(canvas, jx, jy, r * .62, r * .14, (40, 45, 40))
-        fill_disc(canvas, jx, jy, r * .3, (190, 195, 190))
+    # Cue stick behind the cue ball, with decorative rings and joints. Its
+    # tip (round cap, half its 0.32 r width) is STICK_REST + stick_pull radii
+    # from the cue ball's rim.
+    if scene.show_stick:
+        start = r * (1.25 + scene.stick_pull)
+        length = span * .52
+        steps = 48
+        for k in range(steps):
+            t0 = start + length * k / steps
+            t1 = start + length * (k + 1) / steps
+            width = r * (.32 + .45 * k / steps)
+            colour = (235, 235, 230) if k == 0 else ((70, 80, 40) if k % 9 < 6 else (160, 90, 30))
+            stroke_line(canvas, (cx - ux * t0, cy - uy * t0), (cx - ux * t1, cy - uy * t1), width, colour)
+        for frac in (.18, .31, .62, .78):
+            t = start + length * frac
+            stroke_ring(canvas, cx - ux * t, cy - uy * t, r * .42, r * .12, (200, 205, 200))
+        # Round metal joints on the shaft, about 0.8 ball radii, like the real
+        # stick's decorations (the real frame has one the detector saw as a ball).
+        for frac in (.1, .45):
+            t = start + length * frac
+            jx, jy = cx - ux * t, cy - uy * t
+            fill_disc(canvas, jx, jy, r * .8, (95, 100, 95))
+            stroke_ring(canvas, jx, jy, r * .62, r * .14, (40, 45, 40))
+            fill_disc(canvas, jx, jy, r * .3, (190, 195, 190))
     if scene.show_guide:
         stroke = max(2.0, r * .17)
         gx, gy = truth.ghost
