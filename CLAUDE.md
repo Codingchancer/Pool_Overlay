@@ -20,7 +20,7 @@ It is a **visual practice aid only**. Never add code that clicks, aims, moves th
 - `capture.py` — area **overlay**: guide drawing (`paint_guide`, `GUIDE_ALPHA`), `render_guide_layer`, `remove_overlay`, `PAINT_SETTLE`, DPI helpers.
 - `overlay.py` — area **overlay** (window) / **simulator-ui** (control panel): `Overlay` guide window, `Control` panel, `CueTracker`, background `AnalysisTask`.
 - `simulator_ui.py` — area **simulator-ui**: `ShotSimulator`, `SimCanvas`, `ScreenshotTester`.
-- `pool_physics.py` — the simulator's approximate 2D physics (no spin, no 8-ball rules; the UI and README must keep saying so).
+- `pool_physics.py` — the simulator's approximate 2D physics: follow/draw/english with the sliding/rolling model; no swerve, squirt, throw, jump or 8-ball rules (the UI and README must keep saying so).
 - `fake_game.py` — synthetic table renderer with exact truth (a test fixture, not a game).
 - `stress_test.py` — random synthetic shots vs truth (`--count 300`, `--save-failures DIR`).
 - `live_check.py` — runs the real app against the synthetic table window through UI Automation.
