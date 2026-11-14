@@ -14,10 +14,9 @@ Until `main.py` is split, all of these live in `main.py`: only one open branch a
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| | | | |
+| Split `main.py` into modules | repo | Codingchancer (Claude) | `codingchancer/split-main` |
 
 ## Next
-- [ ] **Split `main.py` into modules** (e.g. `detector.py`, `overlay.py`, `capture.py`, `simulator_ui.py`, `main.py` as the entry point). One person, one PR, no behaviour change, all tests green; everyone else pauses other code changes until it is merged, then pulls. — area: repo
 - [ ] Try the overlay on the real AirPlay mirror and note what goes wrong (needs Windows + iPhone). — area: overlay
 - [ ] Check Fit table and the guide at Windows display scaling 125% / 150%. — area: overlay
 - [ ] Ghost ring hidden when the struck ball nearly touches the cue ball: find another cue for that case. — area: detector
