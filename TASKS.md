@@ -20,6 +20,7 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
+| Shot power: measure how far the stick is pulled back from the cue ball (new `Detection` field; mapping to real power needs live frames later) | detector | Jartartarta | `jartartarta/stick-power` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Real-game precision:** play with the guide on; wherever the guide's aim line, target ball or object/cue path does not sit exactly on the game's own white lines, save the frame (set `POOL_OVERLAY_DEBUG_DIR`, keep `capture.png`/`cleaned.png`) and have your Claude fix the detector. Keep real screenshots out of git (`outputs/` is ignored; the repo is public).
