@@ -16,6 +16,136 @@ from capture import paint_guide
 from detector import Detection, collision_paths, detect, trace_bounces
 
 
+BALL_COLOURS = {
+    1: (246, 190, 31), 2: (43, 108, 196), 3: (204, 54, 55),
+    4: (122, 70, 167), 5: (230, 123, 36), 6: (42, 142, 68),
+    7: (133, 55, 45), 8: (28, 30, 36), 9: (246, 190, 31),
+    10: (43, 108, 196), 11: (204, 54, 55), 12: (122, 70, 167),
+    13: (230, 123, 36), 14: (42, 142, 68), 15: (133, 55, 45),
+}
+BREAK_POWER = 80  # percent: above this the shot is break power (see pool_physics)
+
+
+def draw_small_ball(p: QPainter, cx: float, cy: float, r: float, number: int, faded: bool = False):
+    """A numbered ball icon (solid or striped) for the scoreboard."""
+    colour = QColor(*BALL_COLOURS[number])
+    if faded:
+        colour.setAlpha(60)
+    p.setPen(QPen(QColor(30, 34, 40, 90 if faded else 200), 1)); p.setBrush(colour)
+    p.drawEllipse(QRectF(cx - r, cy - r, 2 * r, 2 * r))
+    if number >= 9:
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(245, 245, 238, 60 if faded else 255))
+        p.drawRoundedRect(QRectF(cx - r, cy - r * .42, 2 * r, r * .84), r * .3, r * .3)
+    p.setPen(QColor(15, 15, 18, 90 if faded else 255))
+    p.setFont(QFont("Arial", max(6, round(r * .9)), QFont.Weight.Bold))
+    p.drawText(QRectF(cx - r, cy - r, 2 * r, 2 * r), Qt.AlignmentFlag.AlignCenter, str(number))
+
+
+class PowerBar(QWidget):
+    """Vertical power meter: click or drag to set the power (10-100%).
+
+    The top part above ``BREAK_POWER`` is marked as break power.
+    """
+    changed = Signal(int)
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedWidth(34)
+        self.setMinimumHeight(220)
+        self.value = 68
+        self.setToolTip("Power: click or drag. The red top part is break power.")
+
+    def set_value(self, value: int):
+        value = int(min(100, max(10, value)))
+        if value != self.value:
+            self.value = value
+            self.changed.emit(value)
+            self.update()
+
+    def _bar(self) -> QRectF:
+        return QRectF(9, 8, self.width() - 18, self.height() - 16)
+
+    def _set_from(self, y: float):
+        bar = self._bar()
+        fraction = (bar.bottom() - y) / bar.height()
+        self.set_value(round(10 + 90 * min(1.0, max(0.0, fraction))))
+
+    def mousePressEvent(self, e):
+        self._set_from(e.position().y())
+
+    def mouseMoveEvent(self, e):
+        self._set_from(e.position().y())
+
+    def paintEvent(self, _):
+        p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        bar = self._bar()
+        p.setPen(QPen(QColor(70, 76, 88), 1.5)); p.setBrush(QColor(30, 34, 42))
+        p.drawRoundedRect(bar, 6, 6)
+        fraction = (self.value - 10) / 90
+        filled = QRectF(bar.left() + 2, bar.bottom() - 2 - (bar.height() - 4) * fraction,
+                        bar.width() - 4, (bar.height() - 4) * fraction)
+        colour = QColor(70, 200, 110) if self.value <= 50 else (
+            QColor(240, 200, 60) if self.value <= BREAK_POWER else QColor(235, 70, 60))
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(colour)
+        p.drawRoundedRect(filled, 4, 4)
+        # Break zone marker.
+        break_y = bar.bottom() - bar.height() * (BREAK_POWER - 10) / 90
+        p.setPen(QPen(QColor(235, 70, 60), 2)); p.drawLine(QPoint(round(bar.left()) - 5, round(break_y)),
+                                                            QPoint(round(bar.right()) + 5, round(break_y)))
+        p.end()
+
+
+class Scoreboard(QWidget):
+    """Both players' groups and remaining balls; the shooter is highlighted."""
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedHeight(54)
+        self.game = None
+
+    def set_game(self, game):
+        self.game = game
+        self.setVisible(game is not None)
+        self.update()
+
+    def paintEvent(self, _):
+        if self.game is None:
+            return
+        p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        game = self.game
+        half = self.width() / 2
+        for player in (0, 1):
+            x0 = player * half
+            box = QRectF(x0 + 4, 4, half - 8, self.height() - 8)
+            active = game.winner is None and game.turn == player
+            winner = game.winner == player
+            p.setPen(QPen(QColor(255, 200, 60) if (active or winner) else QColor(90, 96, 108), 2.5 if active or winner else 1))
+            p.setBrush(QColor(38, 44, 54) if active or winner else QColor(28, 32, 40))
+            p.drawRoundedRect(box, 8, 8)
+            group = game.groups[player]
+            if winner:
+                label = f"{game.player_name(player)} · WINS"
+            elif group is None:
+                label = f"{game.player_name(player)} · open table"
+            else:
+                label = f"{game.player_name(player)} · {'solids' if min(group) == 1 else 'stripes'}"
+            if active and game.ball_in_hand:
+                label += " · ball in hand"
+            p.setPen(QColor(240, 242, 246)); p.setFont(QFont("Arial", 10, QFont.Weight.Bold))
+            p.drawText(QRectF(box.left() + 12, box.top(), box.width() * .5, box.height()),
+                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, label)
+            # Ball icons: the player's group (potted ones faded), then the 8.
+            numbers = sorted(group) if group is not None else []
+            if group is not None and not game.remaining(player):
+                numbers = [8]
+            r = 9
+            x = box.right() - r - 14 - (len(numbers) - 1) * (2 * r + 4)
+            for number in numbers:
+                draw_small_ball(p, x, box.center().y(), r, number, faded=number not in game.on_table)
+                x += 2 * r + 4
+        p.end()
+
+
 def describe_spin(side: float, top: float) -> str:
     """Plain words for a spin setting, e.g. "40% draw · 20% right"."""
     parts = []
@@ -78,6 +208,8 @@ class SpinPad(QWidget):
 class SimCanvas(QWidget):
     # Emitted when a shot's animation has finished and the table is settled.
     shot_finished = Signal()
+    # Emitted when the aim is set by clicking the table (degrees).
+    aim_changed = Signal(float)
 
     def __init__(self):
         super().__init__()
@@ -123,13 +255,7 @@ class SimCanvas(QWidget):
         radius = max(9, min(14, int(height * .031)))
         center_y = top + height / 2
         self.cue = [left + width * .22, center_y, radius, QColor(248, 248, 242), 0]
-        palette = {
-            1: (246, 190, 31), 2: (43, 108, 196), 3: (204, 54, 55),
-            4: (122, 70, 167), 5: (230, 123, 36), 6: (42, 142, 68),
-            7: (133, 55, 45), 8: (28, 30, 36), 9: (246, 190, 31),
-            10: (43, 108, 196), 11: (204, 54, 55), 12: (122, 70, 167),
-            13: (230, 123, 36), 14: (42, 142, 68), 15: (133, 55, 45),
-        }
+        palette = BALL_COLOURS
         # Standard five-row triangle with the 8 ball in the center.
         rack_order = (1, 9, 2, 10, 8, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15)
         rack_tip_x = left + width * .72
@@ -418,20 +544,39 @@ class SimCanvas(QWidget):
                            f"{self.result.ball_collisions} ball hits · {self.result.cushion_collisions} cushion hits · potted {len(self.result.pocketed)}")
         p.end()
 
+    def aim_at(self, x: float, y: float):
+        """Point the cue at (x, y) on the table."""
+        if np.hypot(x - self.cue[0], y - self.cue[1]) < 1:
+            return
+        self.angle = float(np.degrees(np.arctan2(y - self.cue[1], x - self.cue[0])))
+        if self.game is None:
+            self.result = None
+            self.pocketed.clear()
+        self.aim_changed.emit(self.angle)
+        self.update()
+
     def mousePressEvent(self,e):
         x,y=e.position().x(),e.position().y()
+        if self.timer.isActive():
+            return
         if self.game is not None:
             # In a game only the cue ball moves by hand, and only with ball in hand.
-            if (self.game.ball_in_hand and self.game.winner is None and not self.timer.isActive()
+            if (self.game.ball_in_hand and self.game.winner is None
                     and np.hypot(x-self.cue[0],y-self.cue[1])<25):
                 self.dragging='cue'
+            elif self.game.winner is None:
+                self.dragging='aim';self.aim_at(x,y)
             return
         if np.hypot(x-self.cue[0],y-self.cue[1])<25:self.dragging='cue';return
         for i,b in enumerate(self.balls):
             if np.hypot(x-b[0],y-b[1])<25:self.dragging=i;return
+        # Empty cloth: aim there (keep the button down to fine-tune).
+        self.dragging='aim';self.aim_at(x,y)
 
     def mouseMoveEvent(self,e):
         if self.dragging is None:return
+        if self.dragging=='aim':
+            self.aim_at(e.position().x(),e.position().y());return
         left,top,w,h=self.table();x=np.clip(e.position().x(),left+24,left+w-24);y=np.clip(e.position().y(),top+24,top+h-24)
         if self.game is not None:
             if self.game.kitchen_only:
@@ -465,10 +610,14 @@ class ShotSimulator(QMainWindow):
         self.rules_box=QCheckBox('8-ball game (2 players)');self.rules_box.toggled.connect(self.set_rules)
         self.game_text=QLabel('');self.game_text.setWordWrap(True);self.game_text.setStyleSheet('font-weight:600');self.game_text.hide()
         self.canvas.shot_finished.connect(self.shot_finished)
+        self.canvas.aim_changed.connect(self.aim_from_table)
+        self.power_bar=PowerBar();self.power_bar.changed.connect(self.power_slider.setValue)
+        self.scoreboard=Scoreboard();self.scoreboard.hide()
         controls=QHBoxLayout();controls.addWidget(self.angle_text);controls.addWidget(self.slider);controls.addWidget(self.power_text);controls.addWidget(self.power_slider);controls.addWidget(self.spin_pad);controls.addWidget(self.spin_text);controls.addWidget(self.shoot_button);controls.addWidget(self.reset)
-        intro=QLabel('A full 15-ball practice table. Drag balls, set aim, power and spin, then shoot. '
-                     'Click the white spin ball where the cue tip should hit (up = follow, down = draw, '
-                     'sides = english; double-click to reset). The pink dashes show where the cue ball goes.')
+        intro=QLabel('A full 15-ball practice table. Click the cloth to aim (hold and move to fine-tune), '
+                     'drag balls to place them, set power on the bar at the left (red top = break), '
+                     'click the white spin ball where the cue tip should hit, then shoot. '
+                     'The pink dashes show where the cue ball goes.')
         intro.setWordWrap(True)
         limits=QLabel('Approximate 2D physics. Spin covers follow, draw and english off cushions; not modelled: '
                       'swerve/masse, squirt, throw and jump. The 8-ball game uses simplified 8-ball rules: '
@@ -476,10 +625,17 @@ class ShotSimulator(QMainWindow):
                       'Use it to practise angles and cue-ball control, not to predict exact results.')
         limits.setWordWrap(True);limits.setStyleSheet('color:#667085')
         layout=QVBoxLayout();layout.addWidget(intro);layout.addWidget(limits);game_row=QHBoxLayout();game_row.addWidget(self.rules_box);game_row.addWidget(self.game_text,1)
-        layout.addLayout(game_row);layout.addWidget(self.canvas);layout.addLayout(controls)
+        table_row=QHBoxLayout();table_row.addWidget(self.power_bar);table_row.addWidget(self.canvas,1)
+        layout.addLayout(game_row);layout.addWidget(self.scoreboard);layout.addLayout(table_row);layout.addLayout(controls)
         root=QWidget();root.setLayout(layout);self.setCentralWidget(root)
     def set_angle(self,value):self.canvas.angle=value;self.angle_text.setText(f'Aim: {value}°');self.canvas.update()
-    def set_power(self,value):self.canvas.power=value/100;self.power_text.setText(f'Power: {value}%'+(' (break)' if value>80 else ''));self.canvas.update()
+    def aim_from_table(self,angle):
+        # Keep the exact angle from the click; the slider shows it to the degree.
+        self.slider.blockSignals(True);self.slider.setValue(round(angle));self.slider.blockSignals(False)
+        self.angle_text.setText(f'Aim: {angle:.1f}°')
+    def set_power(self,value):
+        self.canvas.power=value/100;self.power_text.setText(f'Power: {value}%'+(' (break)' if value>BREAK_POWER else ''))
+        self.power_bar.set_value(value);self.canvas.update()
     def set_spin(self,side,top):self.canvas.spin=(side,top);self.spin_text.setText(f'Spin: {describe_spin(side,top)}');self.canvas.update()
     def shoot(self):
         self.canvas.shoot()
@@ -498,6 +654,7 @@ class ShotSimulator(QMainWindow):
         self.shoot_button.setEnabled(game is None or game.winner is None)
     def update_game_text(self):
         game=self.canvas.game
+        self.scoreboard.set_game(game)
         if game is None:
             self.game_text.hide();return
         lines=[game.last.message] if game.last else []

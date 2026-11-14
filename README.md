@@ -56,7 +56,7 @@ If the cue ball or aim ray cannot be identified confidently, the guide says so i
 
 ## Shot simulator and screenshot tester
 
-The shot simulator holds a full numbered rack. Drag balls, set aim, power and spin, then shoot (power above 80% is break power: up to about four times harder, to scatter a rack) to see ball-to-ball collisions, cushion rebounds, cloth drag and pocketing. Click the white spin ball where the cue tip should hit (up = follow, down = draw, left/right = english; double-click resets). Before the shot, pink dashes show where the cue ball goes after hitting the target ball with that spin.
+The shot simulator holds a full numbered rack. Click the cloth to aim (hold and move to fine-tune), drag balls to place them, set power on the bar left of the table, set spin, then shoot (power above 80% is break power: up to about four times harder, to scatter a rack) to see ball-to-ball collisions, cushion rebounds, cloth drag and pocketing. Click the white spin ball where the cue tip should hit (up = follow, down = draw, left/right = english; double-click resets). Before the shot, pink dashes show where the cue ball goes after hitting the target ball with that spin.
 
 It is **approximate 2D physics**:
 - an equal-mass impulse model with small energy losses;
@@ -64,7 +64,7 @@ It is **approximate 2D physics**:
 - not modelled: swerve/masse, squirt, throw between balls, jump shots;
 - 8-ball rules only in game mode, and simplified (see below).
 
-Tick **8-ball game (2 players)** to play a game instead of free practice. Player 1 breaks from behind the dashed line. Balls potted on the break keep the turn but the table stays open; the 8 on the break is spotted back. After the break, the first ball potted legally gives that player solids or stripes. You keep shooting after potting one of your own balls. Fouls give the other player ball in hand anywhere: potting the cue ball, hitting nothing, hitting the wrong ball first (or the 8 first on an open table), or no ball potted and no ball reaching a cushion. Potting the 8 after clearing your group wins; potting it earlier or with a foul loses. In game mode only the cue ball can be moved, and only with ball in hand. Not included: called pockets, push-outs, the three-foul rule.
+Tick **8-ball game (2 players)** to play a game instead of free practice. A scoreboard above the table shows each player's group and balls left, and highlights whose turn it is. Player 1 breaks from behind the dashed line. Balls potted on the break keep the turn but the table stays open; the 8 on the break is spotted back. After the break, the first ball potted legally gives that player solids or stripes. You keep shooting after potting one of your own balls. Fouls give the other player ball in hand anywhere: potting the cue ball, hitting nothing, hitting the wrong ball first (or the 8 first on an open table), or no ball potted and no ball reaching a cushion. Potting the 8 after clearing your group wins; potting it earlier or with a foul loses. In game mode only the cue ball can be moved, and only with ball in hand. Not included: called pockets, push-outs, the three-foul rule.
 
 Use it to practise angles and cue-ball control, not to predict exact outcomes. The same limits are shown in the simulator window.
 
