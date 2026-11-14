@@ -28,6 +28,9 @@ Border rules:
 - [ ] Ghost ring hidden when the struck ball nearly touches the cue ball: find another cue for that case.
 - [ ] Balls boxed in inside a rack can be off by ~0.5 radius.
 - [ ] Raise the synthetic pass rate (`stress_test.py --count 300`) from 283/300 towards 297+/300 without making real-game results worse.
+- [ ] **Prediction: more cushion bounces.** The object-ball and cue-ball paths now stop after one bounce (`max_bounces=1` in `collision_paths` / `predict_shot`). Follow them through 2-3 bounces (losing a little angle accuracy each time), stopping at a pocket or the first ball in the way. Check on the synthetic table that the extra segments match `fake_game`'s truth.
+- [ ] **Prediction: pot or miss.** Say whether the object ball drops: does its path reach a pocket mouth inside the jaws, or hit the jaw/cushion point? Add the result to `Detection` as a new field (e.g. `pot: "pot" | "jaw" | None` and the pocket), not by renaming fields. Drawing it (e.g. a green/red ring on the pocket) is in `capture.py`, so open a GitHub issue for Codingchancer with the field name when it's ready.
+- [ ] **Prediction: paths through other balls.** Today a path stops at the first ball in the way (orange dotted ring). Predict what happens next: the blocking ball's direction after the hit and where the original ball deflects to (same ghost-ball/90° rule as the main shot), at least one level deep. Keep `blockers` as it is; add new fields for the extra paths and tell Codingchancer so the overlay can draw them.
 
 ## Next — Codingchancer (overlay + simulator)
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
