@@ -21,6 +21,7 @@ Border rules:
 | Task | Area | Who | Branch |
 |---|---|---|---|
 | Real-game precision | detector | Jartartarta | `jartartarta/real-game-precision` |
+| Prediction: more cushion bounces | detector | Jartartarta | `jartartarta/more-bounces` |
 | Real-time overlay (faster guide updates). Also touches `detector.py`: faster ghost-ball search and target fit, same results. Jartartarta: pull main after it merges | overlay (+ detector speed, OK'd by Codingchancer) | Codingchancer | `codingchancer/realtime-overlay` |
 
 ## Next — Jartartarta (detector / precision)
