@@ -67,6 +67,8 @@ def simulate_shot(
     sliding_deceleration: float = 350.0,
     side_spin_decay: float = 220.0,
     cushion_friction: float = 0.2,
+    break_speed: float = 2200.0,
+    collision_passes: int = 4,
 ) -> SimulationResult:
     """Simulate a shot and return 60 Hz frames and trails for visualization.
 
@@ -76,6 +78,12 @@ def simulate_shot(
     ``spin`` is where the cue tip hits the cue ball, as (side, top), each
     -1..1 of the usable half-radius: side > 0 is right english, top > 0 is
     follow (top spin), top < 0 is draw (back spin). (0, 0) is a centre hit.
+
+    The top fifth of the power range is for breaking: above 80% power, up to
+    ``break_speed`` is added (quadratically), so shots up to 80% are unchanged
+    and full power hits about four times harder, enough to scatter a rack.
+    ``collision_passes`` resolves ball contacts several times per step, so
+    energy runs through a packed rack instead of stopping at the first ball.
     """
     if not balls:
         return SimulationResult((), (), frozenset(), 0, 0, 0.0)
@@ -95,7 +103,8 @@ def simulate_shot(
     rolls = [[0.0, 0.0] for _ in balls]
     sides = [0.0] * n
     theta = radians(angle_degrees)
-    speed = 150.0 + 480.0 * min(1.0, max(0.0, power))
+    power = min(1.0, max(0.0, power))
+    speed = 150.0 + 480.0 * power + break_speed * max(0.0, (power - .8) / .2) ** 2
     velocities[0] = [cos(theta) * speed, sin(theta) * speed]
     # A tip offset h (fraction of the radius) gives a solid ball spin with
     # surface speed 2.5 * h * speed; the usable offset is about half the radius.
@@ -227,41 +236,46 @@ def simulate_shot(
                 rail_hits += 1
                 rail_after_contact = rail_after_contact or first_contact is not None
 
-        for i in range(n):
-            if pocketed[i]:
-                continue
-            for j in range(i + 1, n):
-                if pocketed[j]:
+        for _ in range(max(1, collision_passes)):
+            resolved = False
+            for i in range(n):
+                if pocketed[i]:
                     continue
-                dx = positions[j][0] - positions[i][0]
-                dy = positions[j][1] - positions[i][1]
-                distance = hypot(dx, dy)
-                minimum = radii[i] + radii[j]
-                if distance >= minimum:
-                    continue
-                if distance < 1e-9:
-                    nx, ny, distance = 1.0, 0.0, 1e-9
-                else:
-                    nx, ny = dx / distance, dy / distance
-                overlap = minimum - distance
-                positions[i][0] -= nx * overlap * 0.5
-                positions[i][1] -= ny * overlap * 0.5
-                positions[j][0] += nx * overlap * 0.5
-                positions[j][1] += ny * overlap * 0.5
-                relative_normal = ((velocities[j][0] - velocities[i][0]) * nx
-                                   + (velocities[j][1] - velocities[i][1]) * ny)
-                if relative_normal < 0:
-                    if first_contact is None and i == 0:
-                        first_contact = balls[j].number
-                    impulse = -(1 + ball_restitution) * relative_normal * 0.5
-                    velocities[i][0] -= impulse * nx
-                    velocities[i][1] -= impulse * ny
-                    velocities[j][0] += impulse * nx
-                    velocities[j][1] += impulse * ny
-                    pair = (min(balls[i].number, balls[j].number), max(balls[i].number, balls[j].number))
-                    if pair not in counted_pairs:
-                        counted_pairs.add(pair)
-                        ball_hits += 1
+                for j in range(i + 1, n):
+                    if pocketed[j]:
+                        continue
+                    dx = positions[j][0] - positions[i][0]
+                    dy = positions[j][1] - positions[i][1]
+                    distance = hypot(dx, dy)
+                    minimum = radii[i] + radii[j]
+                    if distance >= minimum:
+                        continue
+                    if distance < 1e-9:
+                        nx, ny, distance = 1.0, 0.0, 1e-9
+                    else:
+                        nx, ny = dx / distance, dy / distance
+                    overlap = minimum - distance
+                    positions[i][0] -= nx * overlap * 0.5
+                    positions[i][1] -= ny * overlap * 0.5
+                    positions[j][0] += nx * overlap * 0.5
+                    positions[j][1] += ny * overlap * 0.5
+                    relative_normal = ((velocities[j][0] - velocities[i][0]) * nx
+                                       + (velocities[j][1] - velocities[i][1]) * ny)
+                    if relative_normal < 0:
+                        resolved = True
+                        if first_contact is None and i == 0:
+                            first_contact = balls[j].number
+                        impulse = -(1 + ball_restitution) * relative_normal * 0.5
+                        velocities[i][0] -= impulse * nx
+                        velocities[i][1] -= impulse * ny
+                        velocities[j][0] += impulse * nx
+                        velocities[j][1] += impulse * ny
+                        pair = (min(balls[i].number, balls[j].number), max(balls[i].number, balls[j].number))
+                        if pair not in counted_pairs:
+                            counted_pairs.add(pair)
+                            ball_hits += 1
+            if not resolved:
+                break
 
         if step % sample_every == 0 or step == steps - 1:
             frames.append(tuple(BallFrame(positions[i][0], positions[i][1], pocketed[i])

@@ -479,7 +479,7 @@ class ShotSimulator(QMainWindow):
         layout.addLayout(game_row);layout.addWidget(self.canvas);layout.addLayout(controls)
         root=QWidget();root.setLayout(layout);self.setCentralWidget(root)
     def set_angle(self,value):self.canvas.angle=value;self.angle_text.setText(f'Aim: {value}°');self.canvas.update()
-    def set_power(self,value):self.canvas.power=value/100;self.power_text.setText(f'Power: {value}%');self.canvas.update()
+    def set_power(self,value):self.canvas.power=value/100;self.power_text.setText(f'Power: {value}%'+(' (break)' if value>80 else ''));self.canvas.update()
     def set_spin(self,side,top):self.canvas.spin=(side,top);self.spin_text.setText(f'Spin: {describe_spin(side,top)}');self.canvas.update()
     def shoot(self):
         self.canvas.shoot()

@@ -56,7 +56,7 @@ If the cue ball or aim ray cannot be identified confidently, the guide says so i
 
 ## Shot simulator and screenshot tester
 
-The shot simulator holds a full numbered rack. Drag balls, set aim, power and spin, then shoot to see ball-to-ball collisions, cushion rebounds, cloth drag and pocketing. Click the white spin ball where the cue tip should hit (up = follow, down = draw, left/right = english; double-click resets). Before the shot, pink dashes show where the cue ball goes after hitting the target ball with that spin.
+The shot simulator holds a full numbered rack. Drag balls, set aim, power and spin, then shoot (power above 80% is break power: up to about four times harder, to scatter a rack) to see ball-to-ball collisions, cushion rebounds, cloth drag and pocketing. Click the white spin ball where the cue tip should hit (up = follow, down = draw, left/right = english; double-click resets). Before the shot, pink dashes show where the cue ball goes after hitting the target ball with that spin.
 
 It is **approximate 2D physics**:
 - an equal-mass impulse model with small energy losses;
