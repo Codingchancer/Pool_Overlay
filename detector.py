@@ -211,7 +211,12 @@ def game_line_direction(white: np.ndarray, origin: tuple[float, float], expected
     h, w = white.shape[:2]
     x0, x1 = max(0, int(ox - reach)), min(w, int(ox + reach) + 1)
     y0, y1 = max(0, int(oy - reach)), min(h, int(oy + reach) + 1)
-    ys, xs = np.nonzero(white[y0:y1, x0:x1])
+    # Miniclip's lines are solid strokes at least 2 px wide. One-pixel
+    # threads are not: the anti-aliased edge of our own guide line (yellow
+    # blended into blue felt turns pale grey) leaves exactly such a thread from
+    # the target centre, and reading it as the game's line locked the guide
+    # onto its own, wrong, angle (real frame: -123 deg instead of -110 deg).
+    ys, xs = np.nonzero(cv2.morphologyEx(white[y0:y1, x0:x1], cv2.MORPH_OPEN, np.ones((2, 2), np.uint8)))
     if xs.size == 0:
         return None
     dx, dy = xs + x0 - ox, ys + y0 - oy
@@ -325,6 +330,45 @@ def _run_peaks(angles: np.ndarray, runs: np.ndarray, minimum: float) -> list[tup
 # ball radius, real balls 0.92-1.12; both can have clean round rims.
 STICK_BALL_RIM = .5
 STICK_BALL_SIZE = .9
+# Towards the butt Miniclip's stick is nearly a ball wide, and its end cap and
+# rings are round, full ball size and have clean rims (real frame: 1.11 r,
+# rim 0.79, 1-3 px off the stick axis, ~30 r behind the cue ball). Such a
+# circle is no wider than the stick around it, while a ball lying under a
+# narrower part of the stick sticks out on both sides. A circle whose stick
+# half-width (beside it, along the axis) is at least this share of the
+# typical ball radius is taken as part of the stick (real butt ring: 0.75;
+# synthetic balls under the stick, rings included: 0.40-0.60).
+STICK_WIDTH_SHARE = .68
+
+
+def stick_half_width(distance: np.ndarray, cx: float, cy: float, ux: float, uy: float,
+                     radius: float) -> float | None:
+    """Half-width of the stick just beside a circle on its axis, in pixels.
+
+    Measured across the axis (``ux``, ``uy``) at 1.6 radii before and after
+    the circle, where it does not cover the stick. Only places where the axis
+    itself is not cloth count (the butt end may have no stick beyond it). A
+    reading wider than the ball is a neighbouring ball, not the stick, and is
+    skipped; of the rest the narrower is used.
+    ``distance`` is the float cloth-distance image. None when no stick is
+    seen beside the circle.
+    """
+    steps = np.arange(0.0, radius * 1.5, .5)
+    widths = []
+    for t in (-1.6 * radius, 1.6 * radius):
+        px, py = cx + ux * t, cy + uy * t
+        sides = []
+        for sign in (-1, 1):
+            xs = (px - sign * uy * steps).astype(np.float32)[None]
+            ys = (py + sign * ux * steps).astype(np.float32)[None]
+            profile = cv2.remap(distance, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
+            if profile[0] <= 8:
+                break
+            cloth = np.nonzero(profile <= 8)[0]
+            sides.append(float(steps[cloth[0]]) if cloth.size else float(steps[-1]))
+        if len(sides) == 2 and max(sides) < radius * 1.1:
+            widths.append(float(np.mean(sides)))
+    return min(widths) if widths else None
 
 
 def separate_cue_stick_detections(
@@ -332,6 +376,8 @@ def separate_cue_stick_detections(
     cue: tuple[int, int, int],
     aim: tuple[float, float],
     rim_open: dict[tuple[int, int], float] | None = None,
+    distance: np.ndarray | None = None,
+    offset: tuple[int, int] = (0, 0),
 ) -> list[tuple[int, int, int, str]]:
     """Drop circle-like cue-stick ornaments lying behind the tracked cue ball.
 
@@ -339,7 +385,10 @@ def separate_cue_stick_detections(
     stick lies on the opposite side. Real balls offset from that narrow stick
     axis stay in the list; the cue itself is always retained. A real ball
     lying under the stick also stays when ``rim_open`` shows a clear
-    ball-to-cloth edge around most of its rim (stick ornaments have none).
+    ball-to-cloth edge around most of its rim (stick ornaments have none),
+    unless the stick beside it is about as wide as the circle (the butt's
+    round end cap and rings; needs ``distance``, the float cloth-distance
+    image of the region starting at ``offset`` in frame pixels).
     """
     cx, cy, cr = cue
     ux, uy = aim
@@ -357,6 +406,9 @@ def separate_cue_stick_detections(
         if cr * 1.35 < behind < typical_r * 40 and across <= shaft_half_width:
             ball_like = (rim_open is not None and rim_open.get((bx, by), 0.0) >= STICK_BALL_RIM
                          and br >= typical_r * STICK_BALL_SIZE)
+            if ball_like and distance is not None:
+                width = stick_half_width(distance, bx - offset[0], by - offset[1], ux, uy, br)
+                ball_like = width is None or width < typical_r * STICK_WIDTH_SHARE
             if not ball_like:
                 continue
         kept.append((bx, by, br, kind))
@@ -591,11 +643,29 @@ def predict_shot(roi: np.ndarray, table: tuple[int, int, int, int],
             _, bx, by, br = min(touching)
             selected = (bx, by, br)
         else:
-            # Reticle sits against a cushion (or the struck ball was missed by
-            # the detector): show the game ray up to the reticle only.
             ghost_int = (int(round(gx)), int(round(gy)), int(round(ghost_frame[2])))
-            return {**empty, "aim": [((cx, cy), ghost_int[:2])], "ghost": ghost_int, "aim_dir": (ux, uy),
-                    "note": f"Aim ray matched at {angle:.1f}° · ghost ball has no object ball beside it"}
+            if not on_cushion:
+                # No ball and no cushion beside the reticle: the struck ball
+                # was probably missed, so show the game ray only.
+                return {**empty, "aim": [((cx, cy), ghost_int[:2])], "ghost": ghost_int, "aim_dir": (ux, uy),
+                        "note": f"Aim ray matched at {angle:.1f}° · ghost ball has no object ball beside it"}
+            # Reticle against a cushion: the cue ball rebounds there. Mirror
+            # the aim off each cushion the reticle touches (both in a corner)
+            # and trace on from the reticle, like the after-impact paths.
+            near = ball_r * .35
+            rx, ry = ux, uy
+            if (gx - (left + ball_r) < near and ux < 0) or (left + width - ball_r - gx < near and ux > 0):
+                rx = -ux
+            if (gy - (top + ball_r) < near and uy < 0) or (top + height - ball_r - gy < near and uy > 0):
+                ry = -uy
+            bounds = (left + ball_r, top + ball_r, left + width - ball_r, top + height - ball_r)
+            blockers: list = []
+            rebound = trace_bounces((gx, gy), (rx, ry), bounds, ball_r, max_bounces=1,
+                                    obstacles=obstacles, blocked=blockers) if (rx, ry) != (ux, uy) else []
+            return {**empty, "aim": [((cx, cy), ghost_int[:2])], "cue": rebound, "ghost": ghost_int,
+                    "blockers": blockers, "aim_dir": (ux, uy),
+                    "cue_dir": (rx, ry) if rebound else None,
+                    "note": f"Aim ray matched at {angle:.1f}° · cue ball rebounds off the cushion"}
     if selected is None:
         selected = _select_target_on_ray(roi, table, balls, cue, direction, ball_r)
         if selected is None:
@@ -633,8 +703,15 @@ def predict_shot(roi: np.ndarray, table: tuple[int, int, int, int],
             physics_obj = (fitted[0] + left - contact_point[0], fitted[1] + top - contact_point[1])
             n = float(np.hypot(*physics_obj))
             obj_dir = (physics_obj[0] / n, physics_obj[1] / n)
-    n = float(np.hypot(*physics_obj))
-    nx, ny = physics_obj[0] / n, physics_obj[1] / n
+    if object_line is not None:
+        # The game's own object line is the impact normal to a fraction of a
+        # degree; the cue ball leaves at 90 deg to it. The centre-to-centre
+        # estimate can be several degrees off (synthetic seed 253: 9 deg),
+        # which turned the fallback cue path just as far.
+        nx, ny = obj_dir
+    else:
+        n = float(np.hypot(*physics_obj))
+        nx, ny = physics_obj[0] / n, physics_obj[1] / n
     dot = ux * nx + uy * ny
     physics_cue = (ux - dot * nx, uy - dot * ny)
     cue_dir = None
@@ -1215,7 +1292,9 @@ def detect(frame: np.ndarray) -> Detection:
             local_balls = [(bx-x, by-y, br, kind) for bx, by, br, kind in balls]
             aim = aim_direction(roi, (cue_position[0]-x, cue_position[1]-y, cue_position[2]), local_balls)
             if aim:
-                balls = separate_cue_stick_detections(balls, cue_position, aim, rim_open)
+                distance = felt_distance_image(roi, cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), as_float=True)
+                balls = separate_cue_stick_detections(balls, cue_position, aim, rim_open,
+                                                      distance=distance, offset=(x, y))
             # Exactly one ball is the cue ball; other white/striped detections
             # remain valid object-ball targets under 8-ball rules.
             cue_index = min(range(len(balls)), key=lambda i: np.hypot(balls[i][0]-cue[0], balls[i][1]-cue[1]))

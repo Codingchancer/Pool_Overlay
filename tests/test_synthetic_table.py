@@ -101,6 +101,79 @@ class SyntheticRegressionTests(unittest.TestCase):
             self.assertIsNone(d.target, f"seed {seed}: {problems}")
             self.assertIsNotNone(d.aim_dir, f"seed {seed}")
 
+    def test_aim_at_empty_cushion_continues_off_the_cushion(self):
+        # The guide used to stop at the ghost ball when it sat on a cushion;
+        # the cue ball rebounds there, mirrored off that cushion.
+        checked = 0
+        for seed in range(9200, 9210):
+            *_, truth, d, problems, _ = run(seed, "miss")
+            if truth.ghost is None or d.ghost is None:
+                continue
+            left, top, width, height = truth.table
+            r, (gx, gy) = truth.radius, truth.ghost
+            a = np.radians(truth.aim_degrees)
+            ux, uy = np.cos(a), np.sin(a)
+            near = r * .2
+            if abs(gx - (left + r)) < near or abs(left + width - r - gx) < near:
+                ux = -ux
+            if abs(gy - (top + r)) < near or abs(top + height - r - gy) < near:
+                uy = -uy
+            if (ux, uy) == (np.cos(a), np.sin(a)):
+                continue
+            self.assertTrue(d.cue_segments, f"seed {seed}: no rebound · {d.note}")
+            (x1, y1), (x2, y2) = d.cue_segments[0]
+            self.assertLess(np.hypot(x1 - gx, y1 - gy), r * .5, f"seed {seed}")
+            self.assertLess(st.angle_diff(st.seg_angle(d.cue_segments[0]), np.degrees(np.arctan2(uy, ux))),
+                            2.0, f"seed {seed}")
+            checked += 1
+        self.assertGreaterEqual(checked, 5)
+
+
+class GameLineReaderTests(unittest.TestCase):
+    def test_one_pixel_guide_thread_is_not_read_as_the_game_line(self):
+        # Real frame: only a short stub of Miniclip's thick object line shows
+        # past the ball, while the anti-aliased edge of our own yellow guide
+        # left a 1 px pale thread from the same centre, 13 deg off. The reader
+        # took the thread and the guide locked onto its own wrong angle.
+        import cv2
+        import detector
+
+        r, ox, oy = 18.0, 200.0, 200.0
+        white = np.zeros((400, 400), np.uint8)
+        game, thread = np.radians(-110.0), np.radians(-123.0)
+        stub = [(ox + t * np.cos(game), oy + t * np.sin(game)) for t in (r * 1.18, r * 2.9)]
+        cv2.line(white, *[(int(round(x)), int(round(y))) for x, y in stub], 255, 4)
+        end = (int(round(ox + r * 9 * np.cos(thread))), int(round(oy + r * 9 * np.sin(thread))))
+        cv2.line(white, (int(ox), int(oy)), end, 255, 1)
+        cv2.circle(white, (int(ox), int(oy)), int(r * 1.18), 0, -1)
+        found = detector.game_line_direction(white, (ox, oy), (np.cos(game), np.sin(game)), r)
+        self.assertIsNotNone(found)
+        angle = float(np.degrees(np.arctan2(found[0][1], found[0][0])))
+        self.assertAlmostEqual(angle, -110.0, delta=2.0)
+
+
+class StickButtTests(unittest.TestCase):
+    def test_round_ring_on_a_ball_wide_butt_is_not_a_ball(self):
+        # Real frame: the butt's end rings are full ball size with clean rims,
+        # but the stick around them is as wide as they are. A ball under a
+        # thin part of the stick (as in fake_game) must stay.
+        import cv2
+        import detector
+
+        r = 18
+        cue = (900, 300, r)
+        aim = (1.0, 0.0)  # stick lies to the left of the cue ball
+        for stick_half, expect_kept in ((r * .8, False), (r * .38, True)):
+            distance = np.zeros((600, 1000), np.float32)
+            cv2.rectangle(distance, (300, int(300 - stick_half)), (900, int(300 + stick_half)), 50.0, -1)
+            ring = (400, 301, 20)
+            cv2.circle(distance, ring[:2], ring[2], 50.0, -1)
+            balls = [(*cue, "cue"), (*ring, "ball"), (600, 500, r, "ball")]
+            kept = detector.separate_cue_stick_detections(
+                balls, cue, aim, rim_open={ring[:2]: .8, (600, 500): 1.0}, distance=distance)
+            self.assertEqual((*ring, "ball") in kept, expect_kept, f"stick half-width {stick_half}")
+            self.assertIn((600, 500, r, "ball"), kept)
+
 
 class SyntheticWindowTests(unittest.TestCase):
     def test_window_shows_a_new_shot_on_demand(self):
