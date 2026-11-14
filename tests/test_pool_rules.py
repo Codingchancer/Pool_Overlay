@@ -186,10 +186,13 @@ class SimulatorGameTests(unittest.TestCase):
             def position(self):
                 return self._p
 
+        # Without ball in hand a click only aims (at the ball): nothing is picked up.
         self.canvas.mousePressEvent(Event(ball[0], ball[1]))
-        self.assertIsNone(self.canvas.dragging)
+        self.assertEqual(self.canvas.dragging, "aim")
+        self.canvas.mouseReleaseEvent(None)
         self.canvas.mousePressEvent(Event(self.canvas.cue[0], self.canvas.cue[1]))
-        self.assertIsNone(self.canvas.dragging)
+        self.assertNotEqual(self.canvas.dragging, "cue")
+        self.canvas.mouseReleaseEvent(None)
         game.ball_in_hand = True
         game.kitchen_only = True
         self.canvas.mousePressEvent(Event(self.canvas.cue[0], self.canvas.cue[1]))
@@ -212,6 +215,71 @@ class SimulatorGameTests(unittest.TestCase):
         self.window.rules_box.setChecked(False)
         self.assertIsNone(self.canvas.game)
         self.assertFalse(self.window.game_text.isVisibleTo(self.window))
+
+
+
+class FakeMouse:
+    def __init__(self, x, y):
+        self._p = type("P", (), {"x": lambda s: x, "y": lambda s: y})()
+
+    def position(self):
+        return self._p
+
+
+class SimulatorControlTests(unittest.TestCase):
+    def setUp(self):
+        self.window = main.ShotSimulator()
+        self.canvas = self.window.canvas
+
+    def tearDown(self):
+        self.canvas.timer.stop()
+        self.window.close()
+
+    def test_power_bar_and_slider_stay_in_step(self):
+        bar = self.window.power_bar
+        bar.resize(34, 300)
+        bar.mousePressEvent(FakeMouse(17, bar._bar().top()))
+        self.assertEqual(bar.value, 100)
+        self.assertEqual(self.window.power_slider.value(), 100)
+        self.assertAlmostEqual(self.canvas.power, 1.0)
+        self.assertIn("(break)", self.window.power_text.text())
+        self.window.power_slider.setValue(40)
+        self.assertEqual(bar.value, 40)
+        bar.mousePressEvent(FakeMouse(17, bar._bar().bottom() + 50))
+        self.assertEqual(bar.value, 10)
+
+    def test_clicking_the_cloth_aims_there(self):
+        cx, cy = self.canvas.cue[:2]
+        self.canvas.mousePressEvent(FakeMouse(cx + 100, cy + 100))
+        self.assertAlmostEqual(self.canvas.angle, 45.0, places=6)
+        self.assertEqual(self.window.slider.value(), 45)
+        self.assertIn("45.0", self.window.angle_text.text())
+        self.canvas.mouseMoveEvent(FakeMouse(cx, cy - 50))
+        self.assertAlmostEqual(self.canvas.angle, -90.0, places=6)
+        self.canvas.mouseReleaseEvent(None)
+        self.assertIsNone(self.canvas.dragging)
+        # Aiming does not move any ball.
+        self.assertEqual(self.canvas.cue[:2], [cx, cy])
+
+    def test_clicking_a_ball_still_drags_it_in_practice(self):
+        ball = self.canvas.balls[0]
+        self.canvas.mousePressEvent(FakeMouse(ball[0], ball[1]))
+        self.assertEqual(self.canvas.dragging, 0)
+
+    def test_scoreboard_shows_only_in_game_mode_and_follows_the_game(self):
+        self.assertFalse(self.window.scoreboard.isVisibleTo(self.window))
+        self.window.rules_box.setChecked(True)
+        board = self.window.scoreboard
+        self.assertTrue(board.isVisibleTo(self.window))
+        self.assertIs(board.game, self.canvas.game)
+        board.resize(900, 54)
+        board.repaint()  # paints without errors on an open table
+        game = self.canvas.game
+        game.apply(ShotFacts(1, (), True))
+        game.apply(ShotFacts(12, (12,), True))
+        board.repaint()  # and with groups assigned
+        self.window.rules_box.setChecked(False)
+        self.assertFalse(board.isVisibleTo(self.window))
 
 
 if __name__ == "__main__":
