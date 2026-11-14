@@ -22,6 +22,7 @@ Border rules:
 |---|---|---|---|
 | Real-game precision | detector | Jartartarta | `jartartarta/real-game-precision` |
 | Prediction: more cushion bounces | detector | Jartartarta | `jartartarta/more-bounces` |
+| Any cloth colour: the detector only works on blue tables; make it work on green, red, purple, etc. | detector | Jartartarta | `jartartarta/any-cloth-colour` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Real-game precision:** play with the guide on; wherever the guide's aim line, target ball or object/cue path does not sit exactly on the game's own white lines, save the frame (set `POOL_OVERLAY_DEBUG_DIR`, keep `capture.png`/`cleaned.png`) and have your Claude fix the detector. Keep real screenshots out of git (`outputs/` is ignored; the repo is public).
