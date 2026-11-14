@@ -180,6 +180,45 @@ class BounceTests(unittest.TestCase):
         self.assertLess(st.angle_diff(drawn, st.angle_of(d.cue_dir)), 2.0)
 
 
+class ClothColourTests(unittest.TestCase):
+    """Miniclip tables come in many colours; the detector used to assume blue
+    and found no table at all on green, red or purple cloth (0/40 shots)."""
+
+    def test_every_cloth_colour_works(self):
+        # Purple (hue 140) is the worst case: exactly the colour of ball 4,
+        # and the stick's grey rings stand out as ball-sized circles on it.
+        for cloth, least in (("green", 12), ("red", 12), ("purple", 8), ("brown", 12), ("teal", 12)):
+            results = [st.evaluate(seed, None, cloth) for seed in range(9000, 9016)]
+            passed = sum(1 for *_, problems, _ in results if not problems)
+            self.assertGreaterEqual(passed, least, f"{cloth}: only {passed}/16 frames passed")
+            worst_table = max(stats.get("table", 99.0) for *_, stats in results)
+            self.assertLessEqual(worst_table, 2.0, cloth)
+            aims = [stats["aim"] for *_, stats in results if "aim" in stats]
+            self.assertGreaterEqual(len(aims), 14, cloth)
+            self.assertLessEqual(np.median(aims), .3, cloth)
+
+    def test_cloth_hue_is_found_across_the_red_wrap(self):
+        import cv2
+        import detector
+
+        for hue in (2, 176, 60, 140, 98):
+            frame, _ = fg.render(fg.random_scene(9001, None, hue))
+            found = detector.cloth_hue(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV), step=4)
+            self.assertLess(abs(float(detector.hue_delta(found, hue))), 3.0, f"hue {hue}: {found}")
+
+    def test_same_colour_ball_is_kept_by_its_number_badge(self):
+        # Purple ball 4 on a purple table is cloth-coloured inside.
+        found = 0
+        for seed in range(9000, 9012):
+            frame, truth = fg.render(fg.random_scene(seed, None, "purple"))
+            if 4 not in truth.balls:
+                continue
+            bx, by = truth.balls[4]
+            d = main.detect(frame)
+            found += any(np.hypot(bx - x, by - y) <= truth.radius * .5 for x, y, _, _ in d.balls or [])
+        self.assertGreaterEqual(found, 8)
+
+
 class GameLineReaderTests(unittest.TestCase):
     def test_one_pixel_guide_thread_is_not_read_as_the_game_line(self):
         # Real frame: only a short stub of Miniclip's thick object line shows

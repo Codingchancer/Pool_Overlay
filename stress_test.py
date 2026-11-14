@@ -90,8 +90,8 @@ def bounce_check(segments, direction, truth, balls, true_start=None, true_dir=No
     return mech, true_deg, len(drawn)
 
 
-def evaluate(seed: int, kind: str | None = None):
-    scene = fg.random_scene(seed, kind)
+def evaluate(seed: int, kind: str | None = None, cloth: str | int = "blue"):
+    scene = fg.random_scene(seed, kind, cloth)
     frame, truth = fg.render(scene)
     d = main.detect(frame)
     r = truth.radius
@@ -256,6 +256,7 @@ def main_cli():
     parser.add_argument("--count", type=int, default=200)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--kind")
+    parser.add_argument("--cloth", default="blue", help="cloth colour: " + ", ".join(fg.CLOTH_HUES))
     parser.add_argument("--save-failures")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
@@ -263,7 +264,7 @@ def main_cli():
     categories = Counter()
     collected = {}
     for seed in range(args.start, args.start + args.count):
-        scene, frame, truth, d, problems, stats = evaluate(seed, args.kind)
+        scene, frame, truth, d, problems, stats = evaluate(seed, args.kind, args.cloth)
         for key, value in stats.items():
             collected.setdefault(key, []).append(value)
         if problems:
