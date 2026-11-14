@@ -14,6 +14,65 @@ from capture import paint_guide
 from detector import Detection, collision_paths, detect, trace_bounces
 
 
+def describe_spin(side: float, top: float) -> str:
+    """Plain words for a spin setting, e.g. "40% draw · 20% right"."""
+    parts = []
+    if abs(top) >= .05:
+        parts.append(f"{round(abs(top) * 100)}% {'follow' if top > 0 else 'draw'}")
+    if abs(side) >= .05:
+        parts.append(f"{round(abs(side) * 100)}% {'right' if side > 0 else 'left'}")
+    return " · ".join(parts) if parts else "centre"
+
+
+class SpinPad(QWidget):
+    """The cue ball seen from the shooter: click where the tip should hit it."""
+    changed = Signal(float, float)
+
+    def __init__(self):
+        super().__init__()
+        self.setFixedSize(76, 76)
+        self.side = 0.0
+        self.top = 0.0
+        self.setToolTip("Spin: click or drag where the cue tip hits the cue ball.\n"
+                        "Up = follow, down = draw, left/right = english. Double-click to reset.")
+
+    def _radius(self) -> float:
+        return min(self.width(), self.height()) / 2 - 4
+
+    def set_spin(self, side: float, top: float):
+        length = float(np.hypot(side, top))
+        if length > 1:
+            side, top = side / length, top / length
+        self.side, self.top = float(side), float(top)
+        self.changed.emit(self.side, self.top)
+        self.update()
+
+    def _set_from(self, x: float, y: float):
+        r = self._radius()
+        self.set_spin((x - self.width() / 2) / r, (self.height() / 2 - y) / r)
+
+    def mousePressEvent(self, e):
+        self._set_from(e.position().x(), e.position().y())
+
+    def mouseMoveEvent(self, e):
+        self._set_from(e.position().x(), e.position().y())
+
+    def mouseDoubleClickEvent(self, e):
+        self.set_spin(0.0, 0.0)
+
+    def paintEvent(self, _):
+        p = QPainter(self); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        cx, cy, r = self.width() / 2, self.height() / 2, self._radius()
+        p.setPen(QPen(QColor(120, 128, 140), 1.5)); p.setBrush(QColor(248, 248, 242))
+        p.drawEllipse(QRectF(cx - r, cy - r, r * 2, r * 2))
+        p.setPen(QPen(QColor(190, 196, 205), 1, Qt.PenStyle.DotLine))
+        p.drawLine(QPoint(round(cx - r), round(cy)), QPoint(round(cx + r), round(cy)))
+        p.drawLine(QPoint(round(cx), round(cy - r)), QPoint(round(cx), round(cy + r)))
+        p.setPen(QPen(QColor(120, 20, 20), 1.5)); p.setBrush(QColor(220, 40, 40))
+        p.drawEllipse(QRectF(cx + self.side * r - 5, cy - self.top * r - 5, 10, 10))
+        p.end()
+
+
 class SimCanvas(QWidget):
     def __init__(self):
         super().__init__()
@@ -22,6 +81,10 @@ class SimCanvas(QWidget):
         self.balls = []
         self.angle = 0
         self.power = 0.68
+        # Where the cue tip hits the cue ball: (side, top), each -1..1.
+        self.spin = (0.0, 0.0)
+        self._preview_key = None
+        self._preview_path = []
         self.dragging = None
         self.result = None
         self.frame_index = 0
@@ -119,6 +182,35 @@ class SimCanvas(QWidget):
                                 (left, top, width, height))
         return direction, index, paths
 
+    def spin_cue_path(self, target_index):
+        """Where the cue ball goes after hitting the target, with the chosen spin.
+
+        Runs the physics for just the cue ball and the target ball (other balls
+        are ignored, like the straight-line preview) and returns the cue ball's
+        positions from the moment of contact until it stops.
+        """
+        cx, cy, cr = self.cue[:3]
+        bx, by, br = self.balls[target_index][:3]
+        left, top, width, height = self.table()
+        key = (round(cx, 1), round(cy, 1), cr, round(bx, 1), round(by, 1), br,
+               self.angle, round(self.power, 3), self.spin, (left, top, width, height))
+        if key != self._preview_key:
+            result = simulate_shot([PhysicsBall(0, cx, cy, cr), PhysicsBall(1, bx, by, br)],
+                                   (left, top, left + width, top + height),
+                                   self.angle, self.power, spin=self.spin)
+            start = next((k for k, frame in enumerate(result.frames)
+                          if np.hypot(frame[1].x - bx, frame[1].y - by) > .5), None)
+            path = []
+            if start is not None:
+                for frame in result.frames[max(0, start - 1):]:
+                    if frame[0].pocketed:
+                        break
+                    point = (round(frame[0].x), round(frame[0].y))
+                    if not path or point != path[-1]:
+                        path.append(point)
+            self._preview_key, self._preview_path = key, path
+        return self._preview_path
+
     def shoot(self):
         left, top, width, height = self.table()
         physics_balls = [PhysicsBall(0, self.cue[0], self.cue[1], self.cue[2])]
@@ -127,7 +219,7 @@ class SimCanvas(QWidget):
         self._physics_ball_order = physics_balls[1:]
         self.pocketed_at_shot = set(self.pocketed)
         self.result = simulate_shot(physics_balls, (left, top, left + width, top + height),
-                                    self.angle, self.power)
+                                    self.angle, self.power, spin=self.spin)
         self.frame_index = 0
         if self.result.frames:
             self.timer.start()
@@ -178,11 +270,21 @@ class SimCanvas(QWidget):
                         p.drawLine(QPoint(round(a[0]), round(a[1])), QPoint(round(b[0]), round(b[1])))
         elif paths:
             approach, cue_path, object_path, _ = paths
+            # The cue ball's path after impact depends on spin, so it comes from
+            # the physics (draw, follow, english off the cushion), not a 90° line.
+            spun = self.spin_cue_path(target_index)
+            if len(spun) > 1:
+                cue_path = list(zip(spun, spun[1:]))
             for segments, color, style, stroke in (
                 (approach, QColor(45, 225, 255, 225), Qt.PenStyle.SolidLine, 3),
                 (object_path, QColor(255, 210, 55, 225), Qt.PenStyle.SolidLine, 3),
                 (cue_path, QColor(255, 70, 180, 220), Qt.PenStyle.DashLine, 2),
             ):
+                if segments is cue_path and len(spun) > 1:
+                    p.setPen(QPen(color, stroke, Qt.PenStyle.DashLine))
+                    for a, b in segments:
+                        p.drawLine(QPoint(*a), QPoint(*b))
+                    continue
                 for index, (a, b) in enumerate(segments):
                     segment_color = QColor(color)
                     if index: segment_color.setAlpha(145)
@@ -259,23 +361,28 @@ class ShotSimulator(QMainWindow):
         self.power_slider.valueChanged.connect(self.set_power)
         self.shoot_button=QPushButton('Shoot');self.shoot_button.clicked.connect(self.shoot)
         self.reset=QPushButton('Reset rack');self.reset.clicked.connect(self.reset_scene)
-        controls=QHBoxLayout();controls.addWidget(self.angle_text);controls.addWidget(self.slider);controls.addWidget(self.power_text);controls.addWidget(self.power_slider);controls.addWidget(self.shoot_button);controls.addWidget(self.reset)
-        intro=QLabel('A full 15-ball practice table. Drag balls, set aim and power, then shoot. '
-                     'Ball collisions, cushion rebounds, cloth drag and pockets run without a phone or game feed.')
+        self.spin_pad=SpinPad();self.spin_text=QLabel('Spin: centre');self.spin_text.setMinimumWidth(150)
+        self.spin_pad.changed.connect(self.set_spin)
+        controls=QHBoxLayout();controls.addWidget(self.angle_text);controls.addWidget(self.slider);controls.addWidget(self.power_text);controls.addWidget(self.power_slider);controls.addWidget(self.spin_pad);controls.addWidget(self.spin_text);controls.addWidget(self.shoot_button);controls.addWidget(self.reset)
+        intro=QLabel('A full 15-ball practice table. Drag balls, set aim, power and spin, then shoot. '
+                     'Click the white spin ball where the cue tip should hit (up = follow, down = draw, '
+                     'sides = english; double-click to reset). The pink dashes show where the cue ball goes.')
         intro.setWordWrap(True)
-        limits=QLabel('Approximate 2D physics: no spin, english, swerve or jump, and no 8-ball rules '
-                      '(fouls, solids/stripes, turns). Use it to practise angles, not to predict exact results.')
+        limits=QLabel('Approximate 2D physics. Spin covers follow, draw and english off cushions; not modelled: '
+                      'swerve/masse, squirt, throw and jump. No 8-ball rules (fouls, solids/stripes, turns). '
+                      'Use it to practise angles and cue-ball control, not to predict exact results.')
         limits.setWordWrap(True);limits.setStyleSheet('color:#667085')
         layout=QVBoxLayout();layout.addWidget(intro);layout.addWidget(limits);layout.addWidget(self.canvas);layout.addLayout(controls)
         root=QWidget();root.setLayout(layout);self.setCentralWidget(root)
     def set_angle(self,value):self.canvas.angle=value;self.angle_text.setText(f'Aim: {value}°');self.canvas.update()
-    def set_power(self,value):self.canvas.power=value/100;self.power_text.setText(f'Power: {value}%')
+    def set_power(self,value):self.canvas.power=value/100;self.power_text.setText(f'Power: {value}%');self.canvas.update()
+    def set_spin(self,side,top):self.canvas.spin=(side,top);self.spin_text.setText(f'Spin: {describe_spin(side,top)}');self.canvas.update()
     def shoot(self):
         self.canvas.shoot()
         self.shoot_button.setEnabled(False)
         QTimer.singleShot(max(500, len(self.canvas.result.frames)*16 + 80),lambda:self.shoot_button.setEnabled(True))
     def reset_scene(self):
-        self.canvas.reset_rack();self.slider.setValue(0);self.power_slider.setValue(68);self.shoot_button.setEnabled(True)
+        self.canvas.reset_rack();self.slider.setValue(0);self.power_slider.setValue(68);self.spin_pad.set_spin(0.0,0.0);self.shoot_button.setEnabled(True)
 
     def closeEvent(self, event):
         self.closed.emit()

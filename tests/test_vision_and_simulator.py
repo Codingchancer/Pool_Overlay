@@ -124,9 +124,30 @@ class CueSeparationTests(unittest.TestCase):
     def test_simulator_states_its_physics_limits(self):
         window = main.ShotSimulator()
         texts = " ".join(label.text() for label in window.findChildren(main.QLabel))
-        self.assertIn("no spin", texts)
+        self.assertIn("swerve", texts)
         self.assertIn("8-ball rules", texts)
         window.close()
+
+    def test_spin_pad_sets_the_simulator_spin_and_preview(self):
+        window = main.ShotSimulator()
+        try:
+            window.spin_pad.set_spin(0.0, -1.0)
+            self.assertEqual(window.canvas.spin, (0.0, -1.0))
+            self.assertIn("100% draw", window.spin_text.text())
+            canvas = window.canvas
+            _, target, _ = canvas.first_hit()
+            self.assertIsNotNone(target)
+            draw = canvas.spin_cue_path(target)
+            window.spin_pad.set_spin(0.0, 1.0)
+            follow = canvas.spin_cue_path(target)
+            # Aiming right at the rack: draw ends left of follow.
+            self.assertLess(draw[-1][0], follow[-1][0])
+            window.spin_pad.set_spin(3.0, 4.0)  # outside the ball: clamped to its edge
+            self.assertAlmostEqual(float(np.hypot(*window.canvas.spin)), 1.0, places=6)
+            window.reset_scene()
+            self.assertEqual(window.canvas.spin, (0.0, 0.0))
+        finally:
+            window.close()
 
     @needs_screenshots
     def test_screenshot_tester_can_switch_to_earlier_screenshot(self):

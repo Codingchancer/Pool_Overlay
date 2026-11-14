@@ -56,14 +56,15 @@ If the cue ball or aim ray cannot be identified confidently, the guide says so i
 
 ## Shot simulator and screenshot tester
 
-The shot simulator holds a full numbered rack. Drag balls, set aim and power, then shoot to see ball-to-ball collisions, cushion rebounds, cloth drag and pocketing.
+The shot simulator holds a full numbered rack. Drag balls, set aim, power and spin, then shoot to see ball-to-ball collisions, cushion rebounds, cloth drag and pocketing. Click the white spin ball where the cue tip should hit (up = follow, down = draw, left/right = english; double-click resets). Before the shot, pink dashes show where the cue ball goes after hitting the target ball with that spin.
 
 It is **approximate 2D physics**:
 - an equal-mass impulse model with small energy losses;
-- no spin, english, swerve or jump;
+- spin with the standard sliding/rolling ball model: a centre hit slides, then rolls; top spin follows through, back spin draws back; side spin (english) changes the angle off cushions;
+- not modelled: swerve/masse, squirt, throw between balls, jump shots;
 - no 8-ball rules (fouls, solids/stripes, turns).
 
-Use it to practise angles, not to predict exact outcomes. The same limits are shown in the simulator window.
+Use it to practise angles and cue-ball control, not to predict exact outcomes. The same limits are shown in the simulator window.
 
 The screenshot tester opens with a clean table from [Miniclip's aiming guide](https://support.miniclip.com/hc/en-us/articles/203747546-How-to-Aim-with-the-Cue-8-Ball-Pool). **Earlier table sample** loads a full screenshot of a real table. **Open screenshot…** checks any saved image without AirPlay. It draws exactly what the live overlay would draw.
 

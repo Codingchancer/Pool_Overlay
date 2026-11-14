@@ -20,7 +20,7 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| Simulator spin: top, back and side spin in `pool_physics.py` + spin control | simulator | Codingchancer (Claude) | `codingchancer/simulator-spin` |
+| | | | |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Set up:** install the Claude desktop app, open the Code tab in your `Pool_Overlay` folder (not a cloud session), run `setup.bat`, then `run.bat` with the phone mirrored. Your Claude can then run the app next to the real game.
@@ -38,6 +38,7 @@ Border rules:
 - [ ] **Steadier guide:** less flicker between frames when the shot hasn't changed.
 
 ## Done
+- [x] Simulator spin: follow, draw and english (sliding/rolling model), spin ball control, physics-based cue-ball preview.
 - [x] Split `main.py` into `detector.py`, `capture.py`, `overlay.py`, `simulator_ui.py` (no behaviour change: 45 tests, identical stress-test output, live 8/8).
 - [x] Detector rework, capture-safe guide, synthetic table + stress/live tests (283/300 synthetic, 23/23 live).
 - [x] Public repo without personal screenshots.
