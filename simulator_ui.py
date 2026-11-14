@@ -7,8 +7,10 @@ import cv2
 import numpy as np
 from PySide6.QtCore import Qt, QTimer, QPoint, QRectF, Signal
 from PySide6.QtGui import QColor, QPainter, QPen, QFont, QImage
-from PySide6.QtWidgets import QWidget, QMainWindow, QPushButton, QLabel, QVBoxLayout, QHBoxLayout, QSlider, QFileDialog
+from PySide6.QtWidgets import (QWidget, QMainWindow, QPushButton, QLabel, QVBoxLayout, QHBoxLayout, QSlider,
+                               QFileDialog, QCheckBox)
 from pool_physics import Ball as PhysicsBall, simulate_shot
+from pool_rules import EIGHT, EightBallGame, ShotFacts
 
 from capture import paint_guide
 from detector import Detection, collision_paths, detect, trace_bounces
@@ -74,9 +76,16 @@ class SpinPad(QWidget):
 
 
 class SimCanvas(QWidget):
+    # Emitted when a shot's animation has finished and the table is settled.
+    shot_finished = Signal()
+
     def __init__(self):
         super().__init__()
         self.setMinimumSize(860, 500)
+        # None = free practice (drag anything); an EightBallGame = two-player rules.
+        self.game: EightBallGame | None = None
+        self._outcome = None
+        self._finished = True
         self.cue = [0.0, 0.0, 12, QColor(248, 248, 242), 0]
         self.balls = []
         self.angle = 0
@@ -137,12 +146,70 @@ class SimCanvas(QWidget):
         self.frame_index = 0
         self.pocketed.clear()
         self.timer.stop()
+        self._finished = True
+        self._outcome = None
+        if self.game is not None:
+            self.game.reset()
         self._last_table = (left, top, width, height)
         self.update()
+
+    def set_rules(self, enabled: bool):
+        """Switch between free practice and a two-player 8-ball game."""
+        self.game = EightBallGame() if enabled else None
+        self.reset_rack()
+
+    def head_string_x(self) -> float:
+        left, _, width, _ = self.table()
+        return left + width * .25
+
+    def _overlaps(self, x: float, y: float, r: float, skip=None) -> bool:
+        for ball in self.balls:
+            if ball is skip or ball[4] in self.pocketed:
+                continue
+            if np.hypot(x - ball[0], y - ball[1]) < r + ball[2] + 1:
+                return True
+        if skip is not self.cue and np.hypot(x - self.cue[0], y - self.cue[1]) < r + self.cue[2] + 1:
+            return True
+        return False
+
+    def _free_spot(self, x: float, y: float, r: float, skip) -> tuple[float, float]:
+        """The nearest free place to (x, y) along the table's long axis."""
+        left, top, width, height = self.table()
+        for step in range(40):
+            for direction in (1, -1):
+                tx = x + direction * step * r * 1.1
+                if left + r <= tx <= left + width - r and not self._overlaps(tx, y, r, skip):
+                    return tx, y
+        return x, y
+
+    def _finish_shot(self):
+        """Settle the table after a shot: re-spot balls and apply the rules."""
+        self._finished = True
+        left, top, width, height = self.table()
+        if self.result is not None and self.result.frames and self.result.frames[-1][0].pocketed:
+            self.cue[0], self.cue[1] = self._free_spot(left + width * .22, top + height / 2, self.cue[2], self.cue)
+        if self._outcome is not None and self._outcome.respot_eight:
+            eight = next(ball for ball in self.balls if ball[4] == EIGHT)
+            self.pocketed.discard(EIGHT)
+            eight[0], eight[1] = self._free_spot(left + width * .72, top + height / 2, eight[2], eight)
+        if self.game is not None:
+            # Back to aiming: the preview lines return for the next player.
+            self.result = None
+        self.update()
+        self.shot_finished.emit()
+
+    def _jump_to_end(self):
+        if self.result is not None and self.result.frames and not self._finished:
+            self.frame_index = len(self.result.frames) - 1
+            self.advance()
+            self.advance()
 
     def resizeEvent(self, event):
         new_table = self.table()
         old_table = self._last_table
+        if self.game is not None:
+            # A game keeps its state: finish a running shot before rescaling.
+            self._jump_to_end()
         if old_table and old_table[2] > 0 and old_table[3] > 0:
             old_left, old_top, old_width, old_height = old_table
             new_left, new_top, new_width, new_height = new_table
@@ -152,7 +219,8 @@ class SimCanvas(QWidget):
                 ball[1] = new_top + (ball[1] - old_top) * sy
                 ball[2] = max(8, round(ball[2] * min(sx, sy)))
             self.result = None
-            self.pocketed.clear()
+            if self.game is None:
+                self.pocketed.clear()
             self.timer.stop()
         self._last_table = new_table
         super().resizeEvent(event)
@@ -212,6 +280,8 @@ class SimCanvas(QWidget):
         return self._preview_path
 
     def shoot(self):
+        if self.timer.isActive() or (self.game is not None and self.game.winner is not None):
+            return
         left, top, width, height = self.table()
         physics_balls = [PhysicsBall(0, self.cue[0], self.cue[1], self.cue[2])]
         physics_balls.extend(PhysicsBall(ball[4], ball[0], ball[1], ball[2])
@@ -220,9 +290,16 @@ class SimCanvas(QWidget):
         self.pocketed_at_shot = set(self.pocketed)
         self.result = simulate_shot(physics_balls, (left, top, left + width, top + height),
                                     self.angle, self.power, spin=self.spin)
+        self._outcome = None
+        if self.game is not None:
+            self._outcome = self.game.apply(ShotFacts(self.result.first_contact, self.result.pocket_order,
+                                                      self.result.rail_after_contact))
         self.frame_index = 0
+        self._finished = False
         if self.result.frames:
             self.timer.start()
+        else:
+            self._finish_shot()
         self.update()
 
     def advance(self):
@@ -231,6 +308,8 @@ class SimCanvas(QWidget):
             return
         if self.frame_index >= len(self.result.frames):
             self.timer.stop()
+            if not self._finished:
+                self._finish_shot()
             self.update()
             return
         frame = self.result.frames[self.frame_index]
@@ -253,6 +332,12 @@ class SimCanvas(QWidget):
         p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(112, 61, 36))
         p.drawRoundedRect(left - 14, top - 14, width + 28, height + 28, 20, 20)
         p.setBrush(QColor(36, 138, 148)); p.drawRoundedRect(left, top, width, height, 12, 12)
+        if self.game is not None and self.game.ball_in_hand and self.game.kitchen_only:
+            # Head string: the cue ball must start behind it on the break.
+            p.setPen(QPen(QColor(255, 255, 255, 110), 1.5, Qt.PenStyle.DashLine))
+            hx = round(self.head_string_x())
+            p.drawLine(QPoint(hx, top + 4), QPoint(hx, bottom - 4))
+            p.setPen(Qt.PenStyle.NoPen)
         p.setBrush(QColor(8, 14, 20, 245))
         pocket_centers = [(left, top), ((left + right)//2, top), (right, top),
                           (left, bottom), ((left + right)//2, bottom), (right, bottom)]
@@ -335,6 +420,12 @@ class SimCanvas(QWidget):
 
     def mousePressEvent(self,e):
         x,y=e.position().x(),e.position().y()
+        if self.game is not None:
+            # In a game only the cue ball moves by hand, and only with ball in hand.
+            if (self.game.ball_in_hand and self.game.winner is None and not self.timer.isActive()
+                    and np.hypot(x-self.cue[0],y-self.cue[1])<25):
+                self.dragging='cue'
+            return
         if np.hypot(x-self.cue[0],y-self.cue[1])<25:self.dragging='cue';return
         for i,b in enumerate(self.balls):
             if np.hypot(x-b[0],y-b[1])<25:self.dragging=i;return
@@ -342,6 +433,14 @@ class SimCanvas(QWidget):
     def mouseMoveEvent(self,e):
         if self.dragging is None:return
         left,top,w,h=self.table();x=np.clip(e.position().x(),left+24,left+w-24);y=np.clip(e.position().y(),top+24,top+h-24)
+        if self.game is not None:
+            if self.game.kitchen_only:
+                x=min(x,self.head_string_x())
+            if not self._overlaps(x,y,self.cue[2],self.cue):
+                self.cue[0],self.cue[1]=x,y
+            self.result=None
+            self.update()
+            return
         if self.dragging=='cue':self.cue[0],self.cue[1]=x,y
         else:self.balls[self.dragging][0],self.balls[self.dragging][1]=x,y
         self.result=None;self.pocketed.clear();self.timer.stop()
@@ -363,16 +462,21 @@ class ShotSimulator(QMainWindow):
         self.reset=QPushButton('Reset rack');self.reset.clicked.connect(self.reset_scene)
         self.spin_pad=SpinPad();self.spin_text=QLabel('Spin: centre');self.spin_text.setMinimumWidth(150)
         self.spin_pad.changed.connect(self.set_spin)
+        self.rules_box=QCheckBox('8-ball game (2 players)');self.rules_box.toggled.connect(self.set_rules)
+        self.game_text=QLabel('');self.game_text.setWordWrap(True);self.game_text.setStyleSheet('font-weight:600');self.game_text.hide()
+        self.canvas.shot_finished.connect(self.shot_finished)
         controls=QHBoxLayout();controls.addWidget(self.angle_text);controls.addWidget(self.slider);controls.addWidget(self.power_text);controls.addWidget(self.power_slider);controls.addWidget(self.spin_pad);controls.addWidget(self.spin_text);controls.addWidget(self.shoot_button);controls.addWidget(self.reset)
         intro=QLabel('A full 15-ball practice table. Drag balls, set aim, power and spin, then shoot. '
                      'Click the white spin ball where the cue tip should hit (up = follow, down = draw, '
                      'sides = english; double-click to reset). The pink dashes show where the cue ball goes.')
         intro.setWordWrap(True)
         limits=QLabel('Approximate 2D physics. Spin covers follow, draw and english off cushions; not modelled: '
-                      'swerve/masse, squirt, throw and jump. No 8-ball rules (fouls, solids/stripes, turns). '
+                      'swerve/masse, squirt, throw and jump. The 8-ball game uses simplified 8-ball rules: '
+                      'no called pockets, push-outs or three-foul rule. '
                       'Use it to practise angles and cue-ball control, not to predict exact results.')
         limits.setWordWrap(True);limits.setStyleSheet('color:#667085')
-        layout=QVBoxLayout();layout.addWidget(intro);layout.addWidget(limits);layout.addWidget(self.canvas);layout.addLayout(controls)
+        layout=QVBoxLayout();layout.addWidget(intro);layout.addWidget(limits);game_row=QHBoxLayout();game_row.addWidget(self.rules_box);game_row.addWidget(self.game_text,1)
+        layout.addLayout(game_row);layout.addWidget(self.canvas);layout.addLayout(controls)
         root=QWidget();root.setLayout(layout);self.setCentralWidget(root)
     def set_angle(self,value):self.canvas.angle=value;self.angle_text.setText(f'Aim: {value}°');self.canvas.update()
     def set_power(self,value):self.canvas.power=value/100;self.power_text.setText(f'Power: {value}%');self.canvas.update()
@@ -380,9 +484,25 @@ class ShotSimulator(QMainWindow):
     def shoot(self):
         self.canvas.shoot()
         self.shoot_button.setEnabled(False)
-        QTimer.singleShot(max(500, len(self.canvas.result.frames)*16 + 80),lambda:self.shoot_button.setEnabled(True))
+        if self.canvas.result is not None:
+            QTimer.singleShot(max(500, len(self.canvas.result.frames)*16 + 80),
+                              lambda:self.shoot_button.setEnabled(self.canvas.game is None or self.canvas.game.winner is None))
     def reset_scene(self):
         self.canvas.reset_rack();self.slider.setValue(0);self.power_slider.setValue(68);self.spin_pad.set_spin(0.0,0.0);self.shoot_button.setEnabled(True)
+        self.update_game_text()
+    def set_rules(self,enabled):
+        self.canvas.set_rules(enabled);self.reset_scene()
+    def shot_finished(self):
+        self.update_game_text()
+        game=self.canvas.game
+        self.shoot_button.setEnabled(game is None or game.winner is None)
+    def update_game_text(self):
+        game=self.canvas.game
+        if game is None:
+            self.game_text.hide();return
+        lines=[game.last.message] if game.last else []
+        lines.append(game.status())
+        self.game_text.setText('\n'.join(lines));self.game_text.show()
 
     def closeEvent(self, event):
         self.closed.emit()

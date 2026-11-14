@@ -44,6 +44,12 @@ class SimulationResult:
     ball_collisions: int
     cushion_collisions: int
     duration: float
+    # Facts the 8-ball rules need. ``first_contact`` is the number of the first
+    # ball the cue ball (the first ball passed in) touched; ``pocket_order``
+    # lists pocketed ball numbers in the order they dropped.
+    first_contact: int | None = None
+    rail_after_contact: bool = False
+    pocket_order: tuple[int, ...] = ()
 
 
 def simulate_shot(
@@ -108,6 +114,9 @@ def simulate_shot(
     frames: list[tuple[BallFrame, ...]] = []
     trails: list[list[tuple[float, float]]] = [[(x, y)] for x, y in positions]
     ball_hits = rail_hits = 0
+    first_contact: int | None = None
+    rail_after_contact = False
+    pocket_order: list[int] = []
     counted_pairs: set[tuple[int, int]] = set()
     steps = int(max_seconds / dt)
     sample_every = max(1, round(1 / (60 * dt)))
@@ -191,6 +200,7 @@ def simulate_shot(
             crossed_y = y < low_y or y > high_y
             if (crossed_x or crossed_y) and pocket_at_edge(i, crossed_x, crossed_y):
                 pocketed[i] = True
+                pocket_order.append(balls[i].number)
                 velocities[i] = [0.0, 0.0]
                 rolls[i] = [0.0, 0.0]
                 sides[i] = 0.0
@@ -206,6 +216,7 @@ def simulate_shot(
                 rolls[i][0] = -rolls[i][0] * cushion_restitution
                 cushion_english(i, 1, sign, normal_speed)
                 rail_hits += 1
+                rail_after_contact = rail_after_contact or first_contact is not None
             if y < low_y or y > high_y:
                 sign = -1.0 if y > high_y else 1.0
                 normal_speed = abs(velocities[i][1])
@@ -214,6 +225,7 @@ def simulate_shot(
                 rolls[i][1] = -rolls[i][1] * cushion_restitution
                 cushion_english(i, 0, sign, normal_speed)
                 rail_hits += 1
+                rail_after_contact = rail_after_contact or first_contact is not None
 
         for i in range(n):
             if pocketed[i]:
@@ -239,6 +251,8 @@ def simulate_shot(
                 relative_normal = ((velocities[j][0] - velocities[i][0]) * nx
                                    + (velocities[j][1] - velocities[i][1]) * ny)
                 if relative_normal < 0:
+                    if first_contact is None and i == 0:
+                        first_contact = balls[j].number
                     impulse = -(1 + ball_restitution) * relative_normal * 0.5
                     velocities[i][0] -= impulse * nx
                     velocities[i][1] -= impulse * ny
@@ -269,4 +283,5 @@ def simulate_shot(
         frames.append(final_frame)
     return SimulationResult(tuple(frames), tuple(tuple(points) for points in trails),
                             frozenset(balls[i].number for i in range(n) if pocketed[i]),
-                            ball_hits, rail_hits, elapsed)
+                            ball_hits, rail_hits, elapsed,
+                            first_contact, rail_after_contact, tuple(pocket_order))

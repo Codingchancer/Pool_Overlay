@@ -20,7 +20,7 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| Simulator 8-ball rules: break, groups, turns, fouls, ball in hand, win/lose | simulator | Codingchancer (Claude) | `codingchancer/eight-ball-rules` |
+| | | | |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Set up:** install the Claude desktop app, open the Code tab in your `Pool_Overlay` folder (not a cloud session), run `setup.bat`, then `run.bat` with the phone mirrored. Your Claude can then run the app next to the real game.
@@ -31,12 +31,14 @@ Border rules:
 - [ ] Raise the synthetic pass rate (`stress_test.py --count 300`) from 283/300 towards 297+/300 without making real-game results worse.
 
 ## Next — Codingchancer (overlay + simulator)
+- [ ] **Stronger break:** the rack barely spreads on a full-power break (one collision pass per physics step passes energy through a tight rack poorly, and the top speed is low). Make breaks scatter the rack. — area: simulator
 - [ ] **Simulator UI:** place the cue ball by hand, a power bar, show whose turn it is and which group they have.
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
 - [ ] **Guide settings:** line colours, thickness and length, saved between runs.
 - [ ] **Steadier guide:** less flicker between frames when the shot hasn't changed.
 
 ## Done
+- [x] Simulator 8-ball game mode: break, groups, turns, fouls, ball in hand, win/lose (`pool_rules.py`).
 - [x] Simulator spin: follow, draw and english (sliding/rolling model), spin ball control, physics-based cue-ball preview.
 - [x] Split `main.py` into `detector.py`, `capture.py`, `overlay.py`, `simulator_ui.py` (no behaviour change: 45 tests, identical stress-test output, live 8/8).
 - [x] Detector rework, capture-safe guide, synthetic table + stress/live tests (283/300 synthetic, 23/23 live).
