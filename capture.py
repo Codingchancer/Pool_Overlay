@@ -180,19 +180,76 @@ def remove_overlay(frame: np.ndarray, layer: np.ndarray) -> np.ndarray:
     """
     frame = np.ascontiguousarray(frame)
     alpha = layer[:, :, 3]
-    covered = alpha > 0
-    if not covered.any():
+    # Work on the guide's own pixels only (a few percent of the frame).
+    ys, xs = np.nonzero(alpha)
+    if len(ys) == 0:
         return frame
     out = frame.copy()
-    a = alpha[covered].astype(np.float32)[:, None] / 255.0
-    c = frame[covered].astype(np.float32)
-    premul = layer[:, :, :3][covered].astype(np.float32)
+    a = alpha[ys, xs].astype(np.float32)[:, None] / 255.0
+    c = frame[ys, xs].astype(np.float32)
+    premul = layer[ys, xs, :3].astype(np.float32)
     background = (c - premul) / np.maximum(1.0 - a, .06)
-    out[covered] = np.clip(np.rint(background), 0, 255).astype(np.uint8)
+    out[ys, xs] = np.clip(np.rint(background), 0, 255).astype(np.uint8)
     solid = (alpha >= 240).astype(np.uint8)
     if solid.any():
-        out = cv2.inpaint(out, solid, 3, cv2.INPAINT_TELEA)
+        # Inpaint only around the solid spots: the same result as the whole
+        # frame (it reads 3 px around each spot), without the full-frame cost.
+        sx, sy, sw, sh = cv2.boundingRect(solid)
+        m = 8
+        y0, y1 = max(0, sy - m), min(out.shape[0], sy + sh + m)
+        x0, x1 = max(0, sx - m), min(out.shape[1], sx + sw + m)
+        out[y0:y1, x0:x1] = cv2.inpaint(np.ascontiguousarray(out[y0:y1, x0:x1]),
+                                        np.ascontiguousarray(solid[y0:y1, x0:x1]), 3, cv2.INPAINT_TELEA)
     return out
+
+
+def shown_layer(frame: np.ndarray, layers: list[np.ndarray]) -> int | None:
+    """Which of several recent guide drawings the captured ``frame`` shows.
+
+    Right after a repaint the desktop compositor may still show the previous
+    drawing for a frame or two. Instead of waiting a fixed time, test each
+    candidate: where a drawing has a stroke, un-blending it from the capture
+    gives a real game colour (inside 0..255) only if that stroke is really on
+    screen; plain game pixels un-blended as if covered land far outside. Only
+    pixels where the candidates differ are tested. Returns the index into
+    ``layers``, or None when the capture matches none of them (mid-update).
+    """
+    if len(layers) == 1:
+        return 0
+    # Only pixels some drawing touches matter (a few percent of the frame).
+    touched = layers[0][:, :, 3].copy()
+    for layer in layers[1:]:
+        np.maximum(touched, layer[:, :, 3], out=touched)
+    ys, xs = np.nonzero(touched)
+    colours = [layer[ys, xs] for layer in layers]
+    pixels = frame[ys, xs]
+    scores = []
+    for i, layer in enumerate(colours):
+        differs = np.zeros(len(layer), bool)
+        for j, other in enumerate(colours):
+            if j != i:
+                differs |= np.any(layer != other, axis=1)
+        # Stroke cores only: faint anti-aliased edges fit almost any colour.
+        test = differs & (layer[:, 3] >= 100)
+        if np.count_nonzero(test) < 20:
+            scores.append(None)
+            continue
+        a = layer[test, 3:4].astype(np.float32) / 255.0
+        background = (pixels[test].astype(np.float32) - layer[test, :3]) / (1.0 - a)
+        outside = np.any((background < -12) | (background > 267), axis=1)
+        scores.append(float(outside.mean()))
+    tested = [(score, i) for i, score in enumerate(scores) if score is not None]
+    if tested:
+        score, best = min(tested)
+        if score < .15:
+            return best
+    # No drawing with strokes of its own fits. If exactly one candidate has
+    # nothing of its own to test (e.g. an empty drawing) and every other was
+    # ruled out, the screen shows that one.
+    untested = [i for i, score in enumerate(scores) if score is None]
+    if len(untested) == 1 and all(score > .5 for score, _ in tested):
+        return untested[0]
+    return None
 
 
 def _debug_dump(folder: str, name: str, image: np.ndarray):
