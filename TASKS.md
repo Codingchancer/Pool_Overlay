@@ -9,7 +9,7 @@ Each person only edits the files they own. That way both of you can work at the 
 | Owner | Area | Files |
 |---|---|---|
 | **Jartartarta** (+ his Claude, run on his Windows PC next to the real game) | **detector / precision**: everything that reads the game image | `detector.py`, `fake_game.py`, `stress_test.py`, `tests/test_synthetic_table.py` |
-| **Codingchancer** (+ his Claude) | **overlay + simulator**: everything that draws, captures, or simulates | `capture.py`, `overlay.py`, `simulator_ui.py`, `pool_physics.py`, `live_check.py`, `tests/test_pool_physics.py` |
+| **Codingchancer** (+ his Claude) | **overlay + simulator**: everything that draws, captures, or simulates | `capture.py`, `overlay.py`, `simulator_ui.py`, `pool_physics.py`, `pool_rules.py`, `live_check.py`, `tests/test_pool_physics.py`, `tests/test_pool_rules.py` |
 | shared (tell the other first) | **repo** | `main.py`, `README.md`, `CLAUDE.md`, `TASKS.md`, `setup.bat`, `run.bat`, `requirements.txt`, the other test files |
 
 Border rules:
@@ -20,7 +20,7 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| | | | |
+| Simulator 8-ball rules: break, groups, turns, fouls, ball in hand, win/lose | simulator | Codingchancer (Claude) | `codingchancer/eight-ball-rules` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Set up:** install the Claude desktop app, open the Code tab in your `Pool_Overlay` folder (not a cloud session), run `setup.bat`, then `run.bat` with the phone mirrored. Your Claude can then run the app next to the real game.
@@ -31,7 +31,6 @@ Border rules:
 - [ ] Raise the synthetic pass rate (`stress_test.py --count 300`) from 283/300 towards 297+/300 without making real-game results worse.
 
 ## Next — Codingchancer (overlay + simulator)
-- [ ] **Simulator 8-ball rules:** break, solids/stripes, turns, fouls (scratch, wrong ball first, no rail), ball in hand, win/lose on the 8.
 - [ ] **Simulator UI:** place the cue ball by hand, a power bar, show whose turn it is and which group they have.
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
 - [ ] **Guide settings:** line colours, thickness and length, saved between runs.
