@@ -101,6 +101,169 @@ class SyntheticRegressionTests(unittest.TestCase):
             self.assertIsNone(d.target, f"seed {seed}: {problems}")
             self.assertIsNotNone(d.aim_dir, f"seed {seed}")
 
+    def test_aim_at_empty_cushion_continues_off_the_cushion(self):
+        # The guide used to stop at the ghost ball when it sat on a cushion;
+        # the cue ball rebounds there, mirrored off that cushion.
+        checked = 0
+        for seed in range(9200, 9210):
+            *_, truth, d, problems, _ = run(seed, "miss")
+            if truth.ghost is None or d.ghost is None:
+                continue
+            left, top, width, height = truth.table
+            r, (gx, gy) = truth.radius, truth.ghost
+            a = np.radians(truth.aim_degrees)
+            ux, uy = np.cos(a), np.sin(a)
+            near = r * .2
+            if abs(gx - (left + r)) < near or abs(left + width - r - gx) < near:
+                ux = -ux
+            if abs(gy - (top + r)) < near or abs(top + height - r - gy) < near:
+                uy = -uy
+            if (ux, uy) == (np.cos(a), np.sin(a)):
+                continue
+            self.assertTrue(d.cue_segments, f"seed {seed}: no rebound · {d.note}")
+            (x1, y1), (x2, y2) = d.cue_segments[0]
+            self.assertLess(np.hypot(x1 - gx, y1 - gy), r * .5, f"seed {seed}")
+            self.assertLess(st.angle_diff(st.seg_angle(d.cue_segments[0]), np.degrees(np.arctan2(uy, ux))),
+                            2.0, f"seed {seed}")
+            checked += 1
+        self.assertGreaterEqual(checked, 5)
+
+
+class BounceTests(unittest.TestCase):
+    def test_tracer_matches_exact_bounces_through_three_cushions(self):
+        import detector
+
+        rng = np.random.default_rng(5)
+        table, r = (100.0, 80.0, 1200.0, 600.0), 15.0
+        bounds = (115.0, 95.0, 1285.0, 665.0)
+        checked = 0
+        for _ in range(200):
+            start = (rng.uniform(200, 1200), rng.uniform(150, 600))
+            a = rng.uniform(-np.pi, np.pi)
+            direction = (float(np.cos(a)), float(np.sin(a)))
+            path = detector.trace_bounces(start, direction, bounds, r, max_bounces=3)
+            exact, stop = fg.truth_path(start, direction, table, r, bounces=3)
+            # Same number of cushions and the same pocket stops.
+            self.assertEqual(len(path), len(exact) - 1, f"angle {np.degrees(a):.1f}")
+            for (_, end), point in zip(path, exact[1:]):
+                self.assertLess(np.hypot(end[0] - point[0], end[1] - point[1]), 1.5)
+            checked += stop == "bounces"
+        self.assertGreater(checked, 100)
+
+    def test_live_paths_follow_three_bounces_like_the_truth(self):
+        bounce_px, bounce_deg, most = [], [], 0
+        for seed in range(9000, 9040):
+            *_, stats = run(seed)
+            if "bounce_px" in stats:
+                bounce_px.append(stats["bounce_px"])
+                most = max(most, stats["bounces"])
+            if "bounce_deg" in stats:
+                bounce_deg.append(stats["bounce_deg"])
+        self.assertEqual(most, 3)
+        self.assertLessEqual(max(bounce_px), 4.0)
+        self.assertLessEqual(np.percentile(bounce_deg, 95), 2.0)
+
+    def test_simulator_paths_keep_one_bounce(self):
+        import detector
+
+        _, cue_path, object_path, _ = detector.collision_paths(
+            (300, 300, 15), (500, 310, 15), (1.0, 0.0), (100, 80, 1200, 600))
+        self.assertLessEqual(len(object_path), 2)
+        self.assertLessEqual(len(cue_path), 2)
+
+    def test_cue_path_is_drawn_along_the_reported_cue_direction(self):
+        # Seed 11: the reported cue direction was 90 deg to the game's object
+        # line, but the drawn path used the raw ball centres and ran 7 deg off.
+        *_, d, problems, _ = run(11)
+        (x1, y1), (x2, y2) = d.cue_segments[0]
+        drawn = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+        self.assertLess(st.angle_diff(drawn, st.angle_of(d.cue_dir)), 2.0)
+
+
+class ClothColourTests(unittest.TestCase):
+    """Miniclip tables come in many colours; the detector used to assume blue
+    and found no table at all on green, red or purple cloth (0/40 shots)."""
+
+    def test_every_cloth_colour_works(self):
+        # Purple (hue 140) is the worst case: exactly the colour of ball 4,
+        # and the stick's grey rings stand out as ball-sized circles on it.
+        for cloth, least in (("green", 12), ("red", 12), ("purple", 8), ("brown", 12), ("teal", 12)):
+            results = [st.evaluate(seed, None, cloth) for seed in range(9000, 9016)]
+            passed = sum(1 for *_, problems, _ in results if not problems)
+            self.assertGreaterEqual(passed, least, f"{cloth}: only {passed}/16 frames passed")
+            worst_table = max(stats.get("table", 99.0) for *_, stats in results)
+            self.assertLessEqual(worst_table, 2.0, cloth)
+            aims = [stats["aim"] for *_, stats in results if "aim" in stats]
+            self.assertGreaterEqual(len(aims), 14, cloth)
+            self.assertLessEqual(np.median(aims), .3, cloth)
+
+    def test_cloth_hue_is_found_across_the_red_wrap(self):
+        import cv2
+        import detector
+
+        for hue in (2, 176, 60, 140, 98):
+            frame, _ = fg.render(fg.random_scene(9001, None, hue))
+            found = detector.cloth_hue(cv2.cvtColor(frame, cv2.COLOR_BGR2HSV), step=4)
+            self.assertLess(abs(float(detector.hue_delta(found, hue))), 3.0, f"hue {hue}: {found}")
+
+    def test_same_colour_ball_is_kept_by_its_number_badge(self):
+        # Purple ball 4 on a purple table is cloth-coloured inside.
+        found = 0
+        for seed in range(9000, 9012):
+            frame, truth = fg.render(fg.random_scene(seed, None, "purple"))
+            if 4 not in truth.balls:
+                continue
+            bx, by = truth.balls[4]
+            d = main.detect(frame)
+            found += any(np.hypot(bx - x, by - y) <= truth.radius * .5 for x, y, _, _ in d.balls or [])
+        self.assertGreaterEqual(found, 8)
+
+
+class GameLineReaderTests(unittest.TestCase):
+    def test_one_pixel_guide_thread_is_not_read_as_the_game_line(self):
+        # Real frame: only a short stub of Miniclip's thick object line shows
+        # past the ball, while the anti-aliased edge of our own yellow guide
+        # left a 1 px pale thread from the same centre, 13 deg off. The reader
+        # took the thread and the guide locked onto its own wrong angle.
+        import cv2
+        import detector
+
+        r, ox, oy = 18.0, 200.0, 200.0
+        white = np.zeros((400, 400), np.uint8)
+        game, thread = np.radians(-110.0), np.radians(-123.0)
+        stub = [(ox + t * np.cos(game), oy + t * np.sin(game)) for t in (r * 1.18, r * 2.9)]
+        cv2.line(white, *[(int(round(x)), int(round(y))) for x, y in stub], 255, 4)
+        end = (int(round(ox + r * 9 * np.cos(thread))), int(round(oy + r * 9 * np.sin(thread))))
+        cv2.line(white, (int(ox), int(oy)), end, 255, 1)
+        cv2.circle(white, (int(ox), int(oy)), int(r * 1.18), 0, -1)
+        found = detector.game_line_direction(white, (ox, oy), (np.cos(game), np.sin(game)), r)
+        self.assertIsNotNone(found)
+        angle = float(np.degrees(np.arctan2(found[0][1], found[0][0])))
+        self.assertAlmostEqual(angle, -110.0, delta=2.0)
+
+
+class StickButtTests(unittest.TestCase):
+    def test_round_ring_on_a_ball_wide_butt_is_not_a_ball(self):
+        # Real frame: the butt's end rings are full ball size with clean rims,
+        # but the stick around them is as wide as they are. A ball under a
+        # thin part of the stick (as in fake_game) must stay.
+        import cv2
+        import detector
+
+        r = 18
+        cue = (900, 300, r)
+        aim = (1.0, 0.0)  # stick lies to the left of the cue ball
+        for stick_half, expect_kept in ((r * .8, False), (r * .38, True)):
+            distance = np.zeros((600, 1000), np.float32)
+            cv2.rectangle(distance, (300, int(300 - stick_half)), (900, int(300 + stick_half)), 50.0, -1)
+            ring = (400, 301, 20)
+            cv2.circle(distance, ring[:2], ring[2], 50.0, -1)
+            balls = [(*cue, "cue"), (*ring, "ball"), (600, 500, r, "ball")]
+            kept = detector.separate_cue_stick_detections(
+                balls, cue, aim, rim_open={ring[:2]: .8, (600, 500): 1.0}, distance=distance)
+            self.assertEqual((*ring, "ball") in kept, expect_kept, f"stick half-width {stick_half}")
+            self.assertIn((600, 500, r, "ball"), kept)
+
 
 class SyntheticWindowTests(unittest.TestCase):
     def test_window_shows_a_new_shot_on_demand(self):

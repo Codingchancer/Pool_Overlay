@@ -1,7 +1,8 @@
 """Synthetic pool-table frames with exactly known geometry, for testing the overlay.
 
 This is a test fixture, not a game. It draws a generic pool table in the
-visual language the detector relies on: blue cloth with lighter cushions,
+visual language the detector relies on: cloth (blue by default, any hue via
+``cloth_hue``) with lighter cushions,
 dark pockets, numbered solid/striped balls with shading, a decorated cue
 stick, and a white aim guide (ray, hollow ghost ball, short object-ball and
 cue-ball lines). Because every frame is drawn from known numbers, a test can
@@ -15,7 +16,7 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from pathlib import Path
 
 import cv2
@@ -54,6 +55,7 @@ class Scene:
     blur: float = 0.0
     letterbox: float = .07
     seed: int = 0
+    cloth_hue: int = 98                               # OpenCV hue; Miniclip's default blue
 
 
 @dataclass
@@ -75,6 +77,76 @@ def pocket_centres(table):
     inset = POCKET_TO_CUSHION * w / (1 - 2 * POCKET_TO_CUSHION)
     return [(x - inset, y - inset), (x + w / 2, y - 2 * inset), (x + w + inset, y - inset),
             (x - inset, y + h + inset), (x + w / 2, y + h + 2 * inset), (x + w + inset, y + h + inset)]
+
+
+def truth_path(start, direction, table, radius, bounces=3, balls=(), pockets=None):
+    """Exact path of a ball's centre: cushion bounces as mirrors, ending in a
+    pocket mouth (rail contact within two radii of where the cushion nose
+    meets the pocket) or where it first touches one of ``balls``.
+
+    Returns (points, stop) with stop "bounces", "pocket" or "ball". Solved by
+    unfolding the table (the path is a straight line in mirrored copies),
+    independently of the detector's step-by-step tracer.
+    """
+    x0, y0, w, h = table
+    lo_x, lo_y, span_x, span_y = x0 + radius, y0 + radius, w - 2 * radius, h - 2 * radius
+    ux, uy = direction
+    n = float(np.hypot(ux, uy))
+    ux, uy = ux / n, uy / n
+    sx = min(max(start[0] - lo_x, 0.0), span_x)
+    sy = min(max(start[1] - lo_y, 0.0), span_y)
+
+    def fold(v, span):
+        v = v % (2 * span)
+        return v if v <= span else 2 * span - v
+
+    def crossings(s0, u, span):
+        # Distances along the line at which it crosses a cushion line.
+        if abs(u) < 1e-12:
+            return []
+        k = np.floor(s0 / span) + (1 if u > 0 else 0)
+        if u < 0 and s0 <= 0:
+            k = -1.0
+        out = []
+        for _ in range(bounces + 2):
+            t = (k * span - s0) / u
+            if t > .5:  # a ball already on that cushion rebounds at once
+                out.append(t)
+            k += 1 if u > 0 else -1
+        return out
+
+    events = sorted(set(round(t, 6) for t in crossings(sx, ux, span_x) + crossings(sy, uy, span_y)))
+    corners = [(lo_x, lo_y), (lo_x + span_x / 2, lo_y), (lo_x + span_x, lo_y),
+               (lo_x, lo_y + span_y), (lo_x + span_x / 2, lo_y + span_y), (lo_x + span_x, lo_y + span_y)]
+    points = [(lo_x + sx, lo_y + sy)]
+    travelled = 0.0
+    for t in events[:bounces + 1]:
+        px, py = points[-1]
+        # Direction on this leg, from the fold of a point just past its start.
+        e = travelled + 1e-3
+        qx, qy = lo_x + fold(sx + ux * e, span_x), lo_y + fold(sy + uy * e, span_y)
+        lx, ly = qx - px, qy - py
+        ln = float(np.hypot(lx, ly)) or 1.0
+        lx, ly = lx / ln, ly / ln
+        leg = t - travelled
+        hit = None
+        for bx, by in balls:
+            dx, dy = bx - px, by - py
+            along = dx * lx + dy * ly
+            across2 = dx * dx + dy * dy - along * along
+            if along > 0 and across2 < (2 * radius) ** 2:
+                d = along - np.sqrt((2 * radius) ** 2 - across2)
+                if 1e-3 < d < leg and (hit is None or d < hit):
+                    hit = d
+        if hit is not None:
+            points.append((px + lx * hit, py + ly * hit))
+            return points, "ball"
+        end = (lo_x + fold(sx + ux * t, span_x), lo_y + fold(sy + uy * t, span_y))
+        points.append(end)
+        if min(np.hypot(end[0] - cx, end[1] - cy) for cx, cy in corners) <= radius * 2.0:
+            return points, "pocket"
+        travelled = t
+    return points, "bounces"
 
 
 def solve_truth(scene: Scene) -> Truth:
@@ -237,7 +309,12 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     r = scene.radius
     span = w / (1 - 2 * POCKET_TO_CUSHION)
     canvas = np.empty((H, W, 3), np.float32)
-    canvas[:] = _hsv_bgr(112, 150, 62)                    # navy surround
+    # Cloth, cushions and table art share the cloth hue (offsets as measured
+    # on the real blue table); other tables are green, red, purple...
+    def tint(offset):
+        return int(round(scene.cloth_hue + offset)) % 180
+
+    canvas[:] = _hsv_bgr(tint(14), 150, 62)               # dark surround
     bar = int(H * scene.letterbox)
     canvas[:bar] = 0                                      # letterbox bars
     canvas[H - bar:] = 0
@@ -255,7 +332,7 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     cushion = span * .02
     cv2.rectangle(canvas, (int(round(x - cushion)), int(round(y - cushion))),
                   (int(round(x + w + cushion)), int(round(y + h + cushion))),
-                  tuple(float(v) for v in _hsv_bgr(99, 175, 205)), -1)
+                  tuple(float(v) for v in _hsv_bgr(tint(1), 175, 205)), -1)
     for i, (px, py) in enumerate(pockets):
         pr = middle_r if i in (1, 4) else corner_r
         draw_pocket(canvas, px, py, pr)
@@ -265,7 +342,7 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     radial = np.hypot((xx - w / 2) / (w / 2), (yy - h / 2) / (h / 2))
     value = (188 - 46 * np.clip(radial, 0, 1.4) + rng.normal(0, 2.2, radial.shape)).clip(0, 255)
     saturation = (134 + 14 * np.clip(radial, 0, 1.4)).clip(0, 255)
-    cloth = np.dstack([np.full_like(value, 98), saturation, value]).astype(np.uint8)
+    cloth = np.dstack([np.full_like(value, tint(0)), saturation, value]).astype(np.uint8)
     cloth = cv2.cvtColor(cloth, cv2.COLOR_HSV2BGR).astype(np.float32)
     x0i, y0i = int(np.floor(x)), int(np.floor(y))
     fx, fy = x - x0i, y - y0i
@@ -279,7 +356,7 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     # Bright cushion-nose highlight just outside the cloth.
     for p0, p1 in (((x, y - 1.2), (x + w, y - 1.2)), ((x, y + h + 1.2), (x + w, y + h + 1.2)),
                    ((x - 1.2, y), (x - 1.2, y + h)), ((x + w + 1.2, y), (x + w + 1.2, y + h))):
-        stroke_line(canvas, p0, p1, 1.6, tuple(float(v) for v in _hsv_bgr(98, 150, 245)))
+        stroke_line(canvas, p0, p1, 1.6, tuple(float(v) for v in _hsv_bgr(tint(0), 150, 245)))
     # Re-open the pocket mouths over cushion and highlight.
     for i, (px, py) in enumerate(pockets):
         pr = middle_r if i in (1, 4) else corner_r
@@ -296,8 +373,8 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     # Faint table decorations that must not become balls or aim lines:
     # a head-string line and a large watermark ring with lettering.
     stroke_line(canvas, (x + w / 4, y + 2), (x + w / 4, y + h - 2), 1.4,
-                tuple(float(v) for v in _hsv_bgr(98, 120, 215)), alpha=.7)
-    darker = tuple(float(v) for v in _hsv_bgr(101, 165, 140))
+                tuple(float(v) for v in _hsv_bgr(tint(0), 120, 215)), alpha=.7)
+    darker = tuple(float(v) for v in _hsv_bgr(tint(3), 165, 140))
     stroke_ring(canvas, x + w * .55, y + h * .52, r * 3.2, r * .45, darker)
     cv2.putText(canvas, "PRACTICE", (int(x + w * .36), int(y + h * .6)), cv2.FONT_HERSHEY_DUPLEX,
                 r / 9, darker, max(2, int(r / 3)), cv2.LINE_AA)
@@ -367,7 +444,18 @@ def _free(point, others, gap):
     return all(np.hypot(point[0] - ox, point[1] - oy) >= gap for ox, oy in others)
 
 
-def random_scene(seed: int, kind: str | None = None) -> Scene:
+# Cloth colours to test with (OpenCV hue). Miniclip's tables come in these.
+CLOTH_HUES = {"blue": 98, "green": 60, "red": 176, "purple": 140, "brown": 12, "teal": 85}
+
+
+def random_scene(seed: int, kind: str | None = None, cloth: str | int = "blue") -> Scene:
+    """Random scene; ``cloth`` is a CLOTH_HUES name or an OpenCV hue.
+    The same seed gives the same layout whatever the cloth colour."""
+    hue = CLOTH_HUES[cloth] if isinstance(cloth, str) else int(cloth)
+    return replace(_random_scene(seed, kind), cloth_hue=hue)
+
+
+def _random_scene(seed: int, kind: str | None = None) -> Scene:
     """A random but plausible table state with a guided aim.
 
     kinds: "scatter" (balls anywhere), "rack" (tight cluster), "cushion"

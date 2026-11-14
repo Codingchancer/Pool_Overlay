@@ -28,6 +28,7 @@ AIM_DEG = .6
 AIM_PX = 1.0       # ...unless the offset at the ghost ball stays under this
 OBJECT_DEG = 2.0
 CUE_PATH_DEG = 4.0
+BOUNCE_PX = 4.0    # bounce points vs an exact trace from the detector's own start and direction
 
 
 def angle_of(vec):
@@ -43,8 +44,54 @@ def seg_angle(segment):
     return angle_of((x2 - x1, y2 - y1))
 
 
-def evaluate(seed: int, kind: str | None = None):
-    scene = fg.random_scene(seed, kind)
+def _to_polyline(point, points):
+    """Shortest distance from a point to a polyline."""
+    best = float("inf")
+    px, py = point
+    for (ax, ay), (bx, by) in zip(points, points[1:]):
+        dx, dy = bx - ax, by - ay
+        length2 = dx * dx + dy * dy
+        t = 0.0 if length2 < 1e-9 else min(max(((px - ax) * dx + (py - ay) * dy) / length2, 0.0), 1.0)
+        best = min(best, float(np.hypot(px - ax - t * dx, py - ay - t * dy)))
+    return best
+
+
+def bounce_check(segments, direction, truth, balls, true_start=None, true_dir=None):
+    """Compare a drawn multi-bounce path with fake_game's exact bounces.
+
+    Returns (mechanics_px, true_deg, n_bounces): how far the drawn bounce
+    points lie off an exact trace from the detector's own start and direction
+    (does the tracer bounce off the right cushions), and the worst sideways
+    drift from the true path as degrees of travel (the angle error that the
+    extra bounces add up to). Distances are measured to the path, not between
+    matching bounce points, which slide far along the cushion on glancing hits.
+    """
+    if not segments or direction is None:
+        return None
+    drawn = [end for _, end in segments[:-1]]  # ends of all but the last segment are bounces
+    if not drawn:
+        return None
+    exact, _ = fg.truth_path(segments[0][0], direction, truth.table, truth.radius,
+                             bounces=len(segments) + 1)
+    mech = max(_to_polyline(p, exact) for p in drawn)
+    true_deg = None
+    if true_start is not None and true_dir is not None:
+        real, _ = fg.truth_path(true_start, true_dir, truth.table, truth.radius,
+                                bounces=len(segments) + 1)
+        travelled, worst = 0.0, 0.0
+        previous = segments[0][0]
+        for p in drawn:
+            travelled += float(np.hypot(p[0] - previous[0], p[1] - previous[1]))
+            previous = p
+            # Right next to the start the drift is the start offset, not an angle.
+            if travelled > truth.radius * 4:
+                worst = max(worst, float(np.degrees(np.arctan2(_to_polyline(p, real), travelled))))
+        true_deg = worst
+    return mech, true_deg, len(drawn)
+
+
+def evaluate(seed: int, kind: str | None = None, cloth: str | int = "blue"):
+    scene = fg.random_scene(seed, kind, cloth)
     frame, truth = fg.render(scene)
     d = main.detect(frame)
     r = truth.radius
@@ -148,6 +195,41 @@ def evaluate(seed: int, kind: str | None = None):
     else:
         if d.target is not None:
             problems.append(f"target: reported {d.target[:2]} but the aim hits no ball")
+    # Paths through several cushion bounces.
+    others = [p for n, p in truth.balls.items() if n != truth.target]
+    checks = []
+    target_ok = (truth.target is not None and d.target is not None and
+                 np.hypot(d.target[0] - truth.balls[truth.target][0],
+                          d.target[1] - truth.balls[truth.target][1]) <= r * .5)
+    if target_ok:
+        checks.append(("object", d.object_segments, d.object_dir, others,
+                       truth.balls[truth.target], truth.object_dir))
+    if d.cue_segments and (target_ok or truth.target is None):
+        a = np.radians(truth.aim_degrees)
+        true_cue_dir = truth.cue_dir
+        if truth.target is None and truth.ghost is not None:
+            # Cue ball against an empty cushion: mirrored aim.
+            x0, y0, w0, h0 = truth.table
+            ux, uy = float(np.cos(a)), float(np.sin(a))
+            gx, gy = truth.ghost
+            if min(abs(gx - x0 - r), abs(x0 + w0 - r - gx)) < r * .2:
+                ux = -ux
+            if min(abs(gy - y0 - r), abs(y0 + h0 - r - gy)) < r * .2:
+                uy = -uy
+            true_cue_dir = (ux, uy)
+        checks.append(("cue", d.cue_segments, d.cue_dir, others, truth.ghost, true_cue_dir))
+    for name, segments, direction, balls, start, true_dir in checks:
+        found = bounce_check(segments, direction, truth, balls, start, true_dir)
+        if found is None:
+            continue
+        mech, true_deg, count = found
+        stats.setdefault("bounce_px", 0.0)
+        stats["bounce_px"] = max(stats["bounce_px"], mech)
+        if true_deg is not None:
+            stats["bounce_deg"] = max(stats.get("bounce_deg", 0.0), true_deg)
+        stats["bounces"] = max(stats.get("bounces", 0), count)
+        if mech > BOUNCE_PX:
+            problems.append(f"bounces: {name} path off the exact bounces by {mech:.1f}px")
     return scene, frame, truth, d, problems, stats
 
 
@@ -174,6 +256,7 @@ def main_cli():
     parser.add_argument("--count", type=int, default=200)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--kind")
+    parser.add_argument("--cloth", default="blue", help="cloth colour: " + ", ".join(fg.CLOTH_HUES))
     parser.add_argument("--save-failures")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
@@ -181,7 +264,7 @@ def main_cli():
     categories = Counter()
     collected = {}
     for seed in range(args.start, args.start + args.count):
-        scene, frame, truth, d, problems, stats = evaluate(seed, args.kind)
+        scene, frame, truth, d, problems, stats = evaluate(seed, args.kind, args.cloth)
         for key, value in stats.items():
             collected.setdefault(key, []).append(value)
         if problems:
