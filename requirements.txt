@@ -1,0 +1,4 @@
+PySide6-Essentials>=6.8,<7
+mss>=10,<11
+opencv-python>=4.10,<5
+numpy>=2,<3

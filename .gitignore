@@ -1,0 +1,8 @@
+.venv/
+.venv-*/
+__pycache__/
+*.pyc
+debug*/
+outputs/attached-detections-review.png
+outputs/live-overlay-capture.png
+outputs/

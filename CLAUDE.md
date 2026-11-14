@@ -1,0 +1,37 @@
+# Pool Practice Overlay — notes for Claude
+
+Windows overlay (PySide6 + OpenCV + mss) for Miniclip 8 Ball Pool mirrored from an iPhone through an AirPlay receiver. Two people work on this repo, each with their own Claude Code session: pull before you start, keep commits small, and don't rewrite shared history.
+
+## Hard rule
+It is a **visual practice aid only**. Never add code that clicks, aims, moves the mouse, sends input, or takes shots in the game.
+
+## Files
+- `main.py` — the app: control panel, transparent always-on-top guide window, detector (`detect`), shot prediction, shot simulator, screenshot tester.
+- `pool_physics.py` — the simulator's approximate 2D physics (no spin, no 8-ball rules; the UI and README must keep saying so).
+- `fake_game.py` — synthetic table renderer with exact truth (a test fixture, not a game).
+- `stress_test.py` — random synthetic shots vs truth (`--count 300`, `--save-failures DIR`).
+- `live_check.py` — runs the real app against the synthetic table window through UI Automation.
+- `tests/` — unit tests. Screenshot-based tests skip when `outputs/*.png` is missing. The real screenshots are deliberately NOT in git (public repo: Miniclip's image + a player profile) — never commit images from `outputs/`.
+- `setup.bat` / `run.bat` — build `.venv` with the newest Python 3.15…3.11 and start the app. `.venv` is never committed.
+
+## How the detector works (short)
+- Table: four corner pockets (dark blobs next to cloth), cushion nose = pocket centre inset by `POCKET_TO_CUSHION`·span, then each edge snapped to the cushion→cloth brightness drop. Cloth-colour fit is the fallback.
+- Balls: Hough circles on a cloth-difference image and a grey image, refined to sub-pixel on the rim, rejected when the inside is mostly cloth.
+- Cue ball = the white ball whose aim ray ends in Miniclip's hollow ghost-ball reticle. Aim = polar ray scan + sub-pixel ghost.
+- Target = ball touching the ghost; object/cue lines are fitted on the game's own short white lines when visible.
+
+## Capture feedback (important)
+The guide is visible in screenshots/screen shares (`WDA_NONE`). To stop it feeding back into detection, every stroke is drawn at ≤60% alpha and the exact rendered layer is un-blended from each capture (`remove_overlay`); the control panel is greyed out in captures; analysis waits `PAINT_SETTLE` after a repaint. Any change to drawing must keep these working — test the detect → draw → capture loop, not just window visibility (`tests/test_aim_alignment_and_capture.py`). `POOL_OVERLAY_DEBUG_DIR` dumps capture/layer/cleaned frames.
+
+## Checks after a change
+```
+.venv\Scripts\python -m unittest discover -s tests -v
+.venv\Scripts\python -m py_compile main.py pool_physics.py fake_game.py stress_test.py live_check.py
+.venv\Scripts\python stress_test.py --count 300 --quiet
+```
+Last known results: 45 tests pass; 283/300 held-out synthetic shots pass every check; live check 23/23.
+
+## Known limits
+- Ghost ring is hidden when the struck ball nearly touches the cue ball.
+- Balls boxed in inside a rack can be off by ~0.5 radius.
+- Not yet verified on a real live AirPlay mirror or at Windows display scaling other than 100%.
