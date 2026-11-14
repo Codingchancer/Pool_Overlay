@@ -22,7 +22,6 @@ Border rules:
 |---|---|---|---|
 | Real-game precision | detector | Jartartarta | `jartartarta/real-game-precision` |
 | Prediction: more cushion bounces | detector | Jartartarta | `jartartarta/more-bounces` |
-| Real-time overlay (faster guide updates). Also touches `detector.py`: faster ghost-ball search and target fit, same results. Jartartarta: pull main after it merges | overlay (+ detector speed, OK'd by Codingchancer) | Codingchancer | `codingchancer/realtime-overlay` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Real-game precision:** play with the guide on; wherever the guide's aim line, target ball or object/cue path does not sit exactly on the game's own white lines, save the frame (set `POOL_OVERLAY_DEBUG_DIR`, keep `capture.png`/`cleaned.png`) and have your Claude fix the detector. Keep real screenshots out of git (`outputs/` is ignored; the repo is public).
@@ -38,6 +37,7 @@ Border rules:
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
 
 ## Done
+- [x] Real-time overlay: ~15 guide updates/s while aiming instead of 3-5 (tracking mode, no settle wait, faster ghost search with identical results; live 12/12). Jartartarta: pull main, `detector.py` changed (speed only).
 - [x] Set up (Jartartarta): `setup.bat` + `run.bat` work on Jartartarta's Windows PC (Python 3.15.1; 71 tests OK, 19 skipped without screenshots; stress test 280/300).
 - [x] Steadier guide: on a still shot the guide is redrawn on 0 of 144 noisy frames instead of 132; real changes show on the next frame.
 - [x] Guide settings: colours, thickness, bounce on/off, saved between runs; feedback removal tested for every style.
