@@ -9,7 +9,7 @@ Each person only edits the files they own. That way both of you can work at the 
 | Owner | Area | Files |
 |---|---|---|
 | **Jartartarta** (+ his Claude, run on his Windows PC next to the real game) | **detector / precision**: everything that reads the game image | `detector.py`, `fake_game.py`, `stress_test.py`, `tests/test_synthetic_table.py` |
-| **Codingchancer** (+ his Claude) | **overlay + simulator**: everything that draws, captures, or simulates | `capture.py`, `overlay.py`, `simulator_ui.py`, `pool_physics.py`, `pool_rules.py`, `live_check.py`, `tests/test_pool_physics.py`, `tests/test_pool_rules.py` |
+| **Codingchancer** (+ his Claude) | **overlay + simulator**: everything that draws, captures, or simulates | `capture.py`, `overlay.py`, `simulator_ui.py`, `pool_physics.py`, `pool_rules.py`, `live_check.py`, `tests/test_pool_physics.py`, `tests/test_pool_rules.py`, `tests/test_guide_settings.py` |
 | shared (tell the other first) | **repo** | `main.py`, `README.md`, `CLAUDE.md`, `TASKS.md`, `setup.bat`, `run.bat`, `requirements.txt`, the other test files |
 
 Border rules:
@@ -20,7 +20,7 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| Guide settings: line colours, thickness and length, saved between runs | overlay | Codingchancer (Claude) | `codingchancer/guide-settings` |
+| | | | |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Set up:** install the Claude desktop app, open the Code tab in your `Pool_Overlay` folder (not a cloud session), run `setup.bat`, then `run.bat` with the phone mirrored. Your Claude can then run the app next to the real game.
@@ -35,6 +35,7 @@ Border rules:
 - [ ] **Steadier guide:** less flicker between frames when the shot hasn't changed.
 
 ## Done
+- [x] Guide settings: colours, thickness, bounce on/off, saved between runs; feedback removal tested for every style.
 - [x] Simulator UI: power bar with break zone, two-player scoreboard, aim by clicking the cloth.
 - [x] Stronger break: power above 80% is break power (a full break scatters ~12 of 15 balls instead of 2); normal shots unchanged.
 - [x] Simulator 8-ball game mode: break, groups, turns, fouls, ball in hand, win/lose (`pool_rules.py`).

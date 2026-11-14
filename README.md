@@ -50,7 +50,9 @@ Tests in `tests/test_aim_alignment_and_capture.py` draw the guide over two real 
 - **Target:** the ball that touches the ghost ball. When the ghost rests on a cushion and a ball lies just beside it, that ball only counts if the game draws an object-ball line from it.
 - **After impact:** Miniclip draws short white lines for the object ball and the cue ball. When they are visible, the app fits them directly and extends them through a cushion bounce. When the object line is hidden (it runs across other balls), the struck ball's centre is fitted one diameter from the ghost centre and the direction follows from that; the cue ball leaves at 90° (no spin). Paths stop at the first ball in the way, which gets an orange dotted ring.
 
-Colours: cyan = cue ball to the ghost ball, yellow = object ball, magenta dashes = cue ball after impact, orange dots = a ball in the way. The game's own guide stays white.
+Default colours: cyan = cue ball to the ghost ball, yellow = object ball, magenta dashes = cue ball after impact, orange dots = a ball in the way. The game's own guide stays white.
+
+**Guide style…** (in the control panel) changes the colours of the three lines, the line thickness (thin to extra thick), and whether paths continue after a cushion bounce. Changes show at once and are kept for the next start. Opacity stays fixed and white is not offered, so the guide can still be removed from every capture and never looks like the game's own white lines; the screenshot tester draws in the same style.
 
 If the cue ball or aim ray cannot be identified confidently, the guide says so instead of guessing. The live overlay sees a still frame, so it cannot know the shot power or spin setting. Paths beyond the game's own short lines are estimates.
 

@@ -11,10 +11,13 @@ import mss
 import numpy as np
 from PySide6.QtCore import Qt, QTimer, QRect, QSettings, QObject, Signal, QRunnable, QThreadPool
 from PySide6.QtGui import QPainter, QGuiApplication
-from PySide6.QtWidgets import QWidget, QMainWindow, QPushButton, QLabel, QVBoxLayout, QHBoxLayout
+from PySide6.QtGui import QColor, QIcon, QPixmap
+from PySide6.QtWidgets import (QWidget, QMainWindow, QPushButton, QLabel, QVBoxLayout, QHBoxLayout, QDialog,
+                               QComboBox, QCheckBox, QFormLayout)
 
-from capture import (PAINT_SETTLE, _debug_dump, logical_to_physical, paint_guide,
-                     physical_to_logical, remove_overlay, render_guide_layer)
+from capture import (GUIDE_COLOURS, GUIDE_THICKNESS, PAINT_SETTLE, DEFAULT_STYLE, GuideStyle, _debug_dump,
+                     load_guide_style, logical_to_physical, paint_guide, physical_to_logical, remove_overlay,
+                     render_guide_layer, save_guide_style)
 from detector import Detection, detect, find_table_bounds
 from simulator_ui import ScreenshotTester, ShotSimulator
 
@@ -98,6 +101,7 @@ class Overlay(QWidget):
         self.active = False
         self.adjusting = True
         self.detection = Detection()
+        self.guide_style = load_guide_style(self.settings)
         self._drag = None
         self._resize = False
         # What the last paintEvent drew, so analysis can subtract exactly that.
@@ -132,8 +136,14 @@ class Overlay(QWidget):
         """Pixels the overlay currently shows on screen, or None if it is hidden."""
         if not self.isVisible() or self._painted is None:
             return None
-        detection, adjusting, active, width, height, ui_scale = self._painted
-        return render_guide_layer(detection, width, height, adjusting, active, ui_scale)
+        detection, adjusting, active, width, height, ui_scale, style = self._painted
+        return render_guide_layer(detection, width, height, adjusting, active, ui_scale, style)
+
+    def set_style(self, style: GuideStyle):
+        """Change how the guide looks and remember it for the next start."""
+        self.guide_style = style
+        save_guide_style(self.settings, style)
+        self.update()
 
     def set_active(self, active: bool):
         self.active = active
@@ -179,10 +189,75 @@ class Overlay(QWidget):
         width, height = round(self.width() * scale), round(self.height() * scale)
         p = QPainter(self)
         p.scale(1 / scale, 1 / scale)
-        paint_guide(p, self.detection, width, height, self.adjusting, self.active, scale)
+        style = self.guide_style
+        paint_guide(p, self.detection, width, height, self.adjusting, self.active, scale, style)
         p.end()
-        self._painted = (self.detection, self.adjusting, self.active, width, height, scale)
+        # The style is part of what was painted: the subtracted layer must match it.
+        self._painted = (self.detection, self.adjusting, self.active, width, height, scale, style)
         self.painted_at = time.monotonic()
+
+
+def _swatch(name: str) -> QIcon:
+    pixmap = QPixmap(14, 14)
+    pixmap.fill(QColor(*GUIDE_COLOURS[name]))
+    return QIcon(pixmap)
+
+
+class GuideSettings(QDialog):
+    """Colours, thickness and bounce for the guide; changes show at once and are saved."""
+
+    def __init__(self, overlay, parent=None, on_change=None):
+        super().__init__(parent)
+        self.setWindowTitle("Guide style")
+        self.overlay = overlay
+        self.on_change = on_change
+        self.colour_boxes = {}
+        form = QFormLayout()
+        for which, label in (("aim", "Aim line (cue ball → ghost)"), ("object", "Object ball path"),
+                             ("cue", "Cue ball after impact")):
+            box = QComboBox()
+            for name in GUIDE_COLOURS:
+                box.addItem(_swatch(name), name.capitalize(), name)
+            box.currentIndexChanged.connect(self.apply)
+            self.colour_boxes[which] = box
+            form.addRow(label, box)
+        self.thickness = QComboBox()
+        for name, value in GUIDE_THICKNESS.items():
+            self.thickness.addItem(name, value)
+        self.thickness.currentIndexChanged.connect(self.apply)
+        form.addRow("Line thickness", self.thickness)
+        self.bounce = QCheckBox("Show the path after a cushion bounce")
+        self.bounce.toggled.connect(self.apply)
+        form.addRow("Length", self.bounce)
+        reset = QPushButton("Reset to default"); reset.clicked.connect(lambda: self.show_style(DEFAULT_STYLE, apply=True))
+        note = QLabel("Opacity stays fixed so the guide can be removed from screen captures. "
+                      "White is not offered because the game's own lines are white.")
+        note.setWordWrap(True); note.setStyleSheet("color:#667085")
+        layout = QVBoxLayout(self); layout.addLayout(form); layout.addWidget(reset); layout.addWidget(note)
+        self.show_style(overlay.guide_style)
+
+    def show_style(self, style: GuideStyle, apply: bool = False):
+        widgets = list(self.colour_boxes.values()) + [self.thickness, self.bounce]
+        for widget in widgets:
+            widget.blockSignals(True)
+        for which, box in self.colour_boxes.items():
+            box.setCurrentIndex(box.findData(getattr(style, f"{which}_colour")))
+        self.thickness.setCurrentIndex(self.thickness.findData(style.thickness))
+        self.bounce.setChecked(style.show_bounce)
+        for widget in widgets:
+            widget.blockSignals(False)
+        if apply:
+            self.apply()
+
+    def current_style(self) -> GuideStyle:
+        return GuideStyle(self.colour_boxes["aim"].currentData(), self.colour_boxes["object"].currentData(),
+                          self.colour_boxes["cue"].currentData(), float(self.thickness.currentData()),
+                          self.bounce.isChecked())
+
+    def apply(self, *_):
+        self.overlay.set_style(self.current_style())
+        if self.on_change:
+            self.on_change()
 
 
 class Control(QMainWindow):
@@ -216,6 +291,10 @@ class Control(QMainWindow):
         self.synthetic_window = None
         self.redetect = QPushButton("Re-detect")
         self.redetect.setEnabled(False)
+        self.style_button = QPushButton("Guide style…")
+        self.style_button.setToolTip("Line colours, thickness and length. Saved for the next start.")
+        self.style_button.clicked.connect(self.open_guide_settings)
+        self.style_window = None
         self.toggle.clicked.connect(self.toggle_guide)
         self.adjust.clicked.connect(self.toggle_adjust)
         self.fit.clicked.connect(self.fit_table)
@@ -225,7 +304,8 @@ class Control(QMainWindow):
         layout.addWidget(self.simulator)
         layout.addWidget(self.screenshot_test)
         layout.addWidget(self.synthetic)
-        layout.addWidget(self.redetect); layout.addWidget(self.label)
+        tools = QHBoxLayout(); tools.addWidget(self.redetect); tools.addWidget(self.style_button)
+        layout.addLayout(tools); layout.addWidget(self.label)
         note = QLabel("Visual estimates only. No gameplay inputs are sent.")
         note.setStyleSheet("color:#667085")
         layout.addWidget(note)
@@ -263,10 +343,23 @@ class Control(QMainWindow):
         self.synthetic_window.raise_()
         self.label.setText("Synthetic test table open · press Fit table, then Enable guide")
 
+    def open_guide_settings(self):
+        if self.style_window is None:
+            self.style_window = GuideSettings(self.overlay, self, on_change=self._style_changed)
+        self.style_window.show(); self.style_window.raise_(); self.style_window.activateWindow()
+
+    def _style_changed(self):
+        if self.screenshot_window is not None:
+            self.screenshot_window.canvas.guide_style = self.overlay.guide_style
+            self.screenshot_window.canvas.update()
+
     def open_screenshot_tester(self):
         if self.screenshot_window is None:
             self.screenshot_window = ScreenshotTester()
             self.screenshot_window.closed.connect(self.restore_overlay)
+        # The tester draws exactly what the live guide would, in the same style.
+        self.screenshot_window.canvas.guide_style = self.overlay.guide_style
+        self.screenshot_window.canvas.update()
         self.suspend_overlay()
         self.screenshot_window.show(); self.screenshot_window.raise_(); self.screenshot_window.activateWindow()
 

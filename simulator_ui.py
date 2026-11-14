@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QWidget, QMainWindow, QPushButton, QLabel, QVBoxL
 from pool_physics import Ball as PhysicsBall, simulate_shot
 from pool_rules import EIGHT, EightBallGame, ShotFacts
 
-from capture import paint_guide
+from capture import DEFAULT_STYLE, paint_guide
 from detector import Detection, collision_paths, detect, trace_bounces
 
 
@@ -700,7 +700,8 @@ class ScreenshotCanvas(QWidget):
         p.scale(scale, scale)
         p.drawImage(0, 0, self.image)
         # Same drawing as the live overlay, with stroke widths kept constant on screen.
-        paint_guide(p, self.detection, iw, ih, adjusting=False, active=True, ui_scale=1 / scale)
+        paint_guide(p, self.detection, iw, ih, adjusting=False, active=True, ui_scale=1 / scale,
+                    style=getattr(self, "guide_style", DEFAULT_STYLE))
         p.end()
 
 
