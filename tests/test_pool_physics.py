@@ -17,25 +17,58 @@ class PoolPhysicsTests(unittest.TestCase):
         self.assertGreater(max(object_x), 350)
 
     def test_draw_comes_back_and_follow_runs_through(self):
+        # 80% power: the strongest normal shot (above that is break power).
         balls = [Ball(0, 100, 250, 12), Ball(1, 300, 250, 12)]
-        end = {top: simulate_shot(balls, (0, 0, 1000, 500), 0, 1.0, spin=(0, top)).frames[-1][0].x
+        end = {top: simulate_shot(balls, (0, 0, 1000, 500), 0, .8, spin=(0, top)).frames[-1][0].x
                for top in (-1, 0, 1)}
-        self.assertLess(end[-1], 276 - 40)          # draw: back from the contact point
+        self.assertLess(end[-1], 276 - 30)          # draw: back from the contact point
         self.assertGreater(end[0], 276)             # centre: rolls on a little
         self.assertGreater(end[1], end[0] + 80)     # follow: well through
         for top in (-1, 0, 1):
-            frames = simulate_shot(balls, (0, 0, 1000, 500), 0, 1.0, spin=(0, top)).frames
+            frames = simulate_shot(balls, (0, 0, 1000, 500), 0, .8, spin=(0, top)).frames
             self.assertTrue(all(abs(frame[0].y - 250) < 1e-6 for frame in frames), "straight shot must stay straight")
 
     def test_english_changes_the_angle_off_a_cushion(self):
         # Straight into the right cushion: right english (shooter facing right,
         # so their right is down the screen) comes off downwards, left english up.
         def end_y(side):
-            return simulate_shot([Ball(0, 100, 250, 12)], (0, 0, 500, 500), 0, 1.0, spin=(side, 0)).frames[-1][0].y
+            return simulate_shot([Ball(0, 100, 250, 12)], (0, 0, 500, 500), 0, .8, spin=(side, 0)).frames[-1][0].y
         self.assertAlmostEqual(end_y(0), 250, delta=1e-6)
         self.assertGreater(end_y(1), 250 + 50)
         self.assertLess(end_y(-1), 250 - 50)
         self.assertAlmostEqual(end_y(1) - 250, 250 - end_y(-1), delta=1)
+
+    def test_power_up_to_80_percent_is_unchanged_and_above_it_breaks(self):
+        def speed(power):
+            # Distance a lone ball needs to stop is a clean proxy for its start speed.
+            frames = simulate_shot([Ball(0, 50, 250, 10)], (0, 0, 100000, 500), 0, power).frames
+            return frames[-1][0].x - 50
+        legacy = lambda power: 150 + 480 * power
+        for power in (.1, .5, .8):
+            ratio = speed(power) / speed(.5)
+            self.assertAlmostEqual(ratio, (legacy(power) / legacy(.5)) ** 2, delta=.03)
+        self.assertGreater(speed(1.0), speed(.8) * 10)
+
+    def test_full_power_break_scatters_the_rack(self):
+        r = 14
+        rack = []
+        number = 1
+        for row in range(5):
+            for slot in range(row + 1):
+                rack.append(Ball(number, 680 + row * r * 1.78, 250 + (slot - row / 2) * r * 2.04, r))
+                number += 1
+        balls = [Ball(0, 200, 250, r)] + rack
+        for angle in (0, .5, -.7):
+            result = simulate_shot(balls, (0, 0, 924, 462), angle, 1.0)
+            final = result.frames[-1]
+            moved = sum(1 for f, b in zip(final[1:], balls[1:]) if ((f.x - b.x) ** 2 + (f.y - b.y) ** 2) ** .5 > 2 * r)
+            self.assertGreaterEqual(moved, 8, f"break at {angle} deg moved only {moved} balls")
+            for frame in result.frames:
+                live = [(s.x, s.y) for s in frame if not s.pocketed]
+                for i in range(len(live)):
+                    for j in range(i + 1, len(live)):
+                        gap = ((live[i][0] - live[j][0]) ** 2 + (live[i][1] - live[j][1]) ** 2) ** .5
+                        self.assertGreater(gap, 2 * r - 2, "balls passed through each other")
 
     def test_a_rolling_ball_comes_to_rest(self):
         result = simulate_shot([Ball(0, 100, 250, 12)], (0, 0, 2000, 500), 0, .3, spin=(0, .5))

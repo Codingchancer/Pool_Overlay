@@ -20,7 +20,7 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| Stronger break: make a full-power break scatter the rack | simulator | Codingchancer (Claude) | `codingchancer/stronger-break` |
+| | | | |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Set up:** install the Claude desktop app, open the Code tab in your `Pool_Overlay` folder (not a cloud session), run `setup.bat`, then `run.bat` with the phone mirrored. Your Claude can then run the app next to the real game.
@@ -37,6 +37,7 @@ Border rules:
 - [ ] **Steadier guide:** less flicker between frames when the shot hasn't changed.
 
 ## Done
+- [x] Stronger break: power above 80% is break power (a full break scatters ~12 of 15 balls instead of 2); normal shots unchanged.
 - [x] Simulator 8-ball game mode: break, groups, turns, fouls, ball in hand, win/lose (`pool_rules.py`).
 - [x] Simulator spin: follow, draw and english (sliding/rolling model), spin ball control, physics-based cue-ball preview.
 - [x] Split `main.py` into `detector.py`, `capture.py`, `overlay.py`, `simulator_ui.py` (no behaviour change: 45 tests, identical stress-test output, live 8/8).
