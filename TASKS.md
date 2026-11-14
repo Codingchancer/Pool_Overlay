@@ -23,7 +23,6 @@ Border rules:
 | | | | |
 
 ## Next — Jartartarta (detector / precision)
-- [ ] **Set up:** install the Claude desktop app, open the Code tab in your `Pool_Overlay` folder (not a cloud session), run `setup.bat`, then `run.bat` with the phone mirrored. Your Claude can then run the app next to the real game.
 - [ ] **Real-game precision:** play with the guide on; wherever the guide's aim line, target ball or object/cue path does not sit exactly on the game's own white lines, save the frame (set `POOL_OVERLAY_DEBUG_DIR`, keep `capture.png`/`cleaned.png`) and have your Claude fix the detector. Keep real screenshots out of git (`outputs/` is ignored; the repo is public).
 - [ ] **Real-game tests:** turn the saved bad frames into tests that skip when the image is missing (like the existing screenshot tests), so fixes stay fixed.
 - [ ] Ghost ring hidden when the struck ball nearly touches the cue ball: find another cue for that case.
@@ -34,6 +33,7 @@ Border rules:
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
 
 ## Done
+- [x] Set up (Jartartarta): `setup.bat` + `run.bat` work on Jartartarta's Windows PC (Python 3.15.1; 71 tests OK, 19 skipped without screenshots; stress test 280/300).
 - [x] Steadier guide: on a still shot the guide is redrawn on 0 of 144 noisy frames instead of 132; real changes show on the next frame.
 - [x] Guide settings: colours, thickness, bounce on/off, saved between runs; feedback removal tested for every style.
 - [x] Simulator UI: power bar with break zone, two-player scoreboard, aim by clicking the cloth.
