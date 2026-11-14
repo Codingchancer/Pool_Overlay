@@ -24,7 +24,7 @@ To run by hand instead: `py -3.15 -m venv .venv`, `.venv\Scripts\python -m pip i
 3. Select **Enable guide**. Use **Re-detect** if the table view changes. Open **Shot simulator** to practise without the phone mirror, or **Test a screenshot** to check the detector on a saved image.
 4. To see the live overlay working without a phone, open **Synthetic test table**, then press **Fit table** and **Enable guide**. A new shot appears every 4 seconds (Space or → for the next one).
 
-The guide starts disabled. It checks its screen rectangle about eight times per second, skips unchanged frames, and runs image analysis in the background so the controls stay responsive.
+The guide starts disabled. It checks its screen rectangle about eight times per second, skips unchanged frames, and runs image analysis in the background so the controls stay responsive. While the shot stays the same (cue ball, ghost ball, target and aim agree with what is drawn, within the detector's frame-to-frame noise), the guide is not redrawn, so it stays perfectly still instead of shimmering; if one frame misses the aim line, the last guide stays up for up to half a second. Any real change is drawn on the next frame.
 
 ## Screenshots and screen sharing
 
