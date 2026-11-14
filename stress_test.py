@@ -195,6 +195,16 @@ def evaluate(seed: int, kind: str | None = None, cloth: str | int = "blue"):
     else:
         if d.target is not None:
             problems.append(f"target: reported {d.target[:2]} but the aim hits no ball")
+    # Pot or miss: only judged when the truth is clear of a decision boundary
+    # by a quarter radius (a pixel of angle error can flip a near-jaw call).
+    target_found = (truth.target is not None and d.target is not None and
+                    np.hypot(d.target[0] - truth.balls[truth.target][0],
+                             d.target[1] - truth.balls[truth.target][1]) <= r * .5)
+    if target_found and truth.pot_margin >= r * .25:
+        said = getattr(d, "pot", None)
+        if truth.pot is None and said == "pot" or truth.pot == "pot" and said != "pot"                 or truth.pot == "jaw" and said is None:
+            problems.append(f"pot: said {said}, truth {truth.pot}")
+        stats["pot_agree"] = float(said == truth.pot)
     # Paths through several cushion bounces.
     others = [p for n, p in truth.balls.items() if n != truth.target]
     checks = []

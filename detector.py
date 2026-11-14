@@ -30,6 +30,11 @@ class Detection:
     # Unit directions the object ball and cue ball leave the impact in.
     object_dir: tuple[float, float] | None = None
     cue_dir: tuple[float, float] | None = None
+    # Does the struck ball drop: "pot", "jaw" (it hits the pocket's jaw) or
+    # None (no pocket on its path, or a ball in the way), and that pocket's
+    # centre in frame pixels.
+    pot: str | None = None
+    pot_pocket: tuple[int, int] | None = None
     note: str = "Guide is off"
 
 
@@ -563,6 +568,71 @@ def trace_bounces(start: tuple[float, float], direction: tuple[float, float],
     return result
 
 
+# Pocket holes as a share of the pocket-to-pocket span (as drawn on Miniclip's
+# table; the same numbers as fake_game).
+CORNER_POCKET_SPAN = .032
+MIDDLE_POCKET_SPAN = .024
+# A ball drops when its centre passes within the hole radius minus
+# POT_DROP_RADII ball radii of the pocket centre; within the hole radius plus
+# POT_JAW_RADII it hits the jaw. An approximation: no pocket-angle or speed
+# effects (a fast ball can rattle out of a pocket in the game).
+POT_DROP_RADII = .4
+POT_JAW_RADII = .5
+# How far past the end of a leg (where it meets the cushion) a pocket counts.
+POT_REACH_RADII = 6.0
+
+
+def pocket_holes(table: tuple[int, int, int, int]) -> list[tuple[float, float, float]]:
+    """(x, y, hole radius) of the six pockets, from the cushion-nose rectangle."""
+    left, top, width, height = table
+    span = width / (1 - 2 * POCKET_TO_CUSHION)
+    inset = POCKET_TO_CUSHION * span
+    right, bottom = left + width, top + height
+    corner, middle = span * CORNER_POCKET_SPAN, span * MIDDLE_POCKET_SPAN
+    return [(left - inset, top - inset, corner), (left + width / 2, top - 2 * inset, middle),
+            (right + inset, top - inset, corner), (left - inset, bottom + inset, corner),
+            (left + width / 2, bottom + 2 * inset, middle), (right + inset, bottom + inset, corner)]
+
+
+def pocket_outcome(segments, table: tuple[int, int, int, int], radius: float):
+    """("pot" | "jaw" | None, pocket centre) for a ball following ``segments``.
+
+    On each leg, a pocket ahead of the ball near where the leg meets the
+    cushion decides it by how close the ball's centre line passes the pocket
+    centre. A leg that ends short of the cushion was stopped by a ball, and a
+    pocket beyond that ball is not reached.
+    """
+    left, top, width, height = table
+    bounds = (left + radius, top + radius, left + width - radius, top + height - radius)
+    holes = pocket_holes(table)
+    for (sx, sy), (ex, ey) in segments or []:
+        length = float(np.hypot(ex - sx, ey - sy))
+        if length < 1e-6:
+            continue
+        ux, uy = (ex - sx) / length, (ey - sy) / length
+        at_cushion = min(abs(ex - bounds[0]), abs(ey - bounds[1]),
+                         abs(ex - bounds[2]), abs(ey - bounds[3])) <= 1.5
+        best = None
+        for px, py, hole in holes:
+            t = (px - sx) * ux + (py - sy) * uy
+            if t <= 0 or t > length + POT_REACH_RADII * radius or (not at_cushion and t > length):
+                continue
+            d = abs((px - sx) * uy - (py - sy) * ux)
+            if d <= hole - POT_DROP_RADII * radius:
+                outcome = "pot"
+            elif d <= hole + POT_JAW_RADII * radius:
+                outcome = "jaw"
+            else:
+                continue
+            if best is None or t < best[0]:
+                best = (t, outcome, (int(round(px)), int(round(py))))
+        if best is not None:
+            return best[1], best[2]
+        if not at_cushion:
+            break
+    return None, None
+
+
 def collision_paths(cue: tuple[int, int, int], target: tuple[int, int, int],
                     direction: tuple[float, float], table: tuple[int, int, int, int],
                     contact: tuple[float, float] | None = None, radius: float | None = None,
@@ -624,7 +694,7 @@ def predict_shot(roi: np.ndarray, table: tuple[int, int, int, int],
     """
     left, top, width, height = table
     empty = {"aim": [], "cue": [], "object": [], "target": None, "ghost": None, "blockers": [],
-             "aim_dir": None, "object_dir": None, "cue_dir": None}
+             "aim_dir": None, "object_dir": None, "cue_dir": None, "pot": None, "pot_pocket": None}
     cue_local = (cue[0] - left, cue[1] - top, cue[2])
     balls_local = [(bx-left, by-top, br, kind) for bx, by, br, kind in balls]
     cx, cy, cr = cue
@@ -801,9 +871,10 @@ def predict_shot(roi: np.ndarray, table: tuple[int, int, int, int],
         ox, oy = selected[0] - contact_point[0], selected[1] - contact_point[1]
         on = float(np.hypot(ox, oy))
         obj_dir = (ox / on, oy / on) if on > 1e-6 else None
+    pot, pot_pocket = pocket_outcome(object_path, table, ball_r)
     return {"aim": approach, "cue": cue_path, "object": object_path, "target": target,
             "ghost": ghost_int, "blockers": blockers, "aim_dir": (ux, uy),
-            "object_dir": obj_dir, "cue_dir": final_cue,
+            "object_dir": obj_dir, "cue_dir": final_cue, "pot": pot, "pot_pocket": pot_pocket,
             "note": f"Aim ray matched · target ({bx},{by}) at {angle:.1f}° · "
                     f"{' + '.join(sources)} · paths are estimates"}
 
@@ -1505,5 +1576,6 @@ def detect(frame: np.ndarray) -> Detection:
                          cue_segments=shot["cue"], object_segments=shot["object"],
                          target=shot["target"], ghost=shot["ghost"], blockers=shot["blockers"],
                          aim_dir=shot["aim_dir"], object_dir=shot["object_dir"], cue_dir=shot["cue_dir"],
+                         pot=shot["pot"], pot_pocket=shot["pot_pocket"],
                          note=f"{shot['note']} · {len(balls)} ball candidates")
     return Detection(table=table, balls=balls, note="Table found · cue ball not confidently identified")
