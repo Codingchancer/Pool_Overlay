@@ -4,6 +4,7 @@ Pure image analysis (OpenCV/numpy): no windows, no screen access."""
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 
 import cv2
 import numpy as np
@@ -52,6 +53,12 @@ def white_guide_mask(roi: np.ndarray, balls: list[tuple[int, int, int, str]],
 
 def _ring_kernel(radius: float) -> np.ndarray:
     """Correlation kernel that rewards a thin white ring with a hollow centre."""
+    # Built once per radius: the same few radii are asked for on every frame.
+    return _ring_kernel_cached(round(float(radius), 4))
+
+
+@lru_cache(maxsize=256)
+def _ring_kernel_cached(radius: float) -> np.ndarray:
     size = int(np.ceil(radius * 1.5)) + 2
     kernel = np.zeros((2 * size + 1, 2 * size + 1), np.float32)
     angles = np.linspace(0, 2 * np.pi, 96, endpoint=False)
@@ -60,6 +67,7 @@ def _ring_kernel(radius: float) -> np.ndarray:
                   for a in angles}
         for x, y in points:
             kernel[y, x] += weight / len(points)
+    kernel.setflags(write=False)  # shared between calls
     return kernel
 
 
@@ -110,30 +118,65 @@ def find_ghost_ball(white: np.ndarray, cue: tuple[int, int, int], direction: tup
         threshold = .25
     if not corridor.any():
         return None
+    # Coarse pass: one ring size over the whole corridor finds where rings
+    # could be. Only small windows around the strongest few spots then get
+    # every ring size (that full sweep over the corridor was most of the time).
+    # Concentric rings of the other sizes peak at the same centres, so the
+    # result matches a full sweep.
+    coarse = cv2.filter2D(crop, -1, _ring_kernel(float(radius)), borderType=cv2.BORDER_CONSTANT)
+    coarse[~corridor] = -1
+    windows = []
+    half = int(np.ceil(radius * .5)) + 3
+    margin = _ring_kernel(radius * 1.16 + .01).shape[0] // 2 + 1
+    for _ in range(3):
+        index = int(np.argmax(coarse))
+        if coarse.flat[index] <= -1:
+            break
+        py, px = divmod(index, coarse.shape[1])
+        windows.append((max(0, py - half), min(crop.shape[0], py + half + 1),
+                        max(0, px - half), min(crop.shape[1], px + half + 1)))
+        coarse[max(0, py - int(radius)):py + int(radius) + 1, max(0, px - int(radius)):px + int(radius) + 1] = -1
     best = None
-    for ring_radius in np.arange(radius * .78, radius * 1.16 + .01, 1.0):
-        score = cv2.filter2D(crop, -1, _ring_kernel(float(ring_radius)), borderType=cv2.BORDER_CONSTANT)
-        score[~corridor] = -1
-        index = int(np.argmax(score))
-        value = float(score.flat[index])
-        if best is None or value > best[0]:
-            iy, ix = divmod(index, score.shape[1])
-            # Sub-pixel peak: a parabola through the neighbours in x and in y.
-            # A whole-pixel centre was ~1 degree of aim on a short shot.
-            fx = fy = 0.0
-            if 0 < ix < score.shape[1] - 1:
-                a, b, c = score[iy, ix - 1], score[iy, ix], score[iy, ix + 1]
-                if a > -1 and c > -1 and (a - 2 * b + c) < 0:
-                    fx = float(np.clip(.5 * (a - c) / (a - 2 * b + c), -.5, .5))
-            if 0 < iy < score.shape[0] - 1:
-                a, b, c = score[iy - 1, ix], score[iy, ix], score[iy + 1, ix]
-                if a > -1 and c > -1 and (a - 2 * b + c) < 0:
-                    fy = float(np.clip(.5 * (a - c) / (a - 2 * b + c), -.5, .5))
-            best = (value, x0 + ix + fx, y0 + iy + fy, float(ring_radius))
+    for wy0, wy1, wx0, wx1 in windows:
+        # Filter a slightly larger patch so values inside the window are the
+        # same as when filtering the whole crop.
+        py0, py1 = max(0, wy0 - margin), min(crop.shape[0], wy1 + margin)
+        px0, px1 = max(0, wx0 - margin), min(crop.shape[1], wx1 + margin)
+        patch = crop[py0:py1, px0:px1]
+        inside = corridor[wy0:wy1, wx0:wx1]
+        for ring_radius in np.arange(radius * .78, radius * 1.16 + .01, 1.0):
+            score = cv2.filter2D(patch, -1, _ring_kernel(float(ring_radius)), borderType=cv2.BORDER_CONSTANT)
+            score = score[wy0 - py0:wy1 - py0, wx0 - px0:wx1 - px0]
+            score[~inside] = -1
+            best = _ring_peak(score, best, wx0 + x0, wy0 + y0, float(ring_radius))
     if best is None or best[0] < threshold:
         return None
     # (x, y, ring radius, ring score)
     return float(best[1]), float(best[2]), best[3], float(best[0])
+
+
+def _ring_peak(score: np.ndarray, best, ox: int, oy: int, ring_radius: float):
+    """Keep ``best`` or replace it with this score map's sub-pixel peak.
+
+    ``(ox, oy)`` is where the map's top-left pixel sits in the white mask.
+    """
+    index = int(np.argmax(score))
+    value = float(score.flat[index])
+    if best is not None and value <= best[0]:
+        return best
+    iy, ix = divmod(index, score.shape[1])
+    # Sub-pixel peak: a parabola through the neighbours in x and in y.
+    # A whole-pixel centre was ~1 degree of aim on a short shot.
+    fx = fy = 0.0
+    if 0 < ix < score.shape[1] - 1:
+        a, b, c = score[iy, ix - 1], score[iy, ix], score[iy, ix + 1]
+        if a > -1 and c > -1 and (a - 2 * b + c) < 0:
+            fx = float(np.clip(.5 * (a - c) / (a - 2 * b + c), -.5, .5))
+    if 0 < iy < score.shape[0] - 1:
+        a, b, c = score[iy - 1, ix], score[iy, ix], score[iy + 1, ix]
+        if a > -1 and c > -1 and (a - 2 * b + c) < 0:
+            fy = float(np.clip(.5 * (a - c) / (a - 2 * b + c), -.5, .5))
+    return value, ox + ix + fx, oy + iy + fy, ring_radius
 
 
 def ray_direction_to_ghost(white: np.ndarray, cue: tuple[float, float, float], ghost: tuple[float, float],
@@ -676,9 +719,19 @@ def fit_target_on_ghost(roi: np.ndarray, ghost: tuple[float, float], target: tup
     (the white ring touches the ball there). Returns the fitted centre, or
     None when the fit is not clearly better than the detected centre.
     """
-    gx, gy = ghost
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    distance = cv2.GaussianBlur(felt_distance_image(roi, hsv, as_float=True), (0, 0), 1.0)
+    # Only a patch around the ghost and struck ball is read (the rim samples
+    # reach at most ~3 radii from the ghost), so only that patch is converted.
+    # The cloth colour is still measured on the whole table, as before.
+    reach = int(np.ceil(radius * 3 + 12))
+    ox, oy = max(0, int(ghost[0]) - reach), max(0, int(ghost[1]) - reach)
+    patch = roi[oy:int(ghost[1]) + reach + 1, ox:int(ghost[0]) + reach + 1]
+    if patch.size == 0:
+        return None
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    distance = cv2.GaussianBlur(felt_distance_image(patch, hsv, as_float=True, reference=_felt_lab(roi)),
+                                (0, 0), 1.0)
+    gx, gy = ghost[0] - ox, ghost[1] - oy
+    target = (target[0] - ox, target[1] - oy)
     base = float(np.arctan2(target[1] - gy, target[0] - gx))
     thetas = base + np.deg2rad(np.arange(-10, 10.01, .2))
     best = None
@@ -703,7 +756,7 @@ def fit_target_on_ghost(roi: np.ndarray, ghost: tuple[float, float], target: tup
             best = (float(scores[i]), float(centres[i, 0]), float(centres[i, 1]))
     if best is None or best[0] < 5:
         return None
-    return best[1], best[2]
+    return best[1] + ox, best[2] + oy
 
 
 def _select_target_on_ray(roi, table, balls, cue, direction, ball_r):
@@ -930,17 +983,40 @@ def felt_reference(roi_hsv: np.ndarray) -> tuple[float, float]:
     return float(np.median(hue[cloth])), float(np.median(sat[cloth]))
 
 
-def felt_distance_image(roi: np.ndarray, roi_hsv: np.ndarray, as_float: bool = False) -> np.ndarray:
+def _felt_lab(roi: np.ndarray, roi_hsv: np.ndarray | None = None) -> np.ndarray:
+    """Median Lab colour of the cloth (all pixels if too little cloth shows)."""
+    if roi_hsv is None:
+        roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
+    cloth = cv2.inRange(roi_hsv, (80, 50, 0), (115, 235, 255))
+    if cv2.countNonZero(cloth) <= 100:
+        cloth = None
+    # Exact median of 8-bit values from each channel's histogram (much faster
+    # than sorting a million pixels; same result as np.median).
+    reference = []
+    for channel in range(3):
+        counts = cv2.calcHist([lab], [channel], cloth, [256], [0, 256]).ravel()
+        cumulative = np.cumsum(counts)
+        n = cumulative[-1]
+        low = int(np.searchsorted(cumulative, (n - 1) // 2 + 1))
+        high = int(np.searchsorted(cumulative, n // 2 + 1))
+        reference.append((low + high) / 2)
+    return np.array(reference, np.float32)
+
+
+def felt_distance_image(roi: np.ndarray, roi_hsv: np.ndarray, as_float: bool = False,
+                        reference: np.ndarray | None = None) -> np.ndarray:
     """How far each pixel's colour is from the cloth (bright = not cloth).
 
     A blue ball on blue cloth has almost no brightness edge, so grey-level
     circle finding misses it; its colour still differs. Lightness is weighted
-    down so the cloth's own vignetting stays dark here.
+    down so the cloth's own vignetting stays dark here. ``reference`` is the
+    cloth's Lab colour when it was measured elsewhere (e.g. on the whole table
+    while ``roi`` is only a patch of it).
     """
     lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32)
-    hue, sat = roi_hsv[:, :, 0], roi_hsv[:, :, 1]
-    cloth = (hue >= 80) & (hue <= 115) & (sat >= 50) & (sat <= 235)
-    reference = np.median(lab[cloth] if np.count_nonzero(cloth) > 100 else lab.reshape(-1, 3), axis=0)
+    if reference is None:
+        reference = _felt_lab(roi, roi_hsv)
     diff = lab - reference
     distance = np.sqrt((diff[:, :, 0] * .5) ** 2 + diff[:, :, 1] ** 2 + diff[:, :, 2] ** 2)
     if as_float:
