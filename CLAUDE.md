@@ -6,7 +6,7 @@ Windows overlay (PySide6 + OpenCV + mss) for Miniclip 8 Ball Pool mirrored from 
 1. At the start: `git checkout main && git pull`, then read `TASKS.md`.
 2. Claim a task before starting: move it to "In progress" in `TASKS.md` with your name and branch, commit only that edit to `main` and push it. If someone else already holds that task or area, pick another or ask.
 3. Work on your own short branch, named `<name>/<task>` (e.g. `sam/ball-detection`). Never commit code directly to `main`, never force-push `main`, never rewrite shared history.
-4. Only touch files and code in your task's area (areas are listed in `TASKS.md`). Big moves — splitting or renaming files, reformatting — get their own task and the other person is told first.
+4. Only touch files you own: `TASKS.md` → "Who owns what" says which files belong to which person (Jartartarta: detector/precision; Codingchancer: overlay + simulator). Ask the user which of the two they are if it isn't clear. Need a change in the other person's files? Open a GitHub issue instead of editing them. Big moves — splitting or renaming files, reformatting — get their own task and the other person is told first.
 5. Commit small, push often, and pull `main` into your branch regularly.
 6. Before merging, run the checks below; all must pass.
 7. Open a pull request, merge it within hours rather than days, then move the task to "Done" in `TASKS.md`.

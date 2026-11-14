@@ -1,32 +1,42 @@
 # Tasks
 
 Shared to-do list for everyone (and every Claude session) working on this repo.
-How to use it is in CLAUDE.md under "Working together". In short: pull, claim a task here in its own small commit to `main`, work on your own branch, merge through a pull request, then move the task to Done.
+How to use it is in CLAUDE.md under "Working together". In short: pull, claim a task here in its own small commit to `main`, work on your own branch, open a pull request, the other person looks at it and merges, then move the task to Done.
 
-Areas, so two people don't edit the same code at once:
-- **detector** — table / ball / cue / aim / ghost detection, `predict_shot`, `fake_game.py`, `stress_test.py`
-- **overlay** — guide window, capture, feedback removal (`remove_overlay`), DPI, `live_check.py`
-- **simulator-ui** — shot simulator, `pool_physics.py`, screenshot tester, control panel
-- **repo** — README, CLAUDE.md, setup/run scripts, file layout
+## Who owns what
+Each person only edits the files they own. That way both of you can work at the same time without merge conflicts.
 
-Files per area: detector → `detector.py`, `fake_game.py`, `stress_test.py`; overlay → `capture.py`, the `Overlay` class in `overlay.py`, `live_check.py`; simulator-ui → `simulator_ui.py`, `pool_physics.py`, the `Control` class in `overlay.py`; repo → docs, scripts, `main.py`. Only one open branch at a time per area, and keep branches short (hours, not days).
+| Owner | Area | Files |
+|---|---|---|
+| **Jartartarta** (+ his Claude, run on his Windows PC next to the real game) | **detector / precision**: everything that reads the game image | `detector.py`, `fake_game.py`, `stress_test.py`, `tests/test_synthetic_table.py` |
+| **Codingchancer** (+ his Claude) | **overlay + simulator**: everything that draws, captures, or simulates | `capture.py`, `overlay.py`, `simulator_ui.py`, `pool_physics.py`, `live_check.py`, `tests/test_pool_physics.py` |
+| shared (tell the other first) | **repo** | `main.py`, `README.md`, `CLAUDE.md`, `TASKS.md`, `setup.bat`, `run.bat`, `requirements.txt`, the other test files |
+
+Border rules:
+- The `Detection` class in `detector.py` is what the overlay draws. Adding a field is fine; renaming or removing one breaks the overlay, so tell the other person first.
+- Need a change in the other person's files? Open a GitHub issue or message them instead of editing it.
+- Adding new tests to a shared test file is fine; don't rewrite the other person's tests.
 
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| Real-game testing: play 8 Ball Pool on the iPhone mirrored to his Windows PC with the overlay on, and report every wrong line, missed ball or bad table fit (how: see below) | testing (no code) | Jartartarta | — |
-| Precision: make aim, target and object/cue paths match the game more closely, fixing what the real-game reports show | detector | Codingchancer (Claude) | `codingchancer/precision` |
+| | | | |
 
-## Next
-- [ ] Check Fit table and the guide at Windows display scaling 125% / 150%. — area: overlay
-- [ ] Ghost ring hidden when the struck ball nearly touches the cue ball: find another cue for that case. — area: detector
-- [ ] Balls boxed in inside a rack can be off by ~0.5 radius. — area: detector
+## Next — Jartartarta (detector / precision)
+- [ ] **Set up:** install the Claude desktop app, open the Code tab in your `Pool_Overlay` folder (not a cloud session), run `setup.bat`, then `run.bat` with the phone mirrored. Your Claude can then run the app next to the real game.
+- [ ] **Real-game precision:** play with the guide on; wherever the guide's aim line, target ball or object/cue path does not sit exactly on the game's own white lines, save the frame (set `POOL_OVERLAY_DEBUG_DIR`, keep `capture.png`/`cleaned.png`) and have your Claude fix the detector. Keep real screenshots out of git (`outputs/` is ignored; the repo is public).
+- [ ] **Real-game tests:** turn the saved bad frames into tests that skip when the image is missing (like the existing screenshot tests), so fixes stay fixed.
+- [ ] Ghost ring hidden when the struck ball nearly touches the cue ball: find another cue for that case.
+- [ ] Balls boxed in inside a rack can be off by ~0.5 radius.
+- [ ] Raise the synthetic pass rate (`stress_test.py --count 300`) from 283/300 towards 297+/300 without making real-game results worse.
 
-## How to report a real-game problem (Jartartarta)
-1. Run `run.bat`, mirror the phone with AirPlay, press **Fit table**, then **Enable guide**.
-2. When the guide is wrong, take a screenshot right away (Win+Shift+S) and also note: what was wrong (aim line, target ball, object/cue path, table edges, a ball not seen), and roughly by how much.
-3. Open a GitHub issue in this repo (Issues → New issue), paste the screenshot and the note. One issue per problem. The repo is public, so crop out your player name/avatar first.
-4. Optional, most useful: set `POOL_OVERLAY_DEBUG_DIR` to a folder before starting the app; then attach that folder's `capture.png` and `cleaned.png` from the bad moment too.
+## Next — Codingchancer (overlay + simulator)
+- [ ] **Simulator spin:** top spin, back spin and side spin (english) in `pool_physics.py`, with a spin control in the simulator.
+- [ ] **Simulator 8-ball rules:** break, solids/stripes, turns, fouls (scratch, wrong ball first, no rail), ball in hand, win/lose on the 8.
+- [ ] **Simulator UI:** place the cue ball by hand, a power bar, show whose turn it is and which group they have.
+- [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
+- [ ] **Guide settings:** line colours, thickness and length, saved between runs.
+- [ ] **Steadier guide:** less flicker between frames when the shot hasn't changed.
 
 ## Done
 - [x] Split `main.py` into `detector.py`, `capture.py`, `overlay.py`, `simulator_ui.py` (no behaviour change: 45 tests, identical stress-test output, live 8/8).
