@@ -219,6 +219,50 @@ class ClothColourTests(unittest.TestCase):
         self.assertGreaterEqual(found, 8)
 
 
+class PotTests(unittest.TestCase):
+    def test_pocket_outcome_geometry(self):
+        import detector
+
+        table, r = (100, 100, 1000, 500), 13.5
+        left, top = 100 + r, 100 + r
+        holes = detector.pocket_holes(table)
+        px, py, _ = holes[0]  # top-left corner pocket
+
+        def path(start, toward):
+            ux, uy = toward[0] - start[0], toward[1] - start[1]
+            return detector.trace_bounces(start, (ux, uy), (left, top, 1100 - r, 600 - r), r, max_bounces=3)
+
+        straight = path((600, 400), (px, py))
+        self.assertEqual(detector.pocket_outcome(straight, table, r), ("pot", (int(round(px)), int(round(py)))))
+        # Along the diagonal moved sideways by the hole radius: hits the jaw.
+        # (At a shallow angle the same offset meets the cushion several radii
+        # before the pocket and is a plain bounce.)
+        hole = holes[0][2]
+        side = hole / np.sqrt(2)
+        jaw = path((px + 300 + side, py + 300 - side), (px + side, py - side))
+        self.assertEqual(detector.pocket_outcome(jaw, table, r)[0], "jaw")
+        # Straight at the middle of the long cushion between pockets: no pocket.
+        rail = path((350, 400), (350, 0))
+        self.assertEqual(detector.pocket_outcome(rail, table, r), (None, None))
+        # A ball in the way stops it before the pocket.
+        blocked = detector.trace_bounces((600, 400), (px - 600, py - 400), (left, top, 1100 - r, 600 - r), r,
+                                         max_bounces=3, obstacles=[(400, 287, 13)])
+        self.assertEqual(detector.pocket_outcome(blocked, table, r), (None, None))
+
+    def test_pot_calls_match_the_truth(self):
+        judged = wrong = 0
+        outcomes = set()
+        for seed in range(9300, 9340):
+            *_, truth, d, problems, stats = run(seed, "pot")
+            if "pot_agree" in stats:
+                judged += 1
+                outcomes.add(truth.pot)
+                wrong += any(p.startswith("pot") for p in problems)
+        self.assertGreaterEqual(judged, 25)
+        self.assertEqual(outcomes >= {"pot", None}, True)
+        self.assertLessEqual(wrong, 1)
+
+
 class GameLineReaderTests(unittest.TestCase):
     def test_one_pixel_guide_thread_is_not_read_as_the_game_line(self):
         # Real frame: only a short stub of Miniclip's thick object line shows

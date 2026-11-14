@@ -70,6 +70,82 @@ class Truth:
     object_dir: tuple[float, float] | None
     cue_dir: tuple[float, float] | None
     pockets: list[tuple[float, float]] = field(default_factory=list)
+    # Does the struck ball drop: "pot", "jaw" (hits the pocket's jaw) or None,
+    # which pocket, and how far (px) the decision is from flipping.
+    pot: str | None = None
+    pot_pocket: tuple[float, float] | None = None
+    pot_margin: float = 0.0
+
+
+# Pocket hole radius as a share of the pocket-to-pocket span.
+CORNER_POCKET_SPAN = .032
+MIDDLE_POCKET_SPAN = .024
+# A ball drops when its centre passes within the hole radius minus
+# POT_DROP_RADII ball radii of the pocket centre, and hits the jaw within the
+# hole radius plus POT_JAW_RADII. An approximation of Miniclip's pockets.
+POT_DROP_RADII = .4
+POT_JAW_RADII = .5
+# How far past the end of a leg (where it meets the cushion) a pocket counts.
+POT_REACH_RADII = 6.0
+
+
+def pocket_holes(table):
+    """(x, y, hole radius) of the six pockets."""
+    span = table[2] / (1 - 2 * POCKET_TO_CUSHION)
+    return [(px, py, span * (MIDDLE_POCKET_SPAN if i in (1, 4) else CORNER_POCKET_SPAN))
+            for i, (px, py) in enumerate(pocket_centres(table))]
+
+
+def truth_pot(start, direction, table, radius, balls=(), bounces=3):
+    """Exact pot decision for a ball sent from ``start`` along ``direction``.
+
+    Follows the exact path (``truth_path``); on each leg, a pocket ahead of
+    the ball near where the leg meets the cushion decides it by how close the
+    ball's centre line passes the pocket centre. Returns (outcome, pocket,
+    margin): margin is how far (px) the decision is from flipping, counting
+    pockets just missed and a ball grazed on the way.
+    """
+    points, stop = truth_path(start, direction, table, radius, bounces=bounces, balls=balls)
+    holes = pocket_holes(table)
+    margin = float("inf")
+    for i in range(len(points) - 1):
+        (sx, sy), (ex, ey) = points[i], points[i + 1]
+        length = float(np.hypot(ex - sx, ey - sy))
+        if length < 1e-6:
+            continue
+        ux, uy = (ex - sx) / length, (ey - sy) / length
+        # Balls the leg passes close by could block it with a slightly
+        # different angle (or are only just clipped).
+        for bx, by in balls:
+            along = (bx - sx) * ux + (by - sy) * uy
+            if 0 < along < length + 2 * radius:
+                margin = min(margin, abs(abs((bx - sx) * uy - (by - sy) * ux) - 2 * radius))
+        blocked = stop == "ball" and i == len(points) - 2
+        best = None
+        for px, py, hole in holes:
+            t = (px - sx) * ux + (py - sy) * uy
+            d = abs((px - sx) * uy - (py - sy) * ux)
+            drop, jaw = hole - POT_DROP_RADII * radius, hole + POT_JAW_RADII * radius
+            reach = length + POT_REACH_RADII * radius
+            if d <= jaw and not blocked:
+                # A pocket right at the reach limit could fall either side.
+                margin = min(margin, abs(t - reach))
+            if t <= 0 or t > reach or (blocked and t > length):
+                continue
+            if d <= drop:
+                outcome, edge = "pot", drop - d
+            elif d <= jaw:
+                outcome, edge = "jaw", min(d - drop, jaw - d)
+            else:
+                margin = min(margin, d - jaw)
+                continue
+            if best is None or t < best[0]:
+                best = (t, outcome, (px, py), edge)
+        if best is not None:
+            return best[1], best[2], float(min(margin, best[3]))
+        if blocked:
+            break
+    return None, None, float(margin)
 
 
 def pocket_centres(table):
@@ -188,9 +264,13 @@ def solve_truth(scene: Scene) -> Truth:
         tx, ty = ux - dot * nx, uy - dot * ny
         t = float(np.hypot(tx, ty))
         cue_dir = (tx / t, ty / t) if t > 1e-6 else None
+    pot = (None, None, 0.0)
+    if target is not None:
+        others = [p for n, p in scene.balls.items() if n != target]
+        pot = truth_pot(scene.balls[target], object_dir, scene.table, r, others)
     return Truth(scene.table, r, scene.cue, dict(scene.balls), scene.aim_degrees,
                  ghost if scene.show_guide else None, target, object_dir, cue_dir,
-                 pocket_centres(scene.table))
+                 pocket_centres(scene.table), *pot)
 
 
 # --- antialiased primitives on a float32 BGR canvas -------------------------
@@ -324,7 +404,7 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     cv2.rectangle(canvas, rail_rect[:2], rail_rect[2:], tuple(float(v) for v in _bgr((150, 32, 26))), -1)
     cv2.rectangle(canvas, rail_rect[:2], rail_rect[2:], (40, 25, 60), 2)
     pockets = pocket_centres(scene.table)
-    corner_r, middle_r = span * .032, span * .024
+    corner_r, middle_r = span * CORNER_POCKET_SPAN, span * MIDDLE_POCKET_SPAN
     for i, (px, py) in enumerate(pockets):
         pr = middle_r if i in (1, 4) else corner_r
         fill_disc(canvas, px, py, pr * 1.22, (178, 172, 176))   # metal rim
@@ -458,7 +538,7 @@ def random_scene(seed: int, kind: str | None = None, cloth: str | int = "blue") 
 def _random_scene(seed: int, kind: str | None = None) -> Scene:
     """A random but plausible table state with a guided aim.
 
-    kinds: "scatter" (balls anywhere), "rack" (tight cluster), "cushion"
+    kinds: "pot" (object ball sent at a pocket), "scatter" (balls anywhere), "rack" (tight cluster), "cushion"
     (several balls frozen on cushions), "miss" (aim at an empty cushion).
     """
     rng = np.random.default_rng(seed)
@@ -533,6 +613,32 @@ def _random_scene(seed: int, kind: str | None = None) -> Scene:
     # Choose an aim: at a reachable target with a random cut, or at an empty cushion.
     order = list(placed)
     rng.shuffle(order)
+    if kind == "pot":
+        # Send a ball at a pocket, a little off its centre, so the scene is a
+        # pot, a jaw hit or a near miss.
+        holes = pocket_holes(table)
+        for number in order:
+            bx, by = placed[number]
+            for i in rng.permutation(len(holes)):
+                px, py, hole = holes[i]
+                aim_x, aim_y = px - bx, py - by
+                n = float(np.hypot(aim_x, aim_y))
+                lateral = float(rng.uniform(-1.6, 1.6)) * r
+                ux, uy = (aim_x - aim_y / n * lateral) , (aim_y + aim_x / n * lateral)
+                m = float(np.hypot(ux, uy))
+                ux, uy = ux / m, uy / m
+                gx, gy = bx - 2 * r * ux, by - 2 * r * uy
+                dist = float(np.hypot(gx - cue[0], gy - cue[1]))
+                if dist < 2.5 * r or not inside(gx, gy):
+                    continue
+                # The cue ball must strike from behind (cut under ~75 deg).
+                if ((gx - cue[0]) * ux + (gy - cue[1]) * uy) / dist < .26:
+                    continue
+                scene.aim_degrees = float(np.degrees(np.arctan2(gy - cue[1], gx - cue[0])))
+                truth = solve_truth(scene)
+                if truth.target == number and np.hypot(truth.ghost[0] - gx, truth.ghost[1] - gy) < .5 and                         all(np.hypot(gx - ox, gy - oy) >= 2 * r * .999
+                            for k, (ox, oy) in placed.items() if k != number):
+                    return scene
     for number in order if kind != "miss" else []:
         bx, by = placed[number]
         dist = float(np.hypot(bx - cue[0], by - cue[1]))
