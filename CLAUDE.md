@@ -18,7 +18,7 @@ It is a **visual practice aid only**. Never add code that clicks, aims, moves th
 - `main.py` — entry point only (`python main.py`); re-exports every name from the modules below so `import main` keeps working. New code goes in the modules, not here.
 - `detector.py` — area **detector**: table / ball / cue / aim / ghost detection, `detect`, `predict_shot`, path tracing. Pure OpenCV/numpy, no Qt.
 - `capture.py` — area **overlay**: guide drawing (`paint_guide`, `GUIDE_ALPHA`, `GuideStyle`: colours/thickness/bounce, saved via QSettings; never add white/grey colours or raise the alpha), `render_guide_layer`, `remove_overlay`, `PAINT_SETTLE`, DPI helpers.
-- `overlay.py` — area **overlay** (window) / **simulator-ui** (control panel): `Overlay` guide window, `Control` panel, `CueTracker`, background `AnalysisTask`.
+- `overlay.py` — area **overlay** (window) / **simulator-ui** (control panel): `Overlay` guide window, `Control` panel, `CueTracker`, background `AnalysisTask`; `GuideStabilizer` keeps the drawn guide still while the shot is unchanged (tolerances from measured frame noise).
 - `pool_rules.py` — area **simulator-ui**: `EightBallGame` (turns, groups, fouls, ball in hand, win/lose), pure Python; the physics reports `first_contact`, `rail_after_contact`, `pocket_order` for it.
 - `simulator_ui.py` — area **simulator-ui**: `ShotSimulator`, `SimCanvas`, `ScreenshotTester`.
 - `pool_physics.py` — the simulator's approximate 2D physics: follow/draw/english with the sliding/rolling model; no swerve, squirt, throw, jump or 8-ball rules (the UI and README must keep saying so).

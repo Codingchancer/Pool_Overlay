@@ -64,6 +64,84 @@ class CueTracker:
         return detection
 
 
+def _near(a, b, tolerance: float) -> bool:
+    """Both missing, or both present with centres within ``tolerance`` px."""
+    if a is None or b is None:
+        return a is None and b is None
+    return float(np.hypot(a[0] - b[0], a[1] - b[1])) <= tolerance
+
+
+def _angle_between(u, v) -> float:
+    if u is None or v is None:
+        return 0.0 if u is None and v is None else 180.0
+    dot = max(-1.0, min(1.0, u[0] * v[0] + u[1] * v[1]))
+    return float(np.degrees(np.arccos(dot)))
+
+
+class GuideStabilizer:
+    """Keep the drawn guide still while the shot on screen hasn't changed.
+
+    Every analysed frame gives slightly different numbers (stream noise moves
+    the fitted lines by a fraction of a pixel), and a frame can miss the aim
+    line now and then. Redrawing for each of those makes the guide shimmer.
+    This keeps showing the same guide while the new frame agrees with it
+    within the detector's own noise, and bridges a short gap with no aim line.
+    The shot is decided by the table, the cue ball, the ghost ball, the target
+    and the aim. While those agree, the whole guide stays as drawn, including
+    the rings around other balls and the short after-impact lines: those follow
+    from the shot but jitter more (a boxed-in rack ball by up to ~10 px, the
+    cue-ball line by a few degrees). A real change of the shot is shown at once.
+    """
+    # Frame-to-frame noise on noisy, JPEG-compressed synthetic frames of a
+    # still shot (max): table 1 px, cue ball 2.8 px, ghost 1.4 px, target 2.8 px,
+    # aim 0.1 deg. Tolerances sit just above that and below a visible change.
+    CUE_PX = 3.0
+    GHOST_PX = 2.0
+    TARGET_PX = 3.0
+    TABLE_PX = 2
+    AIM_DEG = .3
+    HOLD_SECONDS = .5
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.shown: Detection | None = None
+        self.confirmed_at = 0.0
+
+    @staticmethod
+    def has_shot(d: Detection | None) -> bool:
+        return d is not None and d.cue is not None and bool(d.aim_segments)
+
+    def same_shot(self, a: Detection, b: Detection) -> bool:
+        if a.table is None or b.table is None or \
+                max(abs(p - q) for p, q in zip(a.table, b.table)) > self.TABLE_PX:
+            return False
+        if not _near(a.cue, b.cue, self.CUE_PX) or not _near(a.ghost, b.ghost, self.GHOST_PX):
+            return False
+        if not _near(a.target, b.target, self.TARGET_PX):
+            return False
+        return _angle_between(a.aim_dir, b.aim_dir) <= self.AIM_DEG
+
+    def update(self, detection: Detection, now: float | None = None) -> Detection:
+        """The detection to draw: the one already shown if nothing really changed."""
+        now = time.monotonic() if now is None else now
+        shown = self.shown
+        if self.has_shot(detection):
+            if self.has_shot(shown) and self.same_shot(shown, detection):
+                self.confirmed_at = now
+                return shown
+            self.shown, self.confirmed_at = detection, now
+            return detection
+        # No aim line in this frame: keep the last guide briefly, unless the
+        # cue ball visibly moved (then the shot is over or being set up anew).
+        if self.has_shot(shown) and now - self.confirmed_at <= self.HOLD_SECONDS and \
+                (detection.cue is None or _near(detection.cue, shown.cue, shown.cue[2])):
+            return shown
+        self.shown = detection
+        return detection
+
+
 class AnalysisSignals(QObject):
     completed = Signal(object, object)
     failed = Signal(str)
@@ -273,6 +351,8 @@ class Control(QMainWindow):
         self.analysis_task = None
         self.thread_pool = QThreadPool.globalInstance()
         self.cue_tracker = CueTracker()
+        self.stabilizer = GuideStabilizer()
+        self._stabilized_rect = None
         self.label = QLabel("Position the guide over the complete pool table, then enable it.")
         self.label.setWordWrap(True)
         self.toggle = QPushButton("Enable guide")
@@ -531,7 +611,7 @@ class Control(QMainWindow):
             self.analyze(); self.timer.start()
         else:
             self.timer.stop(); self.last_thumbnail = None; self.overlay.detection = Detection(note="Guide is off")
-            self.cue_tracker.reset()
+            self.cue_tracker.reset(); self.stabilizer.reset()
             self.overlay.update(); self.label.setText("Guide is off")
 
     def toggle_adjust(self):
@@ -577,8 +657,17 @@ class Control(QMainWindow):
         if not self.overlay.active or self.overlay.adjusting or self.overlay.geometry() != geometry:
             return
         detection = self.cue_tracker.update(detection, geometry)
-        self.overlay.detection = detection
-        self.label.setText(detection.note)
+        if geometry.getRect() != self._stabilized_rect:
+            # The overlay moved or was resized: old coordinates no longer apply.
+            self.stabilizer.reset()
+            self._stabilized_rect = geometry.getRect()
+        shown = self.stabilizer.update(detection)
+        self.label.setText(shown.note)
+        if shown is self.overlay.detection:
+            # Same shot as on screen: no repaint, so the guide stays perfectly
+            # still (and the next capture needs no settle wait).
+            return
+        self.overlay.detection = shown
         self.overlay.update()
 
     def _analysis_failed(self, message: str):
