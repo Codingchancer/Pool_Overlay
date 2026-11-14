@@ -9,7 +9,7 @@ Each person only edits the files they own. That way both of you can work at the 
 | Owner | Area | Files |
 |---|---|---|
 | **Jartartarta** (+ his Claude, run on his Windows PC next to the real game) | **detector / precision**: everything that reads the game image | `detector.py`, `fake_game.py`, `stress_test.py`, `tests/test_synthetic_table.py` |
-| **Codingchancer** (+ his Claude) | **overlay + simulator**: everything that draws, captures, or simulates | `capture.py`, `overlay.py`, `simulator_ui.py`, `pool_physics.py`, `pool_rules.py`, `live_check.py`, `tests/test_pool_physics.py`, `tests/test_pool_rules.py`, `tests/test_guide_settings.py`, `tests/test_steady_guide.py` |
+| **Codingchancer** (+ his Claude) | **overlay + simulator**: everything that draws, captures, or simulates | `capture.py`, `overlay.py`, `simulator_ui.py`, `pool_physics.py`, `pool_rules.py`, `live_check.py`, `tracking.py`, `tests/test_realtime.py`, `tests/test_pool_physics.py`, `tests/test_pool_rules.py`, `tests/test_guide_settings.py`, `tests/test_steady_guide.py` |
 | shared (tell the other first) | **repo** | `main.py`, `README.md`, `CLAUDE.md`, `TASKS.md`, `setup.bat`, `run.bat`, `requirements.txt`, the other test files |
 
 Border rules:
@@ -21,7 +21,8 @@ Border rules:
 | Task | Area | Who | Branch |
 |---|---|---|---|
 | Real-game precision | detector | Jartartarta | `jartartarta/real-game-precision` |
-| Real-time overlay (faster guide updates). Also touches `detector.py`: faster ghost-ball search and target fit, same results. Jartartarta: pull main after it merges | overlay (+ detector speed, OK'd by Codingchancer) | Codingchancer | `codingchancer/realtime-overlay` |
+| Prediction: more cushion bounces | detector | Jartartarta | `jartartarta/more-bounces` |
+| Any cloth colour: the detector only works on blue tables; make it work on green, red, purple, etc. | detector | Jartartarta | `jartartarta/any-cloth-colour` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Real-game precision:** play with the guide on; wherever the guide's aim line, target ball or object/cue path does not sit exactly on the game's own white lines, save the frame (set `POOL_OVERLAY_DEBUG_DIR`, keep `capture.png`/`cleaned.png`) and have your Claude fix the detector. Keep real screenshots out of git (`outputs/` is ignored; the repo is public).
@@ -37,6 +38,7 @@ Border rules:
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
 
 ## Done
+- [x] Real-time overlay: ~15 guide updates/s while aiming instead of 3-5 (tracking mode, no settle wait, faster ghost search with identical results; live 12/12). Jartartarta: pull main, `detector.py` changed (speed only).
 - [x] Set up (Jartartarta): `setup.bat` + `run.bat` work on Jartartarta's Windows PC (Python 3.15.1; 71 tests OK, 19 skipped without screenshots; stress test 280/300).
 - [x] Steadier guide: on a still shot the guide is redrawn on 0 of 144 noisy frames instead of 132; real changes show on the next frame.
 - [x] Guide settings: colours, thickness, bounce on/off, saved between runs; feedback removal tested for every style.

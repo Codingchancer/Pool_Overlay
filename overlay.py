@@ -4,7 +4,9 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+import threading
 import time
+from dataclasses import dataclass
 
 import cv2
 import mss
@@ -17,8 +19,9 @@ from PySide6.QtWidgets import (QWidget, QMainWindow, QPushButton, QLabel, QVBoxL
 
 from capture import (GUIDE_COLOURS, GUIDE_THICKNESS, PAINT_SETTLE, DEFAULT_STYLE, GuideStyle, _debug_dump,
                      load_guide_style, logical_to_physical, paint_guide, physical_to_logical, remove_overlay,
-                     render_guide_layer, save_guide_style)
-from detector import Detection, detect, find_table_bounds
+                     render_guide_layer, save_guide_style, shown_layer)
+from detector import Detection, find_table_bounds
+from tracking import ShotTracker
 from simulator_ui import ScreenshotTester, ShotSimulator
 
 
@@ -142,22 +145,163 @@ class GuideStabilizer:
         return detection
 
 
+@dataclass
+class GrabPlan:
+    """What to capture and how to clean it, gathered on the window thread.
+
+    ``paints`` are the guide drawings that may be on screen, newest first
+    (empty when the overlay is hidden), as ``Overlay.paintEvent`` records them.
+    """
+    region: dict
+    overlay: dict
+    panel: dict | None
+    paints: list
+
+
+def grab_clean(capture, plan: GrabPlan) -> np.ndarray | None:
+    """Capture ``plan.region`` (physical pixels) and undo the guide's own drawing.
+
+    Safe to run off the window thread. Returns None when the capture shows
+    none of the recent guide drawings exactly (the screen was mid-update), so
+    the subtraction would not match.
+    """
+    region = plan.region
+    shot = capture.grab(region)
+    # Straight from mss's BGRA bytes (a third of the time of np.asarray(shot)).
+    frame = cv2.cvtColor(np.frombuffer(shot.bgra, np.uint8).reshape(shot.height, shot.width, 4),
+                         cv2.COLOR_BGRA2BGR)
+    # The control panel is always on top and dark; where it overlaps the
+    # capture (often right above the table) it can merge with a pocket.
+    # Neutral grey is neither dark, felt nor white, so analysis ignores it.
+    if plan.panel is not None:
+        panel = plan.panel
+        shadow = 8  # Windows 11 draws a soft drop shadow outside the frame.
+        px0 = max(0, panel["left"] - shadow - region["left"])
+        py0 = max(0, panel["top"] - shadow - region["top"])
+        px1 = min(frame.shape[1], panel["left"] + panel["width"] + shadow - region["left"])
+        py1 = min(frame.shape[0], panel["top"] + panel["height"] + shadow - region["top"])
+        if px1 > px0 and py1 > py0:
+            frame[py0:py1, px0:px1] = 128
+    if not plan.paints:
+        return frame
+    overlay = plan.overlay
+    size = (overlay["width"], overlay["height"])
+    # Drawings made at another overlay size cannot be what is on screen now.
+    paints = [paint for paint in plan.paints if (paint[3], paint[4]) == size]
+    if not paints or paints[0] is not plan.paints[0]:
+        return None
+    layers = [_layer_for(paint) for paint in paints]
+    # Place the layer where the overlay sits inside the captured region.
+    x0 = overlay["left"] - region["left"]
+    y0 = overlay["top"] - region["top"]
+    fx0, fy0 = max(0, x0), max(0, y0)
+    fx1 = min(frame.shape[1], x0 + size[0])
+    fy1 = min(frame.shape[0], y0 + size[1])
+    if fx1 <= fx0 or fy1 <= fy0:
+        return frame
+    parts = [layer[fy0 - y0:fy1 - y0, fx0 - x0:fx1 - x0] for layer in layers]
+    index = shown_layer(frame[fy0:fy1, fx0:fx1], parts)
+    debug_dir = os.environ.get("POOL_OVERLAY_DEBUG_DIR")
+    if debug_dir:
+        # Opt-in diagnostics: what the screen showed, the guide layer that
+        # is subtracted, and the frame the detector actually analyses.
+        _debug_dump(debug_dir, "capture.png", frame)
+        _debug_dump(debug_dir, "layer.png", layers[0 if index is None else index])
+    if index is None:
+        return None
+    frame[fy0:fy1, fx0:fx1] = remove_overlay(frame[fy0:fy1, fx0:fx1], parts[index])
+    if debug_dir:
+        _debug_dump(debug_dir, "cleaned.png", frame)
+    return frame
+
+
+_layers_lock = threading.Lock()
+_layers: dict[int, tuple] = {}
+
+
+def _layer_for(paint: tuple) -> np.ndarray:
+    """The rendered pixels of a recorded drawing, kept between frames.
+
+    The same drawing stays on screen for many frames; drawing it again for
+    each capture was a large part of the per-frame time.
+    """
+    with _layers_lock:
+        cached = _layers.get(id(paint))
+        if cached is not None and cached[0] is paint:
+            return cached[1]
+    d, adjusting, active, w, h, ui_scale, style = paint
+    layer = render_guide_layer(d, w, h, adjusting, active, ui_scale, style)
+    layer.setflags(write=False)
+    with _layers_lock:
+        _layers[id(paint)] = (paint, layer)
+        while len(_layers) > 6:
+            _layers.pop(next(iter(_layers)))
+    return layer
+
+
+def change_thumbnail(frame: np.ndarray) -> np.ndarray:
+    """A quarter-size grey copy for telling whether the screen changed."""
+    h, w = frame.shape[:2]
+    return cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (max(1, w // 4), max(1, h // 4)),
+                      interpolation=cv2.INTER_AREA)
+
+
+def screen_changed(thumbnail: np.ndarray, last: np.ndarray | None) -> bool:
+    """True unless the frame is the same as the last analysed one.
+
+    Looks for any small spot that changed, not an average over the whole
+    frame: turning the aim a fraction of a degree only moves a thin line and
+    the cue stick, and that must still be analysed. Stream noise averages out
+    over each 4x4 block.
+    """
+    if last is None or last.shape != thumbnail.shape:
+        return True
+    return int(np.count_nonzero(cv2.absdiff(thumbnail, last) > 8)) >= 3
+
+
+_thread_state = threading.local()
+
+
+def _capture_for_this_thread():
+    """An mss capture must stay on the thread that opened it: one per worker."""
+    capture = getattr(_thread_state, "capture", None)
+    if capture is None:
+        capture = _thread_state.capture = mss.MSS()
+    return capture
+
+
 class AnalysisSignals(QObject):
-    completed = Signal(object, object)
+    completed = Signal(object, object, object)
+    skipped = Signal()
     failed = Signal(str)
 
 
 class AnalysisTask(QRunnable):
-    """Run OpenCV away from the window thread to keep the controls smooth."""
-    def __init__(self, frame: np.ndarray, geometry: QRect):
+    """Capture, clean and analyse one frame away from the window thread.
+
+    The window thread only gathers the ``GrabPlan`` (a few rectangles and the
+    recent drawings), so the controls and the guide stay smooth while frames
+    are processed back to back.
+    """
+    def __init__(self, plan: GrabPlan, geometry: QRect, tracker: ShotTracker, last_thumbnail):
         super().__init__()
-        self.frame = frame
+        self.plan = plan
         self.geometry = QRect(geometry)
+        self.tracker = tracker
+        self.last_thumbnail = last_thumbnail
         self.signals = AnalysisSignals()
 
     def run(self):
         try:
-            self.signals.completed.emit(detect(self.frame), self.geometry)
+            shot = grab_clean(_capture_for_this_thread(), self.plan)
+            if shot is None:
+                self.signals.skipped.emit()
+                return
+            thumbnail = change_thumbnail(shot)
+            if not screen_changed(thumbnail, self.last_thumbnail):
+                self.signals.skipped.emit()
+                return
+            self.signals.completed.emit(self.tracker.detect(shot), self.geometry, thumbnail)
         except Exception as exc:
             self.signals.failed.emit(str(exc))
 
@@ -185,6 +329,9 @@ class Overlay(QWidget):
         # What the last paintEvent drew, so analysis can subtract exactly that.
         self._painted = None
         self.painted_at = 0.0
+        # Recent drawings, oldest first, each with the time it was replaced
+        # (None for the current one): the compositor may still show a replaced one.
+        self._paint_history: list[list] = []
         self.setWindowTitle("Pool Practice Guide")
         self.show()
         self._allow_capture()
@@ -271,8 +418,30 @@ class Overlay(QWidget):
         paint_guide(p, self.detection, width, height, self.adjusting, self.active, scale, style)
         p.end()
         # The style is part of what was painted: the subtracted layer must match it.
-        self._painted = (self.detection, self.adjusting, self.active, width, height, scale, style)
-        self.painted_at = time.monotonic()
+        painted = (self.detection, self.adjusting, self.active, width, height, scale, style)
+        now = time.monotonic()
+        if self._painted is None or painted != self._painted:
+            if self._paint_history:
+                self._paint_history[-1][1] = now
+            self._paint_history = self._paint_history[-3:] + [[painted, None]]
+        self._painted = painted
+        self.painted_at = now
+
+    # How long a replaced drawing may still be on screen (measured up to
+    # ~70 ms; a little wider to be safe, each extra candidate costs ~3 ms).
+    REPLACED_VISIBLE = .12
+
+    def recent_paints(self) -> list:
+        """Drawings that may be on screen right now, newest first."""
+        if not self.isVisible() or self._painted is None:
+            return []
+        now = time.monotonic()
+        paints = [self._painted]
+        for painted, replaced_at in reversed(self._paint_history[:-1]):
+            if replaced_at is None or now - replaced_at > self.REPLACED_VISIBLE:
+                break
+            paints.append(painted)
+        return paints
 
 
 def _swatch(name: str) -> QIcon:
@@ -350,9 +519,11 @@ class Control(QMainWindow):
         self.analysis_pending = False
         self.analysis_task = None
         self.thread_pool = QThreadPool.globalInstance()
+        self.tracker = ShotTracker()
         self.cue_tracker = CueTracker()
         self.stabilizer = GuideStabilizer()
         self._stabilized_rect = None
+        self._analysed_at: list[float] = []
         self.label = QLabel("Position the guide over the complete pool table, then enable it.")
         self.label.setWordWrap(True)
         self.toggle = QPushButton("Enable guide")
@@ -378,7 +549,7 @@ class Control(QMainWindow):
         self.toggle.clicked.connect(self.toggle_guide)
         self.adjust.clicked.connect(self.toggle_adjust)
         self.fit.clicked.connect(self.fit_table)
-        self.redetect.clicked.connect(self.analyze)
+        self.redetect.clicked.connect(self.redetect_now)
         row = QHBoxLayout(); row.addWidget(self.toggle); row.addWidget(self.adjust); row.addWidget(self.fit)
         layout = QVBoxLayout(); layout.addWidget(QLabel("Miniclip 8 Ball Pool · practice overlay")); layout.addLayout(row)
         layout.addWidget(self.simulator)
@@ -390,7 +561,9 @@ class Control(QMainWindow):
         note.setStyleSheet("color:#667085")
         layout.addWidget(note)
         root = QWidget(); root.setLayout(layout); self.setCentralWidget(root)
-        self.timer = QTimer(self); self.timer.setInterval(125); self.timer.timeout.connect(self.analyze)
+        # Frames are analysed back to back (each finished analysis starts the
+        # next one); this timer only restarts the chain after a pause.
+        self.timer = QTimer(self); self.timer.setInterval(100); self.timer.timeout.connect(self.analyze)
         self.resize(420, 190)
         # Keep the controls in the black letterbox area above the table so
         # they cannot hide cue/object balls from the screen analysis.
@@ -455,50 +628,19 @@ class Control(QMainWindow):
             self.timer.start()
             self.analyze()
 
+    def _grab_plan(self, region: dict) -> GrabPlan:
+        panel = None
+        if self.isVisible() and not self.isMinimized():
+            panel = logical_to_physical(self.frameGeometry(), self.screen() or QGuiApplication.primaryScreen())
+        return GrabPlan(region, self.overlay.capture_rect(), panel, self.overlay.recent_paints())
+
     def _grab_without_overlay(self, region: dict) -> np.ndarray | None:
         """Capture ``region`` (physical pixels) and undo the guide's own drawing.
 
-        Returns None when the overlay changed after its last on-screen paint,
-        so the subtraction would not match what the capture shows.
+        Returns None when the capture matches none of the overlay's recent
+        drawings, so the subtraction would not match what the screen shows.
         """
-        frame = np.ascontiguousarray(np.asarray(self.capture.grab(region))[:, :, :3])
-        # This control panel is always on top and dark; where it overlaps the
-        # capture (often right above the table) it can merge with a pocket.
-        # Neutral grey is neither dark, felt nor white, so analysis ignores it.
-        if self.isVisible() and not self.isMinimized():
-            panel = logical_to_physical(self.frameGeometry(), self.screen() or QGuiApplication.primaryScreen())
-            shadow = 8  # Windows 11 draws a soft drop shadow outside the frame.
-            px0 = max(0, panel["left"] - shadow - region["left"])
-            py0 = max(0, panel["top"] - shadow - region["top"])
-            px1 = min(frame.shape[1], panel["left"] + panel["width"] + shadow - region["left"])
-            py1 = min(frame.shape[0], panel["top"] + panel["height"] + shadow - region["top"])
-            if px1 > px0 and py1 > py0:
-                frame[py0:py1, px0:px1] = 128
-        layer = self.overlay.render_layer()
-        if layer is None:
-            return frame
-        debug_dir = os.environ.get("POOL_OVERLAY_DEBUG_DIR")
-        if debug_dir:
-            # Opt-in diagnostics: what the screen showed, the guide layer that
-            # is subtracted, and the frame the detector actually analyses.
-            _debug_dump(debug_dir, "capture.png", frame)
-            _debug_dump(debug_dir, "layer.png", layer)
-        overlay = self.overlay.capture_rect()
-        if (layer.shape[1], layer.shape[0]) != (overlay["width"], overlay["height"]):
-            return None
-        # Place the layer where the overlay sits inside the captured region.
-        x0 = overlay["left"] - region["left"]
-        y0 = overlay["top"] - region["top"]
-        fx0, fy0 = max(0, x0), max(0, y0)
-        fx1 = min(frame.shape[1], x0 + layer.shape[1])
-        fy1 = min(frame.shape[0], y0 + layer.shape[0])
-        if fx1 <= fx0 or fy1 <= fy0:
-            return frame
-        part = layer[fy0 - y0:fy1 - y0, fx0 - x0:fx1 - x0]
-        frame[fy0:fy1, fx0:fx1] = remove_overlay(frame[fy0:fy1, fx0:fx1], part)
-        if debug_dir:
-            _debug_dump(debug_dir, "cleaned.png", frame)
-        return frame
+        return grab_clean(self.capture, self._grab_plan(region))
 
     def _place_overlay_on_table(self, x: int, y: int, width: int, height: int):
         """Cover a table found at a physical desktop rect, plus a pocket margin.
@@ -611,7 +753,7 @@ class Control(QMainWindow):
             self.analyze(); self.timer.start()
         else:
             self.timer.stop(); self.last_thumbnail = None; self.overlay.detection = Detection(note="Guide is off")
-            self.cue_tracker.reset(); self.stabilizer.reset()
+            self.cue_tracker.reset(); self.stabilizer.reset(); self.tracker = ShotTracker()
             self.overlay.update(); self.label.setText("Guide is off")
 
     def toggle_adjust(self):
@@ -627,54 +769,73 @@ class Control(QMainWindow):
         if self.overlay.adjusting:
             self.label.setText("Positioning mode · analysis paused")
             return
-        # Read the screen only once the compositor shows the latest guide
-        # drawing; that drawing is subtracted below, so it must be the one on
-        # screen. The 125 ms timer simply retries on its next tick.
-        if time.monotonic() - self.overlay.painted_at < PAINT_SETTLE:
-            return
-        g = self.overlay.geometry()
+        # No waiting for the compositor after a repaint: the worker checks
+        # which recent drawing the capture shows and subtracts that one.
         try:
             # Capture in physical pixels; detection coordinates stay in that
             # space and the overlay paints in it too (see Overlay.paintEvent).
-            shot = self._grab_without_overlay(self.overlay.capture_rect())
-            if shot is None:
-                return
-            thumbnail = cv2.resize(cv2.cvtColor(shot, cv2.COLOR_BGR2GRAY), (128, 64), interpolation=cv2.INTER_AREA)
-            if self.last_thumbnail is not None and float(cv2.absdiff(thumbnail, self.last_thumbnail).mean()) < .35:
-                return
-            self.last_thumbnail = thumbnail
+            plan = self._grab_plan(self.overlay.capture_rect())
             self.analysis_pending = True
-            self.analysis_task = AnalysisTask(shot, g)
+            self.analysis_task = AnalysisTask(plan, self.overlay.geometry(), self.tracker, self.last_thumbnail)
             self.analysis_task.signals.completed.connect(self._analysis_completed)
+            self.analysis_task.signals.skipped.connect(self._analysis_skipped)
             self.analysis_task.signals.failed.connect(self._analysis_failed)
             self.thread_pool.start(self.analysis_task)
         except Exception as exc:
+            self.analysis_pending = False
             self.label.setText(f"Screen capture failed: {exc}")
 
-    def _analysis_completed(self, detection: Detection, geometry: QRect):
+    def redetect_now(self):
+        """Find the table and every ball again on the next frame."""
+        self.tracker = ShotTracker()
+        self.last_thumbnail = None
+        self.analyze()
+
+    # Pause before trying again when a frame was skipped (screen unchanged or
+    # mid-update), so an idle table does not keep a CPU core busy.
+    IDLE_RETRY_MS = 16
+
+    def _next_frame(self, delay_ms: int = 0):
+        if self.overlay.active and not self.overlay.adjusting:
+            QTimer.singleShot(delay_ms, self.analyze)
+
+    def _analysis_skipped(self):
+        self.analysis_pending = False
+        self.analysis_task = None
+        self._next_frame(self.IDLE_RETRY_MS)
+
+    def _analysis_completed(self, detection: Detection, geometry: QRect, thumbnail):
         self.analysis_pending = False
         self.analysis_task = None
         if not self.overlay.active or self.overlay.adjusting or self.overlay.geometry() != geometry:
             return
+        self.last_thumbnail = thumbnail
         detection = self.cue_tracker.update(detection, geometry)
         if geometry.getRect() != self._stabilized_rect:
             # The overlay moved or was resized: old coordinates no longer apply.
             self.stabilizer.reset()
+            if self._stabilized_rect is not None:
+                self.tracker = ShotTracker()
             self._stabilized_rect = geometry.getRect()
         shown = self.stabilizer.update(detection)
-        self.label.setText(shown.note)
-        if shown is self.overlay.detection:
-            # Same shot as on screen: no repaint, so the guide stays perfectly
-            # still (and the next capture needs no settle wait).
-            return
-        self.overlay.detection = shown
-        self.overlay.update()
+        # Analysed frames in the last second, shown so the speed is visible.
+        now = time.monotonic()
+        self._analysed_at = [t for t in self._analysed_at if now - t < 1.0] + [now]
+        self.label.setText(f"{shown.note} · {len(self._analysed_at)} updates/s")
+        # Same shot as on screen: no repaint, so the guide stays perfectly still.
+        if shown is not self.overlay.detection:
+            self.overlay.detection = shown
+            # Paint now rather than later, so the next capture's plan already
+            # knows this drawing (the screen may show it by then).
+            self.overlay.repaint()
+        self._next_frame()
 
     def _analysis_failed(self, message: str):
         self.analysis_pending = False
         self.analysis_task = None
         if self.overlay.active:
             self.label.setText(f"Image analysis failed: {message}")
+            self._next_frame(100)
 
     def closeEvent(self, e):
         self.timer.stop()

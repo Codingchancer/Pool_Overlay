@@ -17,8 +17,9 @@ It is a **visual practice aid only**. Never add code that clicks, aims, moves th
 ## Files
 - `main.py` — entry point only (`python main.py`); re-exports every name from the modules below so `import main` keeps working. New code goes in the modules, not here.
 - `detector.py` — area **detector**: table / ball / cue / aim / ghost detection, `detect`, `predict_shot`, path tracing. Pure OpenCV/numpy, no Qt.
-- `capture.py` — area **overlay**: guide drawing (`paint_guide`, `GUIDE_ALPHA`, `GuideStyle`: colours/thickness/bounce, saved via QSettings; never add white/grey colours or raise the alpha), `render_guide_layer`, `remove_overlay`, `PAINT_SETTLE`, DPI helpers.
-- `overlay.py` — area **overlay** (window) / **simulator-ui** (control panel): `Overlay` guide window, `Control` panel, `CueTracker`, background `AnalysisTask`; `GuideStabilizer` keeps the drawn guide still while the shot is unchanged (tolerances from measured frame noise).
+- `capture.py` — area **overlay**: guide drawing (`paint_guide`, `GUIDE_ALPHA`, `GuideStyle`: colours/thickness/bounce, saved via QSettings; never add white/grey colours or raise the alpha), `render_guide_layer`, `remove_overlay`, `shown_layer` (which recent drawing a capture shows), DPI helpers.
+- `overlay.py` — area **overlay** (window) / **simulator-ui** (control panel): `Overlay` guide window, `Control` panel, `CueTracker`, `grab_clean` + background `AnalysisTask` (capture, clean and analyse back to back off the window thread); `GuideStabilizer` keeps the drawn guide still while the shot is unchanged (tolerances from measured frame noise).
+- `tracking.py` — area **overlay**: `ShotTracker` reuses the table and balls of the last full `detect` while they stay still and only re-runs `predict_shot` (live speed).
 - `pool_rules.py` — area **simulator-ui**: `EightBallGame` (turns, groups, fouls, ball in hand, win/lose), pure Python; the physics reports `first_contact`, `rail_after_contact`, `pocket_order` for it.
 - `simulator_ui.py` — area **simulator-ui**: `ShotSimulator`, `SimCanvas`, `ScreenshotTester`.
 - `pool_physics.py` — the simulator's approximate 2D physics: follow/draw/english with the sliding/rolling model; no swerve, squirt, throw, jump or 8-ball rules (the UI and README must keep saying so).
@@ -35,7 +36,7 @@ It is a **visual practice aid only**. Never add code that clicks, aims, moves th
 - Target = ball touching the ghost; object/cue lines are fitted on the game's own short white lines when visible.
 
 ## Capture feedback (important)
-The guide is visible in screenshots/screen shares (`WDA_NONE`). To stop it feeding back into detection, every stroke is drawn at ≤60% alpha and the exact rendered layer is un-blended from each capture (`remove_overlay`); the control panel is greyed out in captures; analysis waits `PAINT_SETTLE` after a repaint. Any change to drawing must keep these working — test the detect → draw → capture loop, not just window visibility (`tests/test_aim_alignment_and_capture.py`). `POOL_OVERLAY_DEBUG_DIR` dumps capture/layer/cleaned frames.
+The guide is visible in screenshots/screen shares (`WDA_NONE`). To stop it feeding back into detection, every stroke is drawn at ≤60% alpha and the exact rendered layer is un-blended from each capture (`remove_overlay`); the control panel is greyed out in captures; right after a repaint the screen may still show an older drawing, so the overlay keeps its recent drawings and `shown_layer` picks the one the capture really shows (no fixed wait). Any change to drawing must keep these working — test the detect → draw → capture loop, not just window visibility (`tests/test_aim_alignment_and_capture.py`). `POOL_OVERLAY_DEBUG_DIR` dumps capture/layer/cleaned frames.
 
 ## Checks after a change
 ```
