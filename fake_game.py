@@ -77,6 +77,76 @@ def pocket_centres(table):
             (x - inset, y + h + inset), (x + w / 2, y + h + 2 * inset), (x + w + inset, y + h + inset)]
 
 
+def truth_path(start, direction, table, radius, bounces=3, balls=(), pockets=None):
+    """Exact path of a ball's centre: cushion bounces as mirrors, ending in a
+    pocket mouth (rail contact within two radii of where the cushion nose
+    meets the pocket) or where it first touches one of ``balls``.
+
+    Returns (points, stop) with stop "bounces", "pocket" or "ball". Solved by
+    unfolding the table (the path is a straight line in mirrored copies),
+    independently of the detector's step-by-step tracer.
+    """
+    x0, y0, w, h = table
+    lo_x, lo_y, span_x, span_y = x0 + radius, y0 + radius, w - 2 * radius, h - 2 * radius
+    ux, uy = direction
+    n = float(np.hypot(ux, uy))
+    ux, uy = ux / n, uy / n
+    sx = min(max(start[0] - lo_x, 0.0), span_x)
+    sy = min(max(start[1] - lo_y, 0.0), span_y)
+
+    def fold(v, span):
+        v = v % (2 * span)
+        return v if v <= span else 2 * span - v
+
+    def crossings(s0, u, span):
+        # Distances along the line at which it crosses a cushion line.
+        if abs(u) < 1e-12:
+            return []
+        k = np.floor(s0 / span) + (1 if u > 0 else 0)
+        if u < 0 and s0 <= 0:
+            k = -1.0
+        out = []
+        for _ in range(bounces + 2):
+            t = (k * span - s0) / u
+            if t > .5:  # a ball already on that cushion rebounds at once
+                out.append(t)
+            k += 1 if u > 0 else -1
+        return out
+
+    events = sorted(set(round(t, 6) for t in crossings(sx, ux, span_x) + crossings(sy, uy, span_y)))
+    corners = [(lo_x, lo_y), (lo_x + span_x / 2, lo_y), (lo_x + span_x, lo_y),
+               (lo_x, lo_y + span_y), (lo_x + span_x / 2, lo_y + span_y), (lo_x + span_x, lo_y + span_y)]
+    points = [(lo_x + sx, lo_y + sy)]
+    travelled = 0.0
+    for t in events[:bounces + 1]:
+        px, py = points[-1]
+        # Direction on this leg, from the fold of a point just past its start.
+        e = travelled + 1e-3
+        qx, qy = lo_x + fold(sx + ux * e, span_x), lo_y + fold(sy + uy * e, span_y)
+        lx, ly = qx - px, qy - py
+        ln = float(np.hypot(lx, ly)) or 1.0
+        lx, ly = lx / ln, ly / ln
+        leg = t - travelled
+        hit = None
+        for bx, by in balls:
+            dx, dy = bx - px, by - py
+            along = dx * lx + dy * ly
+            across2 = dx * dx + dy * dy - along * along
+            if along > 0 and across2 < (2 * radius) ** 2:
+                d = along - np.sqrt((2 * radius) ** 2 - across2)
+                if 1e-3 < d < leg and (hit is None or d < hit):
+                    hit = d
+        if hit is not None:
+            points.append((px + lx * hit, py + ly * hit))
+            return points, "ball"
+        end = (lo_x + fold(sx + ux * t, span_x), lo_y + fold(sy + uy * t, span_y))
+        points.append(end)
+        if min(np.hypot(end[0] - cx, end[1] - cy) for cx, cy in corners) <= radius * 2.0:
+            return points, "pocket"
+        travelled = t
+    return points, "bounces"
+
+
 def solve_truth(scene: Scene) -> Truth:
     """Where the cue ball first touches a ball or cushion along the aim."""
     x, y, w, h = scene.table

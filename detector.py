@@ -452,6 +452,12 @@ def _first_obstacle(x: float, y: float, ux: float, uy: float, limit: float, radi
     return best
 
 
+# Cushion bounces the live guide follows each predicted path through. Every
+# bounce adds a little angle error (the game's cushions are not perfect
+# mirrors), so the path still stops at a pocket or the first ball in the way.
+PATH_BOUNCES = 3
+
+
 def trace_bounces(start: tuple[float, float], direction: tuple[float, float],
                   bounds: tuple[int, int, int, int], radius: int,
                   max_bounces: int = 1, obstacles=None,
@@ -518,7 +524,8 @@ def collision_paths(cue: tuple[int, int, int], target: tuple[int, int, int],
                     direction: tuple[float, float], table: tuple[int, int, int, int],
                     contact: tuple[float, float] | None = None, radius: float | None = None,
                     obstacles=None, object_dir: tuple[float, float] | None = None,
-                    cue_dir: tuple[float, float] | None = None, blocked: list | None = None):
+                    cue_dir: tuple[float, float] | None = None, blocked: list | None = None,
+                    max_bounces: int = 1):
     """Shared equal-mass, no-spin collision model used by live guide and simulator.
 
     ``radius`` is one shared ball radius (all pool balls are the same size; the
@@ -526,6 +533,8 @@ def collision_paths(cue: tuple[int, int, int], target: tuple[int, int, int],
     centre at impact, taken from the game's ghost-ball reticle when visible.
     ``object_dir``/``cue_dir`` override the physics directions when the game's
     own white object/deflection lines were read from the frame.
+    ``max_bounces`` is how many cushion bounces each path follows (the live
+    guide uses ``PATH_BOUNCES``; the simulator keeps one).
     """
     cx, cy, cr = cue
     bx, by, br = target
@@ -555,9 +564,9 @@ def collision_paths(cue: tuple[int, int, int], target: tuple[int, int, int],
     approach = [((int(round(cx)), int(round(cy))), (int(round(contact[0])), int(round(contact[1]))))]
     others = [(ox, oy, orr) for ox, oy, orr in obstacles or ()
               if (ox, oy) != (bx, by) and np.hypot(ox-cx, oy-cy) > ball_r * .5]
-    object_path = trace_bounces((bx, by), obj, bounds, ball_r, max_bounces=1,
+    object_path = trace_bounces((bx, by), obj, bounds, ball_r, max_bounces=max_bounces,
                                 obstacles=others, blocked=blocked)
-    cue_path = (trace_bounces(contact, cue_after, bounds, ball_r, max_bounces=1,
+    cue_path = (trace_bounces(contact, cue_after, bounds, ball_r, max_bounces=max_bounces,
                               obstacles=others, blocked=blocked)
                 if np.hypot(*physics_cue) > .12 else [])
     return approach, cue_path, object_path, (int(bx), int(by), int(br))
@@ -660,7 +669,8 @@ def predict_shot(roi: np.ndarray, table: tuple[int, int, int, int],
                 ry = -uy
             bounds = (left + ball_r, top + ball_r, left + width - ball_r, top + height - ball_r)
             blockers: list = []
-            rebound = trace_bounces((gx, gy), (rx, ry), bounds, ball_r, max_bounces=1,
+            # The bounce at the reticle is the first of PATH_BOUNCES.
+            rebound = trace_bounces((gx, gy), (rx, ry), bounds, ball_r, max_bounces=PATH_BOUNCES - 1,
                                     obstacles=obstacles, blocked=blockers) if (rx, ry) != (ux, uy) else []
             return {**empty, "aim": [((cx, cy), ghost_int[:2])], "cue": rebound, "ghost": ghost_int,
                     "blockers": blockers, "aim_dir": (ux, uy),
@@ -671,7 +681,7 @@ def predict_shot(roi: np.ndarray, table: tuple[int, int, int, int],
         if selected is None:
             bounds = (left + ball_r, top + ball_r, left + width - ball_r, top + height - ball_r)
             blockers: list = []
-            aim = trace_bounces((cx, cy), direction, bounds, ball_r, max_bounces=1,
+            aim = trace_bounces((cx, cy), direction, bounds, ball_r, max_bounces=PATH_BOUNCES,
                                 obstacles=obstacles, blocked=blockers)
             return {**empty, "aim": aim, "blockers": blockers, "aim_dir": (ux, uy),
                     "note": f"Aim ray found at {angle:.1f}° · no ball directly in its path"}
@@ -719,10 +729,15 @@ def predict_shot(roi: np.ndarray, table: tuple[int, int, int, int],
         cue_line = game_line_direction(white, (contact_point[0] - left, contact_point[1] - top),
                                        physics_cue, ball_r, cone_degrees=20.0)
         cue_dir = cue_line[0] if cue_line else None
+    pn = float(np.hypot(*physics_cue))
+    final_cue = cue_dir or ((physics_cue[0] / pn, physics_cue[1] / pn) if pn > .12 else None)
     blockers = []
+    # Draw the cue path along final_cue too: collision_paths' own physics
+    # uses the raw Hough centre, which is several degrees off the game's
+    # object line (synthetic seed 11: 7 deg).
     approach, cue_path, object_path, target = collision_paths(
         cue, selected, direction, table, contact=contact, radius=ball_r, obstacles=obstacles,
-        object_dir=obj_dir, cue_dir=cue_dir, blocked=blockers)
+        object_dir=obj_dir, cue_dir=final_cue, blocked=blockers, max_bounces=PATH_BOUNCES)
     sources = ["ghost ball" if ghost_frame else "ray only"]
     if object_line is not None:
         sources.append("game object line")
@@ -735,8 +750,6 @@ def predict_shot(roi: np.ndarray, table: tuple[int, int, int, int],
         ox, oy = selected[0] - contact_point[0], selected[1] - contact_point[1]
         on = float(np.hypot(ox, oy))
         obj_dir = (ox / on, oy / on) if on > 1e-6 else None
-    pn = float(np.hypot(*physics_cue))
-    final_cue = cue_dir or ((physics_cue[0] / pn, physics_cue[1] / pn) if pn > .12 else None)
     return {"aim": approach, "cue": cue_path, "object": object_path, "target": target,
             "ghost": ghost_int, "blockers": blockers, "aim_dir": (ux, uy),
             "object_dir": obj_dir, "cue_dir": final_cue,

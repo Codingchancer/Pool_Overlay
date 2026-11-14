@@ -129,6 +129,57 @@ class SyntheticRegressionTests(unittest.TestCase):
         self.assertGreaterEqual(checked, 5)
 
 
+class BounceTests(unittest.TestCase):
+    def test_tracer_matches_exact_bounces_through_three_cushions(self):
+        import detector
+
+        rng = np.random.default_rng(5)
+        table, r = (100.0, 80.0, 1200.0, 600.0), 15.0
+        bounds = (115.0, 95.0, 1285.0, 665.0)
+        checked = 0
+        for _ in range(200):
+            start = (rng.uniform(200, 1200), rng.uniform(150, 600))
+            a = rng.uniform(-np.pi, np.pi)
+            direction = (float(np.cos(a)), float(np.sin(a)))
+            path = detector.trace_bounces(start, direction, bounds, r, max_bounces=3)
+            exact, stop = fg.truth_path(start, direction, table, r, bounces=3)
+            # Same number of cushions and the same pocket stops.
+            self.assertEqual(len(path), len(exact) - 1, f"angle {np.degrees(a):.1f}")
+            for (_, end), point in zip(path, exact[1:]):
+                self.assertLess(np.hypot(end[0] - point[0], end[1] - point[1]), 1.5)
+            checked += stop == "bounces"
+        self.assertGreater(checked, 100)
+
+    def test_live_paths_follow_three_bounces_like_the_truth(self):
+        bounce_px, bounce_deg, most = [], [], 0
+        for seed in range(9000, 9040):
+            *_, stats = run(seed)
+            if "bounce_px" in stats:
+                bounce_px.append(stats["bounce_px"])
+                most = max(most, stats["bounces"])
+            if "bounce_deg" in stats:
+                bounce_deg.append(stats["bounce_deg"])
+        self.assertEqual(most, 3)
+        self.assertLessEqual(max(bounce_px), 4.0)
+        self.assertLessEqual(np.percentile(bounce_deg, 95), 2.0)
+
+    def test_simulator_paths_keep_one_bounce(self):
+        import detector
+
+        _, cue_path, object_path, _ = detector.collision_paths(
+            (300, 300, 15), (500, 310, 15), (1.0, 0.0), (100, 80, 1200, 600))
+        self.assertLessEqual(len(object_path), 2)
+        self.assertLessEqual(len(cue_path), 2)
+
+    def test_cue_path_is_drawn_along_the_reported_cue_direction(self):
+        # Seed 11: the reported cue direction was 90 deg to the game's object
+        # line, but the drawn path used the raw ball centres and ran 7 deg off.
+        *_, d, problems, _ = run(11)
+        (x1, y1), (x2, y2) = d.cue_segments[0]
+        drawn = np.degrees(np.arctan2(y2 - y1, x2 - x1))
+        self.assertLess(st.angle_diff(drawn, st.angle_of(d.cue_dir)), 2.0)
+
+
 class GameLineReaderTests(unittest.TestCase):
     def test_one_pixel_guide_thread_is_not_read_as_the_game_line(self):
         # Real frame: only a short stub of Miniclip's thick object line shows
