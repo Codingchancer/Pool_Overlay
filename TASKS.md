@@ -21,6 +21,7 @@ Border rules:
 | Task | Area | Who | Branch |
 |---|---|---|---|
 | Real-game precision | detector | Jartartarta | `jartartarta/real-game-precision` |
+| Real-time overlay (faster guide updates). Also touches `detector.py`: faster ghost-ball search and target fit, same results. Jartartarta: pull main after it merges | overlay (+ detector speed, OK'd by Codingchancer) | Codingchancer | `codingchancer/realtime-overlay` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Real-game precision:** play with the guide on; wherever the guide's aim line, target ball or object/cue path does not sit exactly on the game's own white lines, save the frame (set `POOL_OVERLAY_DEBUG_DIR`, keep `capture.png`/`cleaned.png`) and have your Claude fix the detector. Keep real screenshots out of git (`outputs/` is ignored; the repo is public).
