@@ -15,7 +15,11 @@ Windows overlay (PySide6 + OpenCV + mss) for Miniclip 8 Ball Pool mirrored from 
 It is a **visual practice aid only**. Never add code that clicks, aims, moves the mouse, sends input, or takes shots in the game.
 
 ## Files
-- `main.py` — the app: control panel, transparent always-on-top guide window, detector (`detect`), shot prediction, shot simulator, screenshot tester.
+- `main.py` — entry point only (`python main.py`); re-exports every name from the modules below so `import main` keeps working. New code goes in the modules, not here.
+- `detector.py` — area **detector**: table / ball / cue / aim / ghost detection, `detect`, `predict_shot`, path tracing. Pure OpenCV/numpy, no Qt.
+- `capture.py` — area **overlay**: guide drawing (`paint_guide`, `GUIDE_ALPHA`), `render_guide_layer`, `remove_overlay`, `PAINT_SETTLE`, DPI helpers.
+- `overlay.py` — area **overlay** (window) / **simulator-ui** (control panel): `Overlay` guide window, `Control` panel, `CueTracker`, background `AnalysisTask`.
+- `simulator_ui.py` — area **simulator-ui**: `ShotSimulator`, `SimCanvas`, `ScreenshotTester`.
 - `pool_physics.py` — the simulator's approximate 2D physics (no spin, no 8-ball rules; the UI and README must keep saying so).
 - `fake_game.py` — synthetic table renderer with exact truth (a test fixture, not a game).
 - `stress_test.py` — random synthetic shots vs truth (`--count 300`, `--save-failures DIR`).
@@ -35,7 +39,7 @@ The guide is visible in screenshots/screen shares (`WDA_NONE`). To stop it feedi
 ## Checks after a change
 ```
 .venv\Scripts\python -m unittest discover -s tests -v
-.venv\Scripts\python -m py_compile main.py pool_physics.py fake_game.py stress_test.py live_check.py
+.venv\Scripts\python -m py_compile main.py detector.py capture.py overlay.py simulator_ui.py pool_physics.py fake_game.py stress_test.py live_check.py
 .venv\Scripts\python stress_test.py --count 300 --quiet
 ```
 Last known results: 45 tests pass; 283/300 held-out synthetic shots pass every check; live check 23/23.

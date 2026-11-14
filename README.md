@@ -89,5 +89,5 @@ The real game screenshots (`outputs/example_pool_screenshot.png` and `outputs/mi
 
 ```
 .venv\Scripts\python -m unittest discover -s tests -v
-.venv\Scripts\python -m py_compile main.py pool_physics.py fake_game.py stress_test.py live_check.py
+.venv\Scripts\python -m py_compile main.py detector.py capture.py overlay.py simulator_ui.py pool_physics.py fake_game.py stress_test.py live_check.py
 ```

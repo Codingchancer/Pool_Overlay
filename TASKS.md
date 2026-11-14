@@ -9,12 +9,12 @@ Areas, so two people don't edit the same code at once:
 - **simulator-ui** — shot simulator, `pool_physics.py`, screenshot tester, control panel
 - **repo** — README, CLAUDE.md, setup/run scripts, file layout
 
-Until `main.py` is split, all of these live in `main.py`: only one open branch at a time should touch a given area, and keep branches short (hours, not days).
+Files per area: detector → `detector.py`, `fake_game.py`, `stress_test.py`; overlay → `capture.py`, the `Overlay` class in `overlay.py`, `live_check.py`; simulator-ui → `simulator_ui.py`, `pool_physics.py`, the `Control` class in `overlay.py`; repo → docs, scripts, `main.py`. Only one open branch at a time per area, and keep branches short (hours, not days).
 
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| Split `main.py` into modules | repo | Codingchancer (Claude) | `codingchancer/split-main` |
+| | | | |
 
 ## Next
 - [ ] Try the overlay on the real AirPlay mirror and note what goes wrong (needs Windows + iPhone). — area: overlay
@@ -23,5 +23,6 @@ Until `main.py` is split, all of these live in `main.py`: only one open branch a
 - [ ] Balls boxed in inside a rack can be off by ~0.5 radius. — area: detector
 
 ## Done
+- [x] Split `main.py` into `detector.py`, `capture.py`, `overlay.py`, `simulator_ui.py` (no behaviour change: 45 tests, identical stress-test output, live 8/8).
 - [x] Detector rework, capture-safe guide, synthetic table + stress/live tests (283/300 synthetic, 23/23 live).
 - [x] Public repo without personal screenshots.
