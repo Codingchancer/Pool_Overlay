@@ -20,7 +20,6 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| Freeze fix from issue #13 (one-off in `overlay.py` while Codingchancer is away, on Jartartarta's say-so) | overlay | Jartartarta | `jartartarta/freeze-fix` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Power needed for a shot:** record ~20-30 real shots (slider % at release + where the balls stop) to fit Miniclip's friction and the %-to-speed scale per cue; then compute the minimum power to pot and add it to `Detection` for Codingchancer to mark on the slider. Also confirm the slider reading on a mid-drag and a full-power frame.
@@ -35,6 +34,7 @@ Border rules:
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
 
 ## Done
+- [x] Freeze fix (Jartartarta, #15, one-off in `overlay.py` while Codingchancer was away): one screen capture per worker thread instead of a new one per frame; GDI objects stay at ~26 instead of hitting Windows' 10,000 limit after ~2 min. `tests/test_capture_reuse.py` guards it. Closes #13.
 - [x] Freeze + polish (Jartartarta, #14): every ball drawn at one size (shadows made circles up to 22% too big), cue ball centre no longer pulled by its shadow; stress test 285/300. Freeze found: `overlay.py` leaks a screen capture per frame until Windows' GDI limit (~2 min on the synthetic table); tested patch in issue #13 for Codingchancer.
 - [x] Grey / black cloth (Jartartarta, #12): the Lucky Shot table's colourless near-black cloth is found (real frame: table within 2 px, cue / gold ball / aim / ghost found). Synthetic black 56/100 (8 ball is the weak spot), purple 84 (was 66).
 - [x] Shot power, reading (Jartartarta, #12): `Detection.power_percent` (0-100) and `power_slider` from Miniclip's power slider (needs the capture to include it), `stick_pull` from the cue stick. Real frames read 0% at rest; % scale not yet confirmed mid-drag.
