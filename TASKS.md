@@ -20,7 +20,6 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| Smoother guide: faster detection per frame (same results) | detector | Jartartarta | `jartartarta/faster` |
 | Window capture + analysis in its own process (IDEAS.md ideas 1 and 3; overlay files only) | overlay | Codingchancer | `codingchancer/window-capture` |
 
 ## Next — Jartartarta (detector / precision)
@@ -34,6 +33,7 @@ Border rules:
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
 
 ## Done
+- [x] Smoother guide, detector side (Jartartarta, #22): same results, full detect 184 -> ~115 ms, `predict_shot` ~15 ms median on shots that hit a ball. Stick crossing balls forces full detections in `tracking.py`: noted on #21 for Codingchancer.
 - [x] Ball outline where a path meets a cushion (Jartartarta, #20, one-off in Codingchancer's `capture.py`): the paths follow the ball's centre, the outline shows the ball touching the cushion.
 - [x] Ghost ring on top of the cue ball + stick rings (Jartartarta, #19): aim found from the game's object line when the ring is hidden (synthetic near shots: struck ball's path right on 28/40, was 0); rings centred on the stick's axis are no longer balls (stress 286/300).
 - [x] Draw the paths through other balls (Jartartarta, #18, one-off in Codingchancer's `capture.py` / `tracking.py`): orange dashes for the ball in the way, dash-dot for the deflection; tracking mode now passes pot, stick pull, power slider and these paths too (the `tracking.py` part of #11).
