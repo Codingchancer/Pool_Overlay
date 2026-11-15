@@ -71,9 +71,41 @@ def white_guide_mask(roi: np.ndarray, balls: list[tuple[int, int, int, str]],
     # while even the brightly lit, washed-out felt centre stays >= ~95. The
     # older <= 115 limit let pale felt inside the hollow reticle through.
     mask = cv2.inRange(hsv, (0, 0, 165), (255, 70, 255))
+    if _light_cloth(hsv):
+        # A white or pale cloth passes that test itself: a guide stroke must
+        # also be clearly brighter than the cloth around it, measured as the
+        # cloth's lighter values over a wide window (strokes are thin, and
+        # compression ringing beside their dark outlines is not brighter).
+        v = hsv[:, :, 2]
+        around = local_lightness(v)
+        mask &= ((v.astype(np.float32) - around) >= LIGHT_CLOTH_STROKE).astype(np.uint8) * 255
+        # Compression speckles next to dark edges pass that too; the guide's
+        # strokes are long connected lines and rings.
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        if count > 1:
+            keep = stats[:, cv2.CC_STAT_AREA] >= 10
+            keep[0] = False
+            mask = np.where(keep[labels], 255, 0).astype(np.uint8)
     for bx, by, br, _ in balls:
         cv2.circle(mask, (int(bx), int(by)), int(br * ball_scale), 0, thickness=-1)
     return mask
+
+
+# Lab lightness (8-bit) from which a cloth counts as light in the ball check.
+LIGHT_CLOTH_L = 150.0
+# On a light, pale cloth, how much a darker shade of it (lettering, logo,
+# shadows) counts in the cloth-distance image; a lighter one counts in full.
+DARKER_SHADE_WEIGHT = .25
+# On a light cloth a guide stroke is at least this much brighter than the
+# cloth around it.
+LIGHT_CLOTH_STROKE = 10
+
+
+def _light_cloth(hsv: np.ndarray) -> bool:
+    """True when the cloth itself would pass the white-stroke test (white,
+    light grey, beige, pale tables): bright and barely saturated."""
+    sample = hsv[::8, ::8].reshape(-1, 3)
+    return float(np.median(sample[:, 2])) >= 150 and float(np.median(sample[:, 1])) <= 90
 
 
 def _ring_kernel(radius: float) -> np.ndarray:
@@ -1296,6 +1328,52 @@ def cloth_hue(hsv: np.ndarray, step: int = 1) -> float:
     return float((peak + (weights @ (window - peak)) / max(1.0, weights.sum())) % 180)
 
 
+# How far (weighted Lab distance, lightness at 0.35 so the cloth's own
+# shading counts as cloth) a pixel may be from the measured cloth colour.
+CLOTH_LAB_REACH = 24.0
+LAB_WEIGHTS = np.array([.35, 1.0, 1.0], np.float32)
+
+
+def cloth_model(frame: np.ndarray, hsv: np.ndarray | None = None, step: int = 4) -> dict:
+    """The cloth, measured instead of assumed: the most common colour in the
+    middle of the image (where the table is), so white, grey, pale, dark and
+    any hue work the same way.
+
+    Returns ``lab`` (reference colour), ``v_low`` (brightness near the rails:
+    5th percentile of cloth pixels), ``v`` and ``s`` (median brightness and
+    saturation of the cloth).
+    """
+    if hsv is None:
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    h, w = frame.shape[:2]
+    middle = (slice(h // 5, h * 4 // 5, step), slice(w // 5, w * 4 // 5, step))
+    lab = cv2.cvtColor(frame[middle], cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float32)
+    if len(lab) == 0:
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB).reshape(-1, 3).astype(np.float32)
+    # Peak of a coarse colour histogram (chroma fine, lightness coarse, so the
+    # cloth's light-to-dark shading stays one peak).
+    bins = np.stack([lab[:, 0] // 48, lab[:, 1] // 6, lab[:, 2] // 6], axis=1).astype(np.int32)
+    keys = bins[:, 0] * 10000 + bins[:, 1] * 100 + bins[:, 2]
+    values, counts = np.unique(keys, return_counts=True)
+    peak = values[np.argmax(counts)]
+    pb = np.array([peak // 10000, (peak // 100) % 100, peak % 100])
+    near = np.all(np.abs(bins - pb) <= np.array([1, 1, 1]), axis=1)
+    reference = np.median(lab[near], axis=0)
+    cloth = np.sqrt((((lab - reference) * LAB_WEIGHTS) ** 2).sum(axis=1)) < CLOTH_LAB_REACH
+    sample = hsv[middle].reshape(-1, 3)[cloth] if cloth.any() else hsv[middle].reshape(-1, 3)
+    return {"lab": reference.astype(np.float32),
+            "v_low": float(np.percentile(sample[:, 2], 5)),
+            "v": float(np.median(sample[:, 2])),
+            "s": float(np.median(sample[:, 1]))}
+
+
+def cloth_like(frame: np.ndarray, model: dict) -> np.ndarray:
+    """Boolean mask of pixels close to the measured cloth colour."""
+    lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB).astype(np.float32)
+    diff = (lab - model["lab"]) * LAB_WEIGHTS
+    return (diff ** 2).sum(axis=2) < CLOTH_LAB_REACH ** 2
+
+
 def cloth_is_grey(hsv: np.ndarray, step: int = 4) -> bool:
     """True for a cloth with no colour (black or grey tables, e.g. Lucky
     Shot): few saturated pixels in the middle of the image."""
@@ -1389,17 +1467,22 @@ def table_from_pockets(frame: np.ndarray) -> tuple[int, int, int, int] | None:
     """
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     grey = cloth_is_grey(hsv)
-    dark = (hsv[:, :, 2] < (GREY_POCKET_DARKNESS if grey else POCKET_DARKNESS)).astype(np.uint8)
+    model = cloth_model(frame, hsv)
+    # Pockets are darker than the cloth's darkest part (its rails): on a dark
+    # cloth (navy, dark green, black) a fixed limit would swallow the cloth.
+    limit = min(POCKET_DARKNESS, max(GREY_POCKET_DARKNESS, .6 * model["v_low"]))
+    dark = (hsv[:, :, 2] < limit).astype(np.uint8)
     # Cut thin dark lines (the neon table's rail bands, outlines) away from
     # the pockets, which they would otherwise join into long blobs. Pockets
     # are far wider than this kernel.
     dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
     hue = cloth_hue(hsv, step=4)
-    if grey:
-        felt_like = grey_cloth_mask(hsv).astype(np.uint8)
-    else:
-        felt_like = (hue_near(hsv[:, :, 0], hue, 23, 27) & (hsv[:, :, 1] >= 45)
-                     & (hsv[:, :, 2] >= 65)).astype(np.uint8)
+    # Next to a pocket: the measured cloth colour, or (on a coloured cloth)
+    # its hue band, which also covers cushions of the same hue (neon table).
+    felt_like = cloth_like(frame, model)
+    if not grey:
+        felt_like |= hue_near(hsv[:, :, 0], hue, 23, 27) & (hsv[:, :, 1] >= 45) & (hsv[:, :, 2] >= 65)
+    felt_like = felt_like.astype(np.uint8)
     count, _, stats, centres = cv2.connectedComponentsWithStats(dark, connectivity=8)
     blobs = []
     for i in range(1, count):
@@ -1453,8 +1536,9 @@ def table_from_pockets(frame: np.ndarray) -> tuple[int, int, int, int] | None:
     y0, y1 = (a[1] + b[1]) / 2 + inset, (c[1] + d[1]) / 2 - inset
     inner = hsv[int(y0 + (y1 - y0) * .25):int(y1 - (y1 - y0) * .25),
                 int(x0 + (x1 - x0) * .25):int(x1 - (x1 - x0) * .25)]
-    felt = (grey_cloth_mask(inner) if grey
-            else hue_near(inner[:, :, 0], hue, 23, 27) & (inner[:, :, 1] >= 45))
+    inner_bgr = frame[int(y0 + (y1 - y0) * .25):int(y1 - (y1 - y0) * .25),
+                      int(x0 + (x1 - x0) * .25):int(x1 - (x1 - x0) * .25)]
+    felt = cloth_like(inner_bgr, model) if inner_bgr.size else np.zeros(1, bool)
     if inner.size == 0 or float(felt.mean()) < .5:
         return None
     return int(round(x0)), int(round(y0)), int(round(x1 - x0)), int(round(y1 - y0))
@@ -1482,7 +1566,8 @@ def refine_table_edges(frame: np.ndarray, table: tuple[int, int, int, int]) -> t
             return None
         # The nose is the innermost strong drop: a chrome rail outside a
         # dark cushion bevel (black Lucky Shot table) drops first, and more.
-        strong = np.nonzero(drops >= max(15.0, drops[i] * .5))[0]
+        # (On a dark cloth the nose step can be small: navy cushion 32 -> cloth 21.)
+        strong = np.nonzero(drops >= max(8.0, drops[i] * .5))[0]
         last = int(strong[-1])
         # Step to that drop's own peak (the edge can span two samples).
         while last + 1 < len(drops) and drops[last + 1] > drops[last]:
@@ -1601,7 +1686,12 @@ def _felt_lab(roi: np.ndarray, roi_hsv: np.ndarray | None = None) -> np.ndarray:
         roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
     if cloth_is_grey(roi_hsv, step=2):
-        cloth = (grey_cloth_mask(roi_hsv) & (roi_hsv[:, :, 2] <= 110)).astype(np.uint8)
+        # Colourless cloth of any brightness (black to white): the measured
+        # cloth colour, not a fixed brightness range.
+        model = cloth_model(roi, roi_hsv, step=2)
+        cloth = cloth_like(roi, model).astype(np.uint8)
+        if cv2.countNonZero(cloth) <= 100:
+            return model["lab"]
     else:
         centre = cloth_hue(roi_hsv, step=2)
         cloth = (hue_near(roi_hsv[:, :, 0], centre, 18, 17) & (roi_hsv[:, :, 1] >= 50)
@@ -1621,6 +1711,38 @@ def _felt_lab(roi: np.ndarray, roi_hsv: np.ndarray | None = None) -> np.ndarray:
     return np.array(reference, np.float32)
 
 
+def local_lightness(lightness: np.ndarray) -> np.ndarray:
+    """The cloth's own lightness around each pixel, over ~90 px.
+
+    The lightest part of each 8 px block (lettering strokes are thinner, so
+    this is the cloth beside them), then a median over 11x11 blocks so a
+    white ball (a few blocks) barely moves it."""
+    h, w = lightness.shape[:2]
+    if h < 16 or w < 16:
+        return np.full((h, w), float(np.median(lightness)), np.float32)
+    clean = cv2.medianBlur(np.clip(lightness, 0, 255).astype(np.uint8), 3)
+    bh, bw = h // 8, w // 8
+    small = clean[:bh * 8, :bw * 8].reshape(bh, 8, bw, 8).max(axis=(1, 3))
+    small = cv2.medianBlur(np.ascontiguousarray(small), 11 if min(bh, bw) > 11 else 3)
+    return cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR).astype(np.float32)
+
+
+def lettering_shade(lab: np.ndarray, cloth_lightness: np.ndarray, felt: np.ndarray) -> float | None:
+    """How much darker than the cloth its watermark lettering/logo is (Lab L,
+    negative), or None when there is none: the commonest darker shade among
+    cloth-coloured pixels across the table."""
+    step = 2
+    l = lab[::step, ::step, 0]
+    rel = l - cloth_lightness[::step, ::step]
+    dab = np.hypot(lab[::step, ::step, 1] - felt[1], lab[::step, ::step, 2] - felt[2])
+    shade = rel[(dab < 10) & (rel < -20) & (rel > -.45 * cloth_lightness[::step, ::step])]
+    if shade.size < .003 * rel.size:
+        return None
+    counts, edges = np.histogram(shade, bins=np.arange(-120, -19, 3))
+    i = int(np.argmax(counts))
+    return float((edges[i] + edges[i + 1]) / 2)
+
+
 def felt_distance_image(roi: np.ndarray, roi_hsv: np.ndarray, as_float: bool = False,
                         reference: np.ndarray | None = None) -> np.ndarray:
     """How far each pixel's colour is from the cloth (bright = not cloth).
@@ -1635,7 +1757,17 @@ def felt_distance_image(roi: np.ndarray, roi_hsv: np.ndarray, as_float: bool = F
     if reference is None:
         reference = _felt_lab(roi, roi_hsv)
     diff = lab - reference
-    distance = np.sqrt((diff[:, :, 0] * .5) ** 2 + diff[:, :, 1] ** 2 + diff[:, :, 2] ** 2)
+    if reference[0] >= LIGHT_CLOTH_L and np.hypot(reference[1] - 128, reference[2] - 128) < 24:
+        # Light, pale cloth: the cue ball and white stripes are only a little
+        # brighter than it, so lightness counts in full that way; darker
+        # shades of the cloth (lettering, logo, shadows) count little. The
+        # lighting falls off across the table, so lightness is measured
+        # against the cloth around each spot, not one reference.
+        dl = lab[:, :, 0] - local_lightness(lab[:, :, 0])
+        diff[:, :, 0] = np.where(dl > 0, dl, dl * DARKER_SHADE_WEIGHT)
+    else:
+        diff[:, :, 0] *= .5
+    distance = np.sqrt(diff[:, :, 0] ** 2 + diff[:, :, 1] ** 2 + diff[:, :, 2] ** 2)
     if as_float:
         return distance.astype(np.float32)
     return np.clip(distance * 3, 0, 255).astype(np.uint8)
@@ -1727,13 +1859,16 @@ def refit_centre(distance: np.ndarray, cx: float, cy: float, r: float,
 BALL_SIZE_SPREAD = .06
 
 
-def has_number_badge(patch_hsv: np.ndarray, xx, yy, cx: float, cy: float, r: float) -> bool:
+def has_number_badge(patch_hsv: np.ndarray, xx, yy, cx: float, cy: float, r: float,
+                     min_v: float = 150) -> bool:
     """True when a compact white disc (a ball's number badge, ~0.45 r) sits
     near the centre: white fills the middle around its own centroid, with
     almost no white just outside it. The game's guide lines crossing at the
     ghost ball's centre are white there too, but they run on outwards.
+    ``min_v`` is raised on a light cloth, which is itself "white" by the
+    default rule (a badge is still brighter than it).
     """
-    white = (patch_hsv[:, :, 1] < 90) & (patch_hsv[:, :, 2] > 150)
+    white = (patch_hsv[:, :, 1] < 90) & (patch_hsv[:, :, 2] > min_v)
     dist2 = (xx - cx) ** 2 + (yy - cy) ** 2
     near = white & (dist2 <= (r * .7) ** 2)
     ys, xs = np.nonzero(near)
@@ -1762,11 +1897,14 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
     th, tw = roi.shape[:2]
     roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     felt_hue, felt_sat = felt_reference(roi_hsv)
-    # A grey or black cloth has no hue to compare; judge it by Lab colour.
-    grey = cloth_is_grey(roi_hsv, step=2)
+    # A grey, black or pale cloth has no reliable hue to compare; judge it by
+    # Lab colour.
+    grey = cloth_is_grey(roi_hsv, step=2) or felt_sat < 75
     roi_lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32) if grey else None
     felt_lab = _felt_lab(roi, roi_hsv) if grey else None
     lab_weights = np.array([.5, 1.0, 1.0], np.float32)
+    roi_light = None
+    letter_shade = False   # not measured yet
     distance = felt_distance_image(roi, roi_hsv, as_float=True)
     if shared is not None:
         # detect() needs the same image again for the cue-stick filter.
@@ -1854,6 +1992,36 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
             local = np.median(near_cloth, axis=0) if len(near_cloth) >= 12 else felt_lab
             inner_lab = lab_patch[dist2 <= (r * .62) ** 2]
             cloth_inside = np.sqrt((((inner_lab - local) * lab_weights) ** 2).sum(axis=1)) < 10
+            if roi_light is None and felt_lab[0] >= LIGHT_CLOTH_L - 30:
+                roi_light = local_lightness(roi_lab[:, :, 0])
+            # Lettering or a logo ring in the ring pulls its median down, so
+            # whether the cloth is light is judged over a wider area too.
+            if max(local[0], roi_light[cy, cx] if roi_light is not None else 0) >= LIGHT_CLOTH_L:
+                if roi_light is None:
+                    roi_light = local_lightness(roi_lab[:, :, 0])
+                # The cloth is the lighter part of the ring...
+                if len(near_cloth) >= 12:
+                    local = local.copy()
+                    # ...but not above the cloth's lightness over a wider
+                    # area: in a rack the ring holds the neighbours' white.
+                    local[0] = max(local[0], min(float(np.percentile(near_cloth[:, 0], 80)),
+                                                 float(roi_light[cy, cx])))
+                # Light cloth: the table's watermark lettering and logo are
+                # the cloth's colour in one darker shade, still cloth;
+                # lighter (the cue ball, white stripes), another colour, or
+                # other shades (a ball's shading and badge edge) are not.
+                if letter_shade is False:
+                    letter_shade = lettering_shade(roi_lab, roi_light, felt_lab)
+                dl = inner_lab[:, 0] - local[0]
+                dab = np.hypot(inner_lab[:, 1] - local[1], inner_lab[:, 2] - local[2])
+                cloth_inside |= (dab < 10) & (np.abs(dl) < 6)
+                if letter_shade is not None:
+                    cloth_inside |= (dab < 10) & (np.abs(dl - letter_shade) < 10)
+                # A white ball on near-white cloth is only a little brighter
+                # than it on its lit side, and its shaded side looks like a
+                # darker shade of the cloth. Lettering has nothing brighter.
+                if float(np.mean((dl > 8) & (dab < 12))) >= .3:
+                    cloth_inside = (np.abs(dl) < 4) & (dab < 10)
         cloth_fraction = float(np.mean(cloth_inside))
         centre = patch[dist2 <= (r * .4) ** 2]
         # A badge-only proposal stands for a ball that looks like cloth; a
@@ -1869,7 +2037,10 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
             # table, red 3 on red) looks like cloth inside, but its white
             # number badge fills the centre. Hollow rings, lettering and
             # shadows have cloth there.
-            if not has_number_badge(patch, xx, yy, cx, cy, r):
+            badge_v = 150.0
+            if grey and len(ring):
+                badge_v = max(badge_v, float(np.percentile(ring[:, 2], 80)) + 10)
+            if not has_number_badge(patch, xx, yy, cx, cy, r, badge_v):
                 continue
         sat = float(np.median(inner[:, 1]))
         val = float(np.median(inner[:, 2]))
