@@ -1,6 +1,6 @@
 """Measure the detector on many synthetic frames with known geometry.
 
-    python stress_test.py [--count 200] [--start 0] [--save-failures DIR]
+    python stress_test.py [--count 200] [--start 0] [--cloth white] [--harsh] [--save-failures DIR]
 
 Prints error statistics and every failed check per seed. A frame passes when
 the table, cue ball, balls, ghost ball, aim angle, target and predicted
@@ -90,8 +90,10 @@ def bounce_check(segments, direction, truth, balls, true_start=None, true_dir=No
     return mech, true_deg, len(drawn)
 
 
-def evaluate(seed: int, kind: str | None = None, cloth: str | int = "blue"):
+def evaluate(seed: int, kind: str | None = None, cloth: str | int = "blue", harsh: bool = False):
     scene = fg.random_scene(seed, kind, cloth)
+    if harsh:
+        scene = fg.harsh(scene)
     frame, truth = fg.render(scene)
     d = main.detect(frame)
     r = truth.radius
@@ -271,6 +273,8 @@ def main_cli():
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--kind")
     parser.add_argument("--cloth", default="blue", help="cloth colour: " + ", ".join(list(fg.CLOTH_HUES) + list(fg.CLOTH_HSV)) + ", black, or h,s,v")
+    parser.add_argument("--harsh", action="store_true",
+                        help="show each scene as a real mirror might: stream scale, 4:2:0 colour, display tone")
     parser.add_argument("--save-failures")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
@@ -279,7 +283,7 @@ def main_cli():
     collected = {}
     for seed in range(args.start, args.start + args.count):
         cloth = tuple(int(v) for v in args.cloth.split(",")) if args.cloth.count(",") == 2 else args.cloth
-        scene, frame, truth, d, problems, stats = evaluate(seed, args.kind, cloth)
+        scene, frame, truth, d, problems, stats = evaluate(seed, args.kind, cloth, args.harsh)
         for key, value in stats.items():
             collected.setdefault(key, []).append(value)
         if problems:

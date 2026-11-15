@@ -57,6 +57,10 @@ class Scene:
     cloth_hsv: tuple | None = None                    # any cloth: OpenCV (hue, saturation, value) mid-table
     jpeg_quality: int | None = None
     blur: float = 0.0
+    # Real AirPlay mirror effects (all off by default):
+    mirror_scale: float = 1.0                         # picture streamed at this scale, shown back at full size
+    chroma_420: bool = False                          # H.264 colour at half resolution (colour bleeds at edges)
+    tone: tuple[float, float, float] = (1.0, 0.0, 1.0)  # contrast, brightness offset, gamma of the display
     letterbox: float = .07
     seed: int = 0
     cloth_hue: int = 98                               # OpenCV hue; Miniclip's default blue
@@ -620,10 +624,51 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     frame = np.clip(np.rint(canvas), 0, 255).astype(np.uint8)
     if scene.blur > 0:
         frame = cv2.GaussianBlur(frame, (0, 0), scene.blur)
+    frame = _mirror_effects(frame, scene)
     if scene.jpeg_quality:
         ok, data = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, scene.jpeg_quality])
         frame = cv2.imdecode(data, cv2.IMREAD_COLOR)
     return frame, truth
+
+
+def _mirror_effects(frame: np.ndarray, scene: Scene) -> np.ndarray:
+    """What an AirPlay mirror does to the picture: streamed at a lower
+    resolution and scaled back up, colour at half resolution (H.264 4:2:0),
+    and the receiver/display's own contrast, brightness and gamma."""
+    h, w = frame.shape[:2]
+    if scene.mirror_scale != 1.0:
+        small = cv2.resize(frame, (max(1, int(round(w * scene.mirror_scale))),
+                                   max(1, int(round(h * scene.mirror_scale)))), interpolation=cv2.INTER_AREA)
+        frame = cv2.resize(small, (w, h), interpolation=cv2.INTER_LINEAR)
+    if scene.chroma_420:
+        ycc = cv2.cvtColor(frame, cv2.COLOR_BGR2YCrCb)
+        for c in (1, 2):
+            half = cv2.resize(ycc[:, :, c], ((w + 1) // 2, (h + 1) // 2), interpolation=cv2.INTER_AREA)
+            ycc[:, :, c] = cv2.resize(half, (w, h), interpolation=cv2.INTER_LINEAR)
+        frame = cv2.cvtColor(ycc, cv2.COLOR_YCrCb2BGR)
+    contrast, brightness, gamma = scene.tone
+    if (contrast, brightness, gamma) != (1.0, 0.0, 1.0):
+        x = np.arange(256, dtype=np.float32) / 255
+        lut = np.clip((x ** gamma) * 255 * contrast + brightness + (1 - contrast) * 128, 0, 255)
+        frame = cv2.LUT(frame, lut.astype(np.uint8))
+    return frame
+
+
+def harsh(scene: Scene, seed: int | None = None) -> Scene:
+    """The same scene as a real mirror might show it: random stream scale,
+    4:2:0 colour, JPEG, blur and display tone (its own random stream, so the
+    layout is unchanged)."""
+    rng = np.random.default_rng(10_000_019 + (scene.seed if seed is None else seed))
+    return replace(scene,
+                   # An iPhone mirror streams ~1600-2000 px wide; a bigger
+                   # window shows it scaled up (a smaller one, scaled down,
+                   # loses nothing that matters here).
+                   mirror_scale=float(min(1.0, rng.uniform(1600, 2000) / scene.width)),
+                   chroma_420=bool(rng.random() < .8),
+                   jpeg_quality=int(rng.choice([65, 75, 85, 92])),
+                   blur=float(rng.choice([0, .4, .7])),
+                   tone=(float(rng.uniform(.85, 1.12)), float(rng.uniform(-14, 14)),
+                         float(rng.uniform(.85, 1.15))))
 
 
 # --- random scenes ---------------------------------------------------------

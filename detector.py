@@ -509,6 +509,7 @@ def separate_cue_stick_detections(
     rim_open: dict[tuple[int, int], float] | None = None,
     distance: np.ndarray | None = None,
     offset: tuple[int, int] = (0, 0),
+    body: dict[tuple[int, int], tuple[float, float, float]] | None = None,
 ) -> list[tuple[int, int, int, str]]:
     """Drop circle-like cue-stick ornaments lying behind the tracked cue ball.
 
@@ -542,6 +543,12 @@ def separate_cue_stick_detections(
             # decoration is narrower.
             if across <= typical_r * STICK_AXIS_SHARE and not _wider_than_stick(
                     distance, bx - offset[0], by - offset[1], ux, uy, typical_r):
+                continue
+            # A grey metal body (barely saturated, mid brightness, not white)
+            # on the stick's axis is one of its joints: no ball looks like
+            # that (the 8 is dark, the cue ball and stripes mostly white).
+            sat, val, white = (body or {}).get((bx, by), (255.0, 0.0, 0.0))
+            if across <= typical_r * STICK_AXIS_SHARE and sat < 60 and 50 < val < 175 and white < .3:
                 continue
             ball_like = (rim_open is not None and rim_open.get((bx, by), 0.0) >= STICK_BALL_RIM
                          and br >= typical_r * STICK_BALL_SIZE)
@@ -1493,7 +1500,7 @@ def table_from_pockets(frame: np.ndarray) -> tuple[int, int, int, int] | None:
     if not grey:
         felt_like |= hue_near(hsv[:, :, 0], hue, 23, 27) & (hsv[:, :, 1] >= 45) & (hsv[:, :, 2] >= 65)
     felt_like = felt_like.astype(np.uint8)
-    count, _, stats, centres = cv2.connectedComponentsWithStats(dark, connectivity=8)
+    count, labels, stats, centres = cv2.connectedComponentsWithStats(dark, connectivity=8)
     blobs = []
     for i in range(1, count):
         x, y, bw, bh, area = stats[i]
@@ -1507,7 +1514,19 @@ def table_from_pockets(frame: np.ndarray) -> tuple[int, int, int, int] | None:
         around = felt_like[max(0, y - pad):y + bh + pad, max(0, x - pad):x + bw + pad]
         if around.size == 0 or float(np.count_nonzero(around)) / around.size < .08:
             continue
-        blobs.append((float(centres[i][0]), float(centres[i][1]), float(bw), float(area)))
+        # Centre on the hole's darkest core: a darker display (lower
+        # brightness, higher gamma) pulls the pocket's shaded rim under the
+        # limit too, and the whole blob's centre slides towards it.
+        values = hsv[y:y + bh, x:x + bw, 2]
+        member = labels[y:y + bh, x:x + bw] == i
+        darkest = float(values[member].min())
+        core = member & (values <= darkest + .5 * (limit - darkest))
+        if int(core.sum()) >= .25 * area:
+            ys, xs = np.nonzero(core)
+            cx_, cy_ = x + float(xs.mean()), y + float(ys.mean())
+        else:
+            cx_, cy_ = float(centres[i][0]), float(centres[i][1])
+        blobs.append((cx_, cy_, float(bw), float(area)))
     blobs = sorted(blobs, key=lambda b: -b[3])[:40]
     best = None
     for a in blobs:
@@ -2316,8 +2335,9 @@ def detect(frame: np.ndarray) -> Detection:
                 distance = shared.get("distance")
                 if distance is None:
                     distance = felt_distance_image(roi, cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), as_float=True)
+                body = {(c[0], c[1]): (c[3], c[4], c[5]) for c in cue_candidates}
                 balls = separate_cue_stick_detections(balls, cue_position, aim, rim_open,
-                                                      distance=distance, offset=(x, y))
+                                                      distance=distance, offset=(x, y), body=body)
             # Exactly one ball is the cue ball; other white/striped detections
             # remain valid object-ball targets under 8-ball rules.
             cue_index = min(range(len(balls)), key=lambda i: np.hypot(balls[i][0]-cue[0], balls[i][1]-cue[1]))
@@ -2337,7 +2357,7 @@ def detect(frame: np.ndarray) -> Detection:
                 balls, cue[:3], aim_now, rim_open,
                 distance=shared.get("distance") if shared.get("distance") is not None
                 else felt_distance_image(roi, cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), as_float=True),
-                offset=(x, y))
+                offset=(x, y), body={(c[0], c[1]): (c[3], c[4], c[5]) for c in cue_candidates})
             if len(filtered) != len(balls):
                 balls = filtered
                 shot = predict_shot(roi, table, balls, cue[:3])
