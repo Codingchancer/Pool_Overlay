@@ -20,6 +20,7 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
+| Table fit with a covered corner pocket (overlay resized to a too-small table when the cue ball sat on a pocket) | detector | Jartartarta | `jartartarta/covered-pocket` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Power needed for a shot:** record ~20-30 real shots (slider % at release + where the balls stop) to fit Miniclip's friction and the %-to-speed scale per cue; then compute the minimum power to pot and add it to `Detection` for Codingchancer to mark on the slider. Also confirm the slider reading on a mid-drag and a full-power frame.
