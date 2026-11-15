@@ -528,6 +528,32 @@ class NearCueGhostTests(unittest.TestCase):
         self.assertIsNone(d.target, problems)
 
 
+class StickAxisRingTests(unittest.TestCase):
+    """A ring centred on the stick's axis (a band or the glowing collar on a
+    real cue) was taken for a ball and stopped a bounce path at the stick."""
+
+    def test_ring_on_the_axis_is_dropped_but_a_ball_under_the_stick_stays(self):
+        import cv2
+        import detector
+
+        r = 18
+        cue = (900, 300, r)
+        aim = (1.0, 0.0)  # the stick lies to the left of the cue ball
+        distance = np.zeros((600, 1000), np.float32)
+        cv2.rectangle(distance, (200, 295), (880, 305), 50.0, -1)      # thin stick
+        cv2.circle(distance, (600, 300), int(r * .8), 50.0, -1)        # decoration on it
+        cv2.circle(distance, (400, 300), r, 50.0, -1)                  # a ball under the stick
+        balls = [(*cue, "cue"), (600, 300, r, "ball"), (400, 300, r, "ball")]
+        kept = detector.separate_cue_stick_detections(
+            balls, cue, aim, rim_open={(600, 300): .9, (400, 300): .9}, distance=distance)
+        self.assertNotIn((600, 300, r, "ball"), kept)
+        self.assertIn((400, 300, r, "ball"), kept)
+
+    def test_synthetic_stick_joint_is_not_a_ball(self):
+        *_, truth, d, problems, stats = run(111)
+        self.assertFalse(any("false" in p for p in problems), problems)
+
+
 class GameLineReaderTests(unittest.TestCase):
     def test_one_pixel_guide_thread_is_not_read_as_the_game_line(self):
         # Real frame: only a short stub of Miniclip's thick object line shows

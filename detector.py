@@ -397,6 +397,9 @@ def _run_peaks(angles: np.ndarray, runs: np.ndarray, minimum: float) -> list[tup
 # ball radius, real balls 0.92-1.12; both can have clean round rims.
 STICK_BALL_RIM = .5
 STICK_BALL_SIZE = .9
+# A circle whose centre lies within this share of a ball radius of the
+# stick's axis is a decoration on the stick.
+STICK_AXIS_SHARE = .2
 # Towards the butt Miniclip's stick is nearly a ball wide, and its end cap and
 # rings are round, full ball size and have clean rims (real frame: 1.11 r,
 # rim 0.79, 1-3 px off the stick axis, ~30 r behind the cue ball). Such a
@@ -438,6 +441,24 @@ def stick_half_width(distance: np.ndarray, cx: float, cy: float, ux: float, uy: 
     return min(widths) if widths else None
 
 
+def _wider_than_stick(distance, cx: float, cy: float, ux: float, uy: float, radius: float) -> bool:
+    """True when non-cloth shows ~0.95 radii to both sides of the stick axis
+    at (cx, cy), i.e. the circle there is as wide as a ball."""
+    if distance is None:
+        return True
+    h, w = distance.shape[:2]
+    hits = 0
+    for side in (-1, 1):
+        values = []
+        for reach in (.93, .97):
+            px = cx - uy * side * radius * reach
+            py = cy + ux * side * radius * reach
+            if 0 <= px < w and 0 <= py < h:
+                values.append(float(distance[int(py), int(px)]))
+        hits += bool(values) and max(values) > 8
+    return hits == 2
+
+
 def separate_cue_stick_detections(
     balls: list[tuple[int, int, int, str]],
     cue: tuple[int, int, int],
@@ -471,6 +492,14 @@ def separate_cue_stick_detections(
         shaft_half_width = max(9.0, min(cr * 1.05, br * 1.1))
         # The stick reaches ~30 ball radii behind the cue ball on real frames.
         if cr * 1.35 < behind < typical_r * 40 and across <= shaft_half_width:
+            # A ring centred on the stick's own axis is one of its
+            # decorations (bands, joints, the glowing collar on real cues)
+            # unless something non-cloth shows on both sides of the stick at
+            # most of a ball radius out: a ball under the stick does, a
+            # decoration is narrower.
+            if across <= typical_r * STICK_AXIS_SHARE and not _wider_than_stick(
+                    distance, bx - offset[0], by - offset[1], ux, uy, typical_r):
+                continue
             ball_like = (rim_open is not None and rim_open.get((bx, by), 0.0) >= STICK_BALL_RIM
                          and br >= typical_r * STICK_BALL_SIZE)
             if ball_like and distance is not None:
