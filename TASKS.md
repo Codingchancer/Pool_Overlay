@@ -20,7 +20,6 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| Draw the paths through other balls (`capture.py` + `tracking.py`, one-off in Codingchancer's files at Jartartarta's request) | overlay | Jartartarta | `jartartarta/draw-knock-on` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Power needed for a shot:** record ~20-30 real shots (slider % at release + where the balls stop) to fit Miniclip's friction and the %-to-speed scale per cue; then compute the minimum power to pot and add it to `Detection` for Codingchancer to mark on the slider. Also confirm the slider reading on a mid-drag and a full-power frame.
@@ -34,7 +33,8 @@ Border rules:
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
 
 ## Done
-- [x] Prediction: paths through other balls (Jartartarta, #17): `Detection.knock_paths` / `deflect_paths` (where a ball in the way goes, where the moving ball deflects to; synthetic median 1.4 deg). Not drawn yet: needs `capture.py` + `tracking.py`.
+- [x] Draw the paths through other balls (Jartartarta, #18, one-off in Codingchancer's `capture.py` / `tracking.py`): orange dashes for the ball in the way, dash-dot for the deflection; tracking mode now passes pot, stick pull, power slider and these paths too (the `tracking.py` part of #11).
+- [x] Prediction: paths through other balls (Jartartarta, #17): `Detection.knock_paths` / `deflect_paths` (where a ball in the way goes, where the moving ball deflects to; synthetic median 1.4 deg). Drawn since #18.
 - [x] Table fit with a covered corner pocket (Jartartarta, #16/#17): three corners + the middle pocket fix the table, so Fit table no longer shrinks the overlay. Also: the neon table is found (dark rail bands cut off the pockets), no cushion rebound from a pocket mouth.
 - [x] Freeze fix (Jartartarta, #15, one-off in `overlay.py` while Codingchancer was away): one screen capture per worker thread instead of a new one per frame; GDI objects stay at ~26 instead of hitting Windows' 10,000 limit after ~2 min. `tests/test_capture_reuse.py` guards it. Closes #13.
 - [x] Freeze + polish (Jartartarta, #14): every ball drawn at one size (shadows made circles up to 22% too big), cue ball centre no longer pulled by its shadow; stress test 285/300. Freeze found: `overlay.py` leaks a screen capture per frame until Windows' GDI limit (~2 min on the synthetic table); tested patch in issue #13 for Codingchancer.
