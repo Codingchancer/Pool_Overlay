@@ -162,10 +162,39 @@ def paint_guide(p: QPainter, d: Detection, width: int, height: int, adjusting: b
         for start, end in (segments or [])[:limit]:
             p.setPen(pen(colour, 2 * thick, Qt.PenStyle.DashDotLine))
             p.drawLine(QPoint(*start), QPoint(*end))
+    # Where a path meets a cushion, a thin ball outline: the path follows the
+    # ball's centre, which turns one radius before the cushion, while the
+    # outline shows the ball actually touching it.
+    radii = [b[2] for b in d.balls or []]
+    ball_r = sorted(radii)[len(radii) // 2] if radii else (d.cue[2] if d.cue else 0)
+    outlines = [(d.aim_segments, style.colour("aim", round(a * .6))),
+                (d.object_segments, style.colour("object", round(a * .6))),
+                (d.cue_segments, style.colour("cue", round(a * .6)))]
+    outlines += [(path, QColor(255, 140, 40, round(a * .5))) for path in getattr(d, "knock_paths", None) or []]
+    outlines += [(path, style.colour("object" if index == 0 else "cue", round(a * .5)))
+                 for index, path in enumerate(getattr(d, "deflect_paths", None) or [])]
+    for segments, colour in outlines:
+        p.setPen(pen(colour, 1.2))
+        for cx_, cy_ in cushion_contacts((segments or [])[:limit], d.table, ball_r):
+            p.drawEllipse(QPointF(cx_, cy_), ball_r, ball_r)
     if d.target:
         tx, ty, tr = d.target
         p.setPen(pen(style.colour("object", a), 3 * thick))
         p.drawEllipse(QPointF(tx, ty), tr + 5, tr + 5)
+
+
+def cushion_contacts(segments, table, radius: float):
+    """End points of ``segments`` where the ball touches a cushion: its
+    centre one radius inside the cushion nose (the paths follow the centre)."""
+    if not segments or not table or not radius:
+        return []
+    x, y, w, h = table
+    limits = (x + radius, y + radius, x + w - radius, y + h - radius)
+    points = []
+    for _, (ex, ey) in segments:
+        if min(abs(ex - limits[0]), abs(ey - limits[1]), abs(ex - limits[2]), abs(ey - limits[3])) <= 1.5:
+            points.append((ex, ey))
+    return points
 
 
 def render_guide_layer(d: Detection, width: int, height: int, adjusting: bool, active: bool,
