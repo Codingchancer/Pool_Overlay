@@ -2065,6 +2065,7 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
     pockets_local = [(-inset, -inset), (tw / 2, -2 * inset), (tw + inset, -inset),
                      (-inset, th + inset), (tw / 2, th + 2 * inset), (tw + inset, th + inset)]
     accepted = []
+    refit: set[tuple[int, int]] = set()
     for cx, cy, r in proposals:
         if not (0 <= cx < tw and 0 <= cy < th):
             continue
@@ -2145,8 +2146,14 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
             # A coloured body is a ball circle finding missed (packed in a
             # rack, crossed by a guide line); a grey one is the stick's joint.
             coloured = float(np.median(inner[body][:, 1])) >= 90 and not grey
-            if float(np.mean(cloth_inside[body])) <= .25 and not coloured:
-                continue
+            if float(np.mean(cloth_inside[body])) <= .25:
+                if not coloured:
+                    continue
+                # Another hue than the cloth, so it has a rim to fit: the
+                # badge is printed off the ball's centre.
+                body_hue = float(np.median(hue_delta(inner[body][:, 0], local_hue)))
+                if abs(body_hue) > 15:
+                    refit.add((cx, cy))
         if cloth_fraction > .35:
             # A solid ball the same colour as the cloth (purple 4 on a purple
             # table, red 3 on red) looks like cloth inside, but its white
@@ -2197,6 +2204,10 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
         # Only a white ball (the cue ball, whose centre sets the aim) has an
         # edge strong enough to beat its shadow in this fit; on a ball close
         # to the cloth colour the shadow would win and pull the centre.
+        if (cx, cy) in refit:
+            fx, fy = refit_centre(smooth, float(cx), float(cy), typical, reach=typical * .6)
+            if np.hypot(fx - cx, fy - cy) <= typical * .6:
+                cx, cy = int(round(fx)), int(round(fy))
         white_ball = rest[2] >= .5  # (sat, val, white_fraction, red_spot)
         if white_ball and r > typical * (1 + BALL_SIZE_SPREAD) and rim_open_fraction(smooth, cx, cy, typical) >= .65:
             fx, fy = refit_centre(smooth, float(cx), float(cy), typical)
