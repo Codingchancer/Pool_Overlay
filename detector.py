@@ -1158,6 +1158,60 @@ def hue_delta(hue, centre: float):
     return (np.asarray(hue, np.float32) - centre + 90) % 180 - 90
 
 
+def _three_corner_fit(blobs, dark: np.ndarray):
+    """(error, tl, tr, bl, br) from three corner pockets, the fourth inferred.
+
+    ``blobs`` are pocket candidates (x, y, width, area). Two corners on one
+    long side, a third straight above or below one of them, and a middle
+    pocket on that long side (checked in the ``dark`` mask directly: the
+    cushion cuts it into a shape the blob filter drops); the hidden corner
+    completes the rectangle.
+    """
+    h, w = dark.shape[:2]
+    best = None
+    for a in blobs:
+        for b in blobs:
+            dx = b[0] - a[0]
+            if dx < 200 or abs(b[1] - a[1]) > dx * .03:
+                continue
+            size = (a[2] + b[2]) / 2
+            if not (.035 * dx <= size <= .1 * dx) or max(a[3], b[3]) > 2 * min(a[3], b[3]):
+                continue
+            row_y = (a[1] + b[1]) / 2
+            # The middle pocket of this side: halfway along, a little outside
+            # the corner row (middle pockets sit further out), smaller.
+            mid_x = (a[0] + b[0]) / 2
+            half = max(3, int(round(dx * .012)))
+            x0m, x1m = int(mid_x - half), int(mid_x + half) + 1
+            y0m, y1m = int(row_y - dx * .03), int(row_y + dx * .03) + 1
+            box = dark[max(0, y0m):min(h, y1m), max(0, x0m):min(w, x1m)]
+            if box.size == 0 or float(box.mean()) < .25:
+                continue
+            for c in blobs:
+                if c is a or c is b:
+                    continue
+                for corner, other in ((a, b), (b, a)):
+                    dy = c[1] - corner[1]
+                    if abs(c[0] - corner[0]) > dx * .03 or not (.44 * dx <= abs(dy) <= .58 * dx):
+                        continue
+                    if max(c[3], corner[3]) > 2 * min(c[3], corner[3]):
+                        continue
+                    # The hidden corner: under/over the other one, level with c.
+                    hidden = (other[0], c[1], other[2], other[3])
+                    if dy > 0:
+                        tl, tr = (a, b)
+                        bl, br = (c, hidden) if corner is a else (hidden, c)
+                    else:
+                        bl, br = (a, b)
+                        tl, tr = (c, hidden) if corner is a else (hidden, c)
+                    height = (bl[1] + br[1]) / 2 - (tl[1] + tr[1]) / 2
+                    error = (abs(c[0] - corner[0]) + abs(b[1] - a[1]) + abs(height / dx - .51) * dx * .2
+                             + dx * .01)  # a little worse than any four-corner fit
+                    if best is None or error < best[0]:
+                        best = (error, tl, tr, bl, br)
+    return best
+
+
 def table_from_pockets(frame: np.ndarray) -> tuple[int, int, int, int] | None:
     """Fit the playing area from the four dark corner pockets.
 
@@ -1213,6 +1267,11 @@ def table_from_pockets(frame: np.ndarray) -> tuple[int, int, int, int] | None:
                              + abs(dy / dx - .51) * dx * .2)
                     if best is None or error < best[0]:
                         best = (error, a, b, c, d)
+    if best is None:
+        # A corner pocket can be hidden (the cue ball or the stick on it).
+        # Three corners still fix the table when the long side's middle
+        # pocket confirms the row that has both corners.
+        best = _three_corner_fit(blobs, dark)
     if best is None:
         return None
     _, a, b, c, d = best

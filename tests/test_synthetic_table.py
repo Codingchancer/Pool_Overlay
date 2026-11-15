@@ -386,6 +386,39 @@ class BallSizeTests(unittest.TestCase):
             self.assertLessEqual(stats["cue"], 2.0, f"seed {seed}: {problems}")
 
 
+class CoveredPocketTests(unittest.TestCase):
+    """The cue ball or the stick on a corner pocket used to make the pocket
+    fit give up; on a real frame the colour fallback then returned a table
+    too small, and Fit table resized the overlay to it."""
+
+    def test_pocket_fit_works_with_one_corner_covered(self):
+        import cv2
+        import detector
+
+        for seed in range(9000, 9010):
+            frame, truth = fg.render(fg.random_scene(seed))
+            holes = fg.pocket_holes(truth.table)
+            for corner in (0, 2, 3, 5):
+                covered = frame.copy()
+                px, py, hole = holes[corner]
+                cv2.circle(covered, (int(px), int(py)), int(hole * 1.3), (230, 232, 232), -1)
+                found = detector.table_from_pockets(covered)
+                self.assertIsNotNone(found, f"seed {seed}, corner {corner}")
+                err = max(abs(a - b) for a, b in zip(found, truth.table))
+                self.assertLessEqual(err, 3.0, f"seed {seed}, corner {corner}: {found}")
+
+    @unittest.skipUnless((Path(__file__).resolve().parents[1] / "outputs/bad/resize-stick-top/window.png").exists(),
+                         "real screenshot not present")
+    def test_real_frame_with_cue_ball_on_a_corner_pocket(self):
+        import cv2
+        import detector
+
+        frame = cv2.imread(str(Path(__file__).resolve().parents[1] / "outputs/bad/resize-stick-top/window.png"))
+        table = detector.find_table_bounds(frame)
+        for got, want in zip(table, (331, 219, 966, 484)):
+            self.assertLessEqual(abs(got - want), 4, table)
+
+
 class GameLineReaderTests(unittest.TestCase):
     def test_one_pixel_guide_thread_is_not_read_as_the_game_line(self):
         # Real frame: only a short stub of Miniclip's thick object line shows
