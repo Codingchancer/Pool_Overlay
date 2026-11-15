@@ -858,6 +858,39 @@ def predict_shot(roi: np.ndarray, table: tuple[int, int, int, int],
     return {**shot, "stick_pull": pull}
 
 
+def ghost_from_object_line(white: np.ndarray, balls_local, cue_local, radius: float):
+    """(ghost x, y, struck ball) in ROI pixels from the game's object-ball
+    line, or None.
+
+    When the struck ball lies right next to the cue ball, Miniclip's ghost
+    ring sits on top of the cue ball and cannot be read. The game still draws
+    its object line from the struck ball's centre, and the ghost touches that
+    ball on the far side: one diameter back along the line.
+    """
+    cx, cy = cue_local[:2]
+    best = None
+    for bx, by, br, kind in balls_local:
+        if kind == "cue":
+            continue
+        dist = float(np.hypot(bx - cx, by - cy))
+        if not (1.8 * radius <= dist <= 4.4 * radius):
+            continue
+        hint = ((bx - cx) / dist, (by - cy) / dist)
+        found = game_line_direction(white, (bx, by), hint, radius, cone_degrees=70.0)
+        if found is None:
+            continue
+        (dx, dy), (ax, ay) = found
+        gx, gy = ax - 2 * radius * dx, ay - 2 * radius * dy
+        gap = float(np.hypot(gx - cx, gy - cy))
+        # The ghost overlaps (or nearly touches) the cue ball, and the cue
+        # ball travels through it into the struck ball.
+        if not (.1 * radius <= gap <= 2.4 * radius) or (gx - cx) * dx + (gy - cy) * dy <= 0:
+            continue
+        if best is None or dist < best[0]:
+            best = (dist, gx, gy, (bx, by, br))
+    return None if best is None else (best[1], best[2], best[3])
+
+
 def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
                    balls: list[tuple[int, int, int, str]], cue: tuple[int, int, int]) -> dict:
     """Follow the game's aim graphics and estimate cue/object paths.
@@ -889,6 +922,25 @@ def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
             direction, ghost = candidate, found
     if ghost is None:
         ghost = find_ghost_ball(ghost_mask, cue_local, None, ball_r) if direction is None else None
+    near_ghost = None
+
+    def ball_touches(gxl, gyl):
+        return any(abs(float(np.hypot(bx - gxl, by - gyl)) - 2 * ball_r) <= ball_r * .5
+                   for bx, by, _, kind in balls_local if kind == "ball")
+
+    def against_cushion(gxl, gyl):
+        return min(gxl - ball_r, width - ball_r - gxl, gyl - ball_r, height - ball_r - gyl) < ball_r * .35
+
+    # A ghost against a cushion with no ball beside it is a plain rebound
+    # shot, not a hidden one; leave it alone.
+    if (ghost is None or np.hypot(ghost[0] - cue_local[0], ghost[1] - cue_local[1]) <= cr * 1.5
+            or not (ball_touches(ghost[0], ghost[1]) or against_cushion(ghost[0], ghost[1]))):
+        near_ghost = ghost_from_object_line(white, balls_local, cue_local, ball_r)
+        if near_ghost is not None:
+            ghost = (near_ghost[0], near_ghost[1], ball_r, 1.0)
+            dx, dy = near_ghost[0] - cue_local[0], near_ghost[1] - cue_local[1]
+            n = float(np.hypot(dx, dy))
+            direction = (dx / n, dy / n)
     if direction is None and ghost is None:
         return {**empty, "note": "Cue found · Miniclip aim line not detected"}
     if direction is None:
@@ -900,10 +952,14 @@ def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
         gx, gy = ghost[0] + left, ghost[1] + top
         gdx, gdy = gx - cx, gy - cy
         glen = float(np.hypot(gdx, gdy))
-        refined = ray_direction_to_ghost(white, cue_local, (ghost[0], ghost[1]), ball_r)
+        refined = None if near_ghost is not None else ray_direction_to_ghost(white, cue_local, (ghost[0], ghost[1]), ball_r)
         if refined is not None:
             gdx, gdy = refined[0] * glen, refined[1] * glen
-        if glen > cr * 1.5:
+        if near_ghost is not None:
+            # Ghost found from the object line, on top of the cue ball.
+            direction = (gdx / glen, gdy / glen)
+            ghost_frame = (gx, gy, ball_r)
+        elif glen > cr * 1.5:
             # The reticle centre lies on the game's ray, and it is far from the
             # cue ball, so this gives the aim angle to a fraction of a degree.
             direction = (gdx / glen, gdy / glen)
@@ -912,7 +968,11 @@ def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
     obstacles = [(bx, by, br) for bx, by, br, kind in balls if kind != "cue"]
     angle = float(np.degrees(np.arctan2(uy, ux)))
     selected = None
-    if ghost_frame is not None:
+    if near_ghost is not None:
+        # The ball whose object line placed the ghost is the struck ball.
+        bx, by, br = near_ghost[2]
+        selected = (int(round(bx + left)), int(round(by + top)), int(br))
+    if ghost_frame is not None and selected is None:
         gx, gy, _ = ghost_frame
         # The struck ball touches the ghost ball: its centre is two radii from
         # the reticle centre, on the far side.
@@ -2029,6 +2089,18 @@ def detect(frame: np.ndarray) -> Detection:
                          note=f"Table found · {len(balls)} circle candidates · too many to track confidently")
     if cue:
         shot = predict_shot(roi, table, balls, cue[:3])
+        aim_now = shot.get("aim_dir")
+        if aim_now is not None and (aim is None or aim_now[0] * aim[0] + aim_now[1] * aim[1] < .985):
+            # The aim used for the cue-stick filter above was wrong (the ghost
+            # ring on top of the cue ball hid the ray); filter the stick's
+            # rings along the real aim and predict again.
+            filtered = separate_cue_stick_detections(
+                balls, cue[:3], aim_now, rim_open,
+                distance=felt_distance_image(roi, cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), as_float=True),
+                offset=(x, y))
+            if len(filtered) != len(balls):
+                balls = filtered
+                shot = predict_shot(roi, table, balls, cue[:3])
         if shot["ghost"]:
             # Nothing can occupy the spot where the cue ball will be at impact:
             # a "ball" centred on the ghost ring is the ring itself (the ray and

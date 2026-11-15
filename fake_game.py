@@ -693,6 +693,26 @@ def _random_scene(seed: int, kind: str | None = None) -> Scene:
     # Choose an aim: at a reachable target with a random cut, or at an empty cushion.
     order = list(placed)
     rng.shuffle(order)
+    if kind == "near":
+        # The struck ball right next to the cue ball, so the game's ghost ring
+        # lies on top of the cue ball (the aim must come from its object line).
+        for number in order:
+            for _ in range(40):
+                a = float(rng.uniform(-np.pi, np.pi))
+                dist = float(rng.uniform(2.3, 3.6)) * r
+                bx, by = cue[0] + dist * np.cos(a), cue[1] + dist * np.sin(a)
+                if not inside(bx, by) or not clear_of_pockets(bx, by):
+                    continue
+                if not all(np.hypot(bx - ox, by - oy) >= 2.1 * r for k, (ox, oy) in placed.items() if k != number):
+                    continue
+                old = placed[number]
+                placed[number] = (float(bx), float(by))
+                cut = float(rng.uniform(-.6, .6))
+                scene.aim_degrees = float(np.degrees(a - np.arcsin(cut * 2 * r / dist)))
+                truth = solve_truth(scene)
+                if truth.target == number:
+                    return scene
+                placed[number] = old
     if kind == "pot":
         # Send a ball at a pocket, a little off its centre, so the scene is a
         # pot, a jaw hit or a near miss.

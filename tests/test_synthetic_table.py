@@ -508,6 +508,26 @@ class NeonTableTests(unittest.TestCase):
         self.assertIsNotNone(d.ghost)
 
 
+class NearCueGhostTests(unittest.TestCase):
+    """The struck ball right next to the cue ball puts the game's ghost ring
+    on top of the cue ball; the aim and the struck ball's path used to be
+    lost (0 of 40 synthetic shots). The ghost now comes from the game's
+    object line."""
+
+    def test_struck_ball_path_found_when_the_ghost_is_on_the_cue_ball(self):
+        right = 0
+        for seed in range(9400, 9420):
+            *_, truth, d, problems, stats = run(seed, "near")
+            right += "object" in stats and stats["object"] <= 2.0
+        self.assertGreaterEqual(right, 12, f"only {right}/20 near shots got the struck ball's path")
+
+    def test_cushion_rebound_is_not_mistaken_for_a_hidden_ghost(self):
+        # Synthetic seed 271: aim at an empty cushion; the stick beside a
+        # ball must not be read as an object line.
+        *_, truth, d, problems, stats = run(271)
+        self.assertIsNone(d.target, problems)
+
+
 class GameLineReaderTests(unittest.TestCase):
     def test_one_pixel_guide_thread_is_not_read_as_the_game_line(self):
         # Real frame: only a short stub of Miniclip's thick object line shows
