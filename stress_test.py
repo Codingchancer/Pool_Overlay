@@ -94,8 +94,17 @@ def evaluate(seed: int, kind: str | None = None, cloth: str | int = "blue", hars
     scene = fg.random_scene(seed, kind, cloth)
     if harsh:
         scene = fg.harsh(scene)
-    frame, truth = fg.render(scene)
-    d = main.detect(frame)
+    return check_scene(scene)
+
+
+def check_scene(scene, frame=None, truth=None, d=None):
+    """Every check on one rendered scene (``frame``/``truth``/``d`` may be
+    passed when already made). Returns (scene, frame, truth, d, problems,
+    stats) like ``evaluate``."""
+    if frame is None:
+        frame, truth = fg.render(scene)
+    if d is None:
+        d = main.detect(frame)
     r = truth.radius
     problems = []
     stats = {}

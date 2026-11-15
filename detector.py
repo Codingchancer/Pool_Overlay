@@ -2541,7 +2541,22 @@ def find_power_slider(frame: np.ndarray, table: tuple[int, int, int, int]) -> tu
             continue
         if abs(y + h / 2 - (top + height / 2)) > height * .2:
             continue
-        candidates.append((int(x), int(y), int(w), int(h)))
+        # The cue stick can lie across the slot and cut its frame in two:
+        # carry on over a short gap in the same columns.
+        rows = mask[:, x:x + w].sum(axis=1) >= max(2, w * .2)
+        gap = int(round(height * .08))
+        top_row, bottom_row = int(y), int(y + h - 1)
+        while True:
+            above = np.nonzero(rows[max(0, top_row - gap):top_row])[0]
+            if above.size == 0 or bottom_row - (max(0, top_row - gap) + int(above[0])) > 1.05 * height:
+                break
+            top_row = max(0, top_row - gap) + int(above[0])
+        while True:
+            below = np.nonzero(rows[bottom_row + 1:bottom_row + 1 + gap])[0]
+            if below.size == 0 or bottom_row + 1 + int(below[-1]) - top_row > 1.05 * height:
+                break
+            bottom_row = bottom_row + 1 + int(below[-1])
+        candidates.append((int(x), top_row, int(w), bottom_row - top_row + 1))
     # Closest to the table first (other tall icons sit further left); it must
     # hold the cue, or be an empty dark slot (cue dragged all the way down).
     for rect in sorted(candidates, key=lambda r: -r[0]):
@@ -2553,7 +2568,7 @@ def find_power_slider(frame: np.ndarray, table: tuple[int, int, int, int]) -> tu
 def _slider_empty(frame: np.ndarray, slider: tuple[int, int, int, int]) -> bool:
     """True when the slot's middle is dark from top to bottom (no cue showing)."""
     x, y, w, h = slider
-    centre = x + w / 2
+    centre = _slider_centre(frame, slider)
     half = max(2, int(round(w * .06)))
     strip = frame[int(y + h * .06):int(y + h * .94), int(centre - half):int(centre + half) + 1]
     if strip.size == 0:
@@ -2562,10 +2577,28 @@ def _slider_empty(frame: np.ndarray, slider: tuple[int, int, int, int]) -> bool:
     return bool(np.mean(value < 110) > .95)
 
 
+def _slider_centre(frame: np.ndarray, slider: tuple[int, int, int, int]) -> float:
+    """Column of the cue's shaft in the slot: the box's middle, unless the
+    shaft's colour shows clearly elsewhere (the stick's joint touching the
+    frame can widen the box)."""
+    x, y, w, h = slider
+    box = frame[y:y + h, x:x + w]
+    if box.size == 0:
+        return x + w / 2
+    hsv = cv2.cvtColor(box, cv2.COLOR_BGR2HSV)
+    shaft = ((hsv[:, :, 0] >= 5) & (hsv[:, :, 0] <= 25) & (hsv[:, :, 1] >= 70) & (hsv[:, :, 1] <= 190)
+             & (hsv[:, :, 2] >= 170))
+    columns = shaft.mean(axis=0)
+    if columns.max() < .05:
+        return x + w / 2
+    strong = np.nonzero(columns >= columns.max() * .6)[0]
+    return x + float(strong.mean()) + .5
+
+
 def _slider_shaft_top(frame: np.ndarray, slider: tuple[int, int, int, int]) -> float | None:
     """Row (fraction of the slot height from its top) where the cue's shaft starts."""
     x, y, w, h = slider
-    centre = x + w / 2
+    centre = _slider_centre(frame, slider)
     half = max(2, int(round(w * .06)))
     strip = frame[y:y + h, int(centre - half):int(centre + half) + 1]
     if strip.size == 0:
@@ -2583,15 +2616,35 @@ def _slider_shaft_top(frame: np.ndarray, slider: tuple[int, int, int, int]) -> f
         return None
     filled = shaft.copy()
     gap_ok = max(2, int(round(h * .01)))
+    # The cue stick can lie across the slider (aiming from near the left
+    # cushion): a longer gap is skipped when the shaft clearly goes on above.
+    jump = int(round(h * .07))
+    resume = max(3, int(round(h * .03)))
     top_row = bottom
     misses = 0
-    for r in range(bottom, -1, -1):
+    r = bottom
+    while r >= 0:
         if filled[r]:
             top_row, misses = r, 0
         else:
             misses += 1
             if misses > gap_ok:
-                break
+                above = filled[max(0, r - jump):r]
+                runs = np.nonzero(above)[0]
+                if runs.size == 0:
+                    break
+                # The lowest row above the gap that starts a long enough run.
+                start = None
+                for k in runs[::-1]:
+                    k0 = max(0, r - jump) + int(k)
+                    if k0 - resume + 1 >= 0 and filled[k0 - resume + 1:k0 + 1].all():
+                        start = k0
+                        break
+                if start is None:
+                    break
+                r, misses = start, 0
+                continue
+        r -= 1
     return top_row / h
 
 
