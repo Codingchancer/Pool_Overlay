@@ -553,6 +553,7 @@ def separate_cue_stick_detections(
     offset: tuple[int, int] = (0, 0),
     body: dict[tuple[int, int], tuple[float, float, float]] | None = None,
     min_behind: float = 1.35,
+    axis_rule: bool = True,
 ) -> list[tuple[int, int, int, str]]:
     """Drop circle-like cue-stick ornaments lying behind the tracked cue ball.
 
@@ -584,7 +585,7 @@ def separate_cue_stick_detections(
             # unless something non-cloth shows on both sides of the stick at
             # most of a ball radius out: a ball under the stick does, a
             # decoration is narrower.
-            if across <= typical_r * STICK_AXIS_SHARE and not _wider_than_stick(
+            if axis_rule and across <= typical_r * STICK_AXIS_SHARE and not _wider_than_stick(
                     distance, bx - offset[0], by - offset[1], ux, uy, typical_r):
                 continue
             # A grey metal body (barely saturated, mid brightness, not white)
@@ -593,8 +594,10 @@ def separate_cue_stick_detections(
             sat, val, white = (body or {}).get((bx, by), (255.0, 0.0, 0.0))
             if across <= typical_r * STICK_AXIS_SHARE and sat < 60 and 50 < val < 175 and white < .3:
                 continue
+            # (Without the aim's axis rule a ball half under the stick, its
+            # circle shrunk by the stick, must not be lost on size alone.)
             ball_like = (rim_open is not None and rim_open.get((bx, by), 0.0) >= STICK_BALL_RIM
-                         and br >= typical_r * STICK_BALL_SIZE)
+                         and (br >= typical_r * STICK_BALL_SIZE or not axis_rule))
             if ball_like and distance is not None:
                 width = stick_half_width(distance, bx - offset[0], by - offset[1], ux, uy, br)
                 ball_like = width is None or width < typical_r * STICK_WIDTH_SHARE
@@ -2486,6 +2489,15 @@ def detect(frame: np.ndarray) -> Detection:
                 best = max(verified, key=lambda item: item[:3])
                 if best[0] or cue is None:
                     cue = best[3]
+            # The ray and ghost of a struck ball right next to the cue ball
+            # are hidden under the ring, while a striped ball's own object
+            # line can pass for a ray ending in a "ghost". The cue ball is
+            # the purest white ball: a much whiter, less saturated candidate
+            # wins over a striped one.
+            whitest = max(cue_candidates, key=lambda c: c[5])
+            if (cue is not None and whitest is not cue and whitest[5] >= .75
+                    and whitest[5] >= cue[5] + .15 and whitest[3] <= cue[3] - 10):
+                cue = whitest
         if cue:
             cue_position = cue[:3]
             cue_index = min(range(len(balls)), key=lambda i: np.hypot(balls[i][0]-cue[0], balls[i][1]-cue[1]))
@@ -2511,7 +2523,7 @@ def detect(frame: np.ndarray) -> Detection:
                 body = {(c[0], c[1]): (c[3], c[4], c[5]) for c in cue_candidates}
                 balls = separate_cue_stick_detections(balls, cue_position, aim_for_stick, rim_open,
                                                       distance=distance, offset=(x, y), body=body,
-                                                      min_behind=min_behind)
+                                                      min_behind=min_behind, axis_rule=bool(aim))
             # Exactly one ball is the cue ball; other white/striped detections
             # remain valid object-ball targets under 8-ball rules.
             cue_index = min(range(len(balls)), key=lambda i: np.hypot(balls[i][0]-cue[0], balls[i][1]-cue[1]))
