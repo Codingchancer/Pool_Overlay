@@ -20,7 +20,6 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| Ball outline where a path meets a cushion (`capture.py`, one-off in Codingchancer's file at Jartartarta's request) | overlay | Jartartarta | `jartartarta/cushion-outline` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Power needed for a shot:** record ~20-30 real shots (slider % at release + where the balls stop) to fit Miniclip's friction and the %-to-speed scale per cue; then compute the minimum power to pot and add it to `Detection` for Codingchancer to mark on the slider. Also confirm the slider reading on a mid-drag and a full-power frame.
@@ -33,6 +32,7 @@ Border rules:
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
 
 ## Done
+- [x] Ball outline where a path meets a cushion (Jartartarta, #20, one-off in Codingchancer's `capture.py`): the paths follow the ball's centre, the outline shows the ball touching the cushion.
 - [x] Ghost ring on top of the cue ball + stick rings (Jartartarta, #19): aim found from the game's object line when the ring is hidden (synthetic near shots: struck ball's path right on 28/40, was 0); rings centred on the stick's axis are no longer balls (stress 286/300).
 - [x] Draw the paths through other balls (Jartartarta, #18, one-off in Codingchancer's `capture.py` / `tracking.py`): orange dashes for the ball in the way, dash-dot for the deflection; tracking mode now passes pot, stick pull, power slider and these paths too (the `tracking.py` part of #11).
 - [x] Prediction: paths through other balls (Jartartarta, #17): `Detection.knock_paths` / `deflect_paths` (where a ball in the way goes, where the moving ball deflects to; synthetic median 1.4 deg). Drawn since #18.
