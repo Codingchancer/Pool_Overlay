@@ -1882,6 +1882,44 @@ def refit_centre(distance: np.ndarray, cx: float, cy: float, r: float,
     return best
 
 
+# White-mask ring score at the cue ball's centre above which the "cue ball"
+# is the ghost ring lying on it (measured: 0.17 locked, at most 0.03 on real
+# cue balls).
+RING_ON_CUE_SCORE = .12
+
+
+def refit_beside_ring(distance: np.ndarray, cx: float, cy: float, r: float,
+                      gx: float, gy: float, ring_r: float) -> tuple[float, float]:
+    """Ball centre near (cx, cy) fitted on the cloth-distance image, leaving
+    out rim samples that fall on the ghost ring drawn at (gx, gy)."""
+    cos, sin = np.cos(_RIM_ANGLES), np.sin(_RIM_ANGLES)
+    band = max(3.0, ring_r * .3)
+    best, best_score = (cx, cy), -np.inf
+    for step, span in ((1.0, r * 1.2), (.25, 1.5)):
+        offsets = np.arange(-span, span + 1e-6, step)
+        gxs, gys = np.meshgrid(best[0] + offsets, best[1] + offsets)
+        centres = np.column_stack([gxs.ravel(), gys.ravel()])
+        best_score = -np.inf
+        for px, py in centres:
+            ix, iy = px + (r - 1.5) * cos, py + (r - 1.5) * sin
+            ox, oy = px + (r + 1.5) * cos, py + (r + 1.5) * sin
+            clear = ((np.abs(np.hypot(ix - gx, iy - gy) - ring_r) > band)
+                     & (np.abs(np.hypot(ox - gx, oy - gy) - ring_r) > band))
+            if clear.mean() < .4:
+                continue
+            inside = cv2.remap(distance, ix[None].astype(np.float32), iy[None].astype(np.float32),
+                               cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
+            outside = cv2.remap(distance, ox[None].astype(np.float32), oy[None].astype(np.float32),
+                                cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
+            score = float((inside - outside)[clear].mean())
+            if score > best_score:
+                best_score, chosen = score, (float(px), float(py))
+        if best_score == -np.inf:
+            return cx, cy
+        best = chosen
+    return best
+
+
 # All pool balls are the same size. A fitted radius further than this share
 # from the typical one has grown onto the ball's drop shadow (or shrunk
 # against a neighbour); its centre is fitted again at the typical radius.
@@ -2370,6 +2408,39 @@ def detect(frame: np.ndarray) -> Detection:
             cleaned = [b for b in balls if b[3] == "cue" or np.hypot(b[0] - gx, b[1] - gy) > gr * .6]
             if len(cleaned) != len(balls):
                 balls = cleaned
+                shot = predict_shot(roi, table, balls, cue[:3])
+        ring_on_cue = None
+        if balls:
+            radius = float(np.median([b[2] for b in balls]))
+            if shot["ghost"] and np.hypot(cue[0] - shot["ghost"][0], cue[1] - shot["ghost"][1]) < radius * 1.5:
+                ring_on_cue = shot["ghost"]
+            elif not shot["ghost"]:
+                # No ghost found: the "cue ball" may be the ring itself.
+                white = white_guide_mask(roi, []).astype(np.float32) / 255
+                lx, ly = cue[0] - x, cue[1] - y
+                k = _ring_kernel(radius)
+                y0_, x0_ = max(0, ly - k.shape[0]), max(0, lx - k.shape[1])
+                local = white[y0_:ly + k.shape[0] + 1, x0_:lx + k.shape[1] + 1]
+                score = cv2.filter2D(local, -1, k, borderType=cv2.BORDER_CONSTANT)
+                sy, sx = ly - y0_, lx - x0_
+                near = score[max(0, sy - 2):sy + 3, max(0, sx - 2):sx + 3]
+                if near.size and float(near.max()) >= RING_ON_CUE_SCORE:
+                    ring_on_cue = (cue[0], cue[1], radius)
+        if ring_on_cue is not None:
+            # The struck ball right next to the cue ball puts the ghost ring
+            # on top of the cue ball, and circle finding can lock onto the
+            # ring (a crisp white circle) instead of the ball under it. Fit
+            # the ball again with the ring's pixels left out.
+            gx, gy, gr = ring_on_cue
+            distance = shared.get("distance")
+            if distance is None:
+                distance = felt_distance_image(roi, cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), as_float=True)
+            fx, fy = refit_beside_ring(cv2.GaussianBlur(distance, (0, 0), 1.0), cue[0] - x, cue[1] - y,
+                                       radius, gx - x, gy - y, gr)
+            moved = (int(round(fx + x)), int(round(fy + y)))
+            if moved != tuple(cue[:2]) and np.hypot(moved[0] - cue[0], moved[1] - cue[1]) <= radius * 1.2:
+                balls = [(moved[0], moved[1], b[2], b[3]) if b[3] == "cue" else b for b in balls]
+                cue = (moved[0], moved[1], *cue[2:])
                 shot = predict_shot(roi, table, balls, cue[:3])
         balls = uniform_ball_size(balls)
         cue = (*cue[:2], balls[0][2]) if balls else cue
