@@ -106,6 +106,14 @@ class GuideStabilizer:
     TABLE_PX = 2
     AIM_DEG = .3
     HOLD_SECONDS = .5
+    # While the player turns the stick, each frame moves the aim by less than
+    # AIM_DEG, so holding the guide made it trail the game's line by up to
+    # that much and then jump (sweep simulation: 0.20 deg median at 5 deg/s).
+    # The stick is turning when the last TURNING_STEPS aim changes all go the
+    # same way and add up to more than TURNING_DEG (random frame noise, up to
+    # ~0.1 deg, goes both ways); every frame is then drawn.
+    TURNING_STEPS = 4
+    TURNING_DEG = .16
 
     def __init__(self):
         self.reset()
@@ -113,6 +121,8 @@ class GuideStabilizer:
     def reset(self):
         self.shown: Detection | None = None
         self.confirmed_at = 0.0
+        self.last_angle: float | None = None
+        self.steps: list[float] = []
 
     @staticmethod
     def has_shot(d: Detection | None) -> bool:
@@ -128,12 +138,27 @@ class GuideStabilizer:
             return False
         return _angle_between(a.aim_dir, b.aim_dir) <= self.AIM_DEG
 
+    def _turning(self, detection: Detection) -> bool:
+        """Is the aim drifting steadily one way (the stick being turned)?"""
+        if detection.aim_dir is None:
+            self.last_angle, self.steps = None, []
+            return False
+        angle = float(np.degrees(np.arctan2(detection.aim_dir[1], detection.aim_dir[0])))
+        if self.last_angle is not None:
+            self.steps = (self.steps + [(angle - self.last_angle + 180) % 360 - 180])[-self.TURNING_STEPS:]
+        self.last_angle = angle
+        if len(self.steps) < self.TURNING_STEPS:
+            return False
+        same_way = all(step > 0 for step in self.steps) or all(step < 0 for step in self.steps)
+        return same_way and abs(sum(self.steps)) > self.TURNING_DEG
+
     def update(self, detection: Detection, now: float | None = None) -> Detection:
         """The detection to draw: the one already shown if nothing really changed."""
         now = time.monotonic() if now is None else now
         shown = self.shown
+        turning = self._turning(detection)
         if self.has_shot(detection):
-            if self.has_shot(shown) and self.same_shot(shown, detection):
+            if self.has_shot(shown) and not turning and self.same_shot(shown, detection):
                 self.confirmed_at = now
                 return shown
             self.shown, self.confirmed_at = detection, now
