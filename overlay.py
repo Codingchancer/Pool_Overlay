@@ -259,15 +259,34 @@ def screen_changed(thumbnail: np.ndarray, last: np.ndarray | None) -> bool:
     return int(np.count_nonzero(cv2.absdiff(thumbnail, last) > 8)) >= 3
 
 
-_thread_state = threading.local()
+# One mss capture per worker thread, kept by the thread's id. (A
+# threading.local does not work here: PySide clears it after every
+# QRunnable, so a new capture was opened for each frame and never closed;
+# its screen DC, memory DC and bitmap leaked until Windows' limit of 10,000
+# GDI objects was reached after a few minutes and the guide froze.)
+_captures: dict[int, object] = {}
+_captures_lock = threading.Lock()
 
 
 def _capture_for_this_thread():
     """An mss capture must stay on the thread that opened it: one per worker."""
-    capture = getattr(_thread_state, "capture", None)
-    if capture is None:
-        capture = _thread_state.capture = mss.MSS()
+    key = threading.get_ident()
+    with _captures_lock:
+        capture = _captures.get(key)
+        if capture is None:
+            capture = _captures[key] = mss.MSS()
     return capture
+
+
+def close_captures():
+    """Close every worker's capture (on exit)."""
+    with _captures_lock:
+        for capture in _captures.values():
+            try:
+                capture.close()
+            except Exception:
+                pass
+        _captures.clear()
 
 
 class AnalysisSignals(QObject):
@@ -843,4 +862,6 @@ class Control(QMainWindow):
         if self.synthetic_window is not None:
             self.synthetic_window.close()
         self.capture.close()
+        self.thread_pool.waitForDone(2000)
+        close_captures()
         super().closeEvent(e)
