@@ -2031,6 +2031,105 @@ def stick_direction(stick_lines, cue_xy: tuple[float, float], radius: float,
     return ux, uy
 
 
+def shadow_direction(lightness: np.ndarray, cloth: np.ndarray, balls, radius: float) -> tuple[float, float] | None:
+    """Unit direction in which the balls' drop shadows fall, measured as the
+    darkest side of a ring just outside each object ball (None when too few
+    balls show one). All shadows fall the same way."""
+    vectors = []
+    for bx, by, _, kind in balls:
+        if kind == "cue":
+            continue
+        xs = (bx + radius * 1.2 * np.cos(_RIM_ANGLES))[None].astype(np.float32)
+        ys = (by + radius * 1.2 * np.sin(_RIM_ANGLES))[None].astype(np.float32)
+        value = cv2.remap(lightness, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
+        around = cv2.remap(cloth, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
+        dark = np.clip(around - value, 0, 60)
+        # A ring mostly dark is packed among other balls: no shadow to read.
+        if dark.sum() < 1 or (dark > 25).mean() > .6:
+            continue
+        v = np.array([np.sum(dark * np.cos(_RIM_ANGLES)), np.sum(dark * np.sin(_RIM_ANGLES))])
+        vectors.append(v / (np.linalg.norm(v) + 1e-9))
+    if len(vectors) < 2:
+        return None
+    mean = np.mean(vectors, axis=0)
+    norm = float(np.linalg.norm(mean))
+    return None if norm < .5 else (float(mean[0] / norm), float(mean[1] / norm))
+
+
+def white_cloth_cue_centre(roi: np.ndarray, cue_xy: tuple[float, float], balls,
+                           offset: tuple[int, int]) -> tuple[float, float] | None:
+    """Cue-ball centre on a white or light grey cloth, or None elsewhere.
+
+    There the ball's shaded rim and its drop shadow are equally dark, so on
+    the shadow side its edge cannot be seen and a full-circle fit slides
+    towards the shadow (3-7 px). The rim is fitted on the lit half only (away
+    from the shadow, whose direction the object balls show), on the
+    brightness step at the edge, leaving out the guide's strokes and the
+    stick (very bright or dark pixels) that cross the rim.
+    """
+    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
+    lightness = lab[:, :, 0].astype(np.float32)
+    cloth = local_lightness(lightness)
+    cx, cy = cue_xy
+    h, w = lightness.shape
+    # Only a near-white cloth: on a light grey one the cue ball is far
+    # brighter than the cloth and the usual fit finds its whole rim.
+    # (Judged on the table's brightest cloth: the lighting falls off
+    # towards the rails, where white cloth is as dark as light grey.)
+    if (not (0 <= int(cy) < h and 0 <= int(cx) < w) or cloth[int(cy), int(cx)] < LIGHT_CLOTH_L
+            or float(np.percentile(cloth[::8, ::8], 95)) < WHITE_CLOTH_L):
+        return None
+    # Colourless cloth only (white, light grey): on a coloured one the
+    # colour difference finds the whole rim.
+    ring = (np.hypot(*np.ogrid[-int(cy):h - int(cy), -int(cx):w - int(cx)]) < 60)
+    if np.hypot(float(np.median(lab[:, :, 1][ring])) - 128, float(np.median(lab[:, :, 2][ring])) - 128) >= 8:
+        return None
+    local = [(bx - offset[0], by - offset[1], br, kind) for bx, by, br, kind in balls]
+    radius = float(np.median([b[2] for b in local]))
+    sdir = shadow_direction(lightness, cloth, local, radius)
+    if sdir is None:
+        return None
+    strokes = ((lightness > cloth + 15) | (lightness < 110)).astype(np.uint8)
+    strokes = cv2.dilate(strokes, np.ones((3, 3), np.uint8), iterations=2).astype(bool)
+    angles = _RIM_ANGLES[np.cos(_RIM_ANGLES - np.arctan2(sdir[1], sdir[0])) < WHITE_CUE_LIT]
+    cos, sin = np.cos(angles), np.sin(angles)
+    best, best_score = (float(cx), float(cy)), None
+    for step, span in ((1.0, WHITE_CUE_REACH), (.25, 1.0)):
+        offsets = np.arange(-span, span + 1e-6, step)
+        found = None
+        for px in best[0] + offsets:
+            for py in best[1] + offsets:
+                for r in np.arange(radius * .92, radius * 1.08 + 1e-6, .25):
+                    inner = (px + (r - 1) * cos, py + (r - 1) * sin)
+                    outer = (px + (r + 1) * cos, py + (r + 1) * sin)
+                    a = cv2.remap(lightness, inner[0][None].astype(np.float32), inner[1][None].astype(np.float32),
+                                  cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
+                    b = cv2.remap(lightness, outer[0][None].astype(np.float32), outer[1][None].astype(np.float32),
+                                  cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
+                    ok = np.ones(len(angles), bool)
+                    for xs, ys in (inner, outer):
+                        ok &= ~strokes[np.clip(ys.astype(int), 0, h - 1), np.clip(xs.astype(int), 0, w - 1)]
+                    if ok.mean() < .4:
+                        continue
+                    value = float(np.abs(b - a)[ok].mean())
+                    if found is None or value > found[0]:
+                        found = (value, (float(px), float(py)))
+        if found is None:
+            return None
+        best_score, best = found
+    return best
+
+
+# Cloth lightness (Lab L, 8-bit) from which the cue ball is fitted on its
+# lit side, as the table's brightest cloth (white ~225-231; light grey ~182).
+WHITE_CLOTH_L = 205.0
+# How far (px) the white-cloth cue fit may move the circle-finding centre.
+WHITE_CUE_REACH = 4.0
+# Rim arc used: cos(angle from the shadow) below this (the lit side, with
+# margin for an error in the measured shadow direction).
+WHITE_CUE_LIT = -.4
+
+
 # All pool balls are the same size. A fitted radius further than this share
 # from the typical one has grown onto the ball's drop shadow (or shrunk
 # against a neighbour); its centre is fitted again at the typical radius.
@@ -2084,6 +2183,7 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
     lab_weights = np.array([.5, 1.0, 1.0], np.float32)
     roi_light = None
     letter_shade = False   # not measured yet
+    roi_bright = None
     distance = felt_distance_image(roi, roi_hsv, as_float=True)
     if shared is not None:
         # detect() needs the same image again for the cue-stick filter.
@@ -2196,7 +2296,14 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
                 dab = np.hypot(inner_lab[:, 1] - local[1], inner_lab[:, 2] - local[2])
                 cloth_inside |= (dab < 10) & (np.abs(dl) < 6)
                 if letter_shade is not None:
-                    cloth_inside |= (dab < 10) & (np.abs(dl - letter_shade) < 10)
+                    # Lettering borders only cloth. The same shade right next
+                    # to something brighter than the cloth is the blurred
+                    # edge of a ball's white badge or stripe.
+                    if roi_bright is None:
+                        roi_bright = cv2.dilate(((roi_lab[:, :, 0] > roi_light + 12) * 255).astype(np.uint8),
+                                                np.ones((5, 5), np.uint8)) > 0
+                    near_bright = roi_bright[y0:y1, x0:x1][dist2 <= (r * .62) ** 2]
+                    cloth_inside |= (dab < 10) & (np.abs(dl - letter_shade) < 10) & ~near_bright
                 # A white ball on near-white cloth is only a little brighter
                 # than it on its lit side, and its shaded side looks like a
                 # darker shade of the cloth. Lettering has nothing brighter.
@@ -2499,10 +2606,14 @@ def detect(frame: np.ndarray) -> Detection:
                     and whitest[5] >= cue[5] + .15 and whitest[3] <= cue[3] - 10):
                 cue = whitest
         if cue:
-            cue_position = cue[:3]
             cue_index = min(range(len(balls)), key=lambda i: np.hypot(balls[i][0]-cue[0], balls[i][1]-cue[1]))
+            moved = white_cloth_cue_centre(roi, (cue[0] - x, cue[1] - y), balls, (x, y))
+            if moved is not None:
+                # (The candidate tuple carries the colour measurements on.)
+                cue = (int(round(moved[0] + x)), int(round(moved[1] + y)), *cue[2:])
+            cue_position = cue[:3]
             bx, by, br, _ = balls[cue_index]
-            balls[cue_index] = (bx, by, br, "cue")
+            balls[cue_index] = (cue[0], cue[1], br, "cue")
             balls = separate_cue_overlap_detections(balls, cue_position)
             local_balls = [(bx-x, by-y, br, kind) for bx, by, br, kind in balls]
             aim = aim_direction(roi, (cue_position[0]-x, cue_position[1]-y, cue_position[2]), local_balls)
