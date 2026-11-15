@@ -20,6 +20,7 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
+| Prediction: paths through other balls | detector | Jartartarta | `jartartarta/paths-through-balls` |
 | Table fit with a covered corner pocket (overlay resized to a too-small table when the cue ball sat on a pocket) | detector | Jartartarta | `jartartarta/covered-pocket` |
 
 ## Next — Jartartarta (detector / precision)
