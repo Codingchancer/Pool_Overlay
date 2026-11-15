@@ -12,6 +12,13 @@ Today (after PR #8, still true after #20) the live guide updates about 15 times 
 
 60 updates per second leaves 16.7 ms for everything, so speeding up this loop a little more won't get there. It needs three changes. Check step 0 first.
 
+### Status (15 Nov)
+
+- **1 done** (`window_capture.py`): `BitBlt` from the mirror window, `PrintWindow` for DirectX windows, screen capture as the fallback. Built without new libraries (the internet was down). Capture is 1-5 ms instead of ~8 ms plus ~6 ms guide removal. `live_check.py` 12/12, and the guide is not in the captured frames.
+- **3 done** (`analysis_process.py`), **but no speed gain on this PC**: 16-18 updates per second with the process against 14-19 with window capture inside the app (synthetic table changing 30 times a second). The aim reading itself (`predict_shot`, 25-50 ms on shots that hit a ball) is now the limit. It stays because the app's window never waits for analysis, and it matters more once 2 makes the reading cheap.
+- **2 is now the bottleneck**: needs Jartartarta's OK (his `jartartarta/faster` task).
+- **0 still open**: needs UxPlay and the phone. Also check that window capture works on the UxPlay window (if it gives black, the panel says "screen capture").
+
 ### 0. Measure the mirror's own frame rate first
 
 AirPlay mirroring often sends only 30 frames per second, depending on the phone and the receiver. Analysing more frames than the mirror shows only repeats work, and the guide can't be faster than the game. Count how many *different* frames the UxPlay window shows per second while aiming. If it's 30, the goal is "every frame the mirror shows", not 60.

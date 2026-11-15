@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import time
 
+import cv2
 import numpy as np
 
 from detector import Detection, detect, predict_shot, read_power_slider
@@ -98,3 +99,23 @@ class ShotTracker:
                          power_slider=base.power_slider,
                          power_percent=read_power_slider(frame, base.power_slider),
                          note=f"{shot['note']} · {len(base.balls)} ball candidates")
+
+
+def change_thumbnail(frame: np.ndarray) -> np.ndarray:
+    """A quarter-size grey copy for telling whether the screen changed."""
+    h, w = frame.shape[:2]
+    return cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (max(1, w // 4), max(1, h // 4)),
+                      interpolation=cv2.INTER_AREA)
+
+
+def screen_changed(thumbnail: np.ndarray, last: np.ndarray | None) -> bool:
+    """True unless the frame is the same as the last analysed one.
+
+    Looks for any small spot that changed, not an average over the whole
+    frame: turning the aim a fraction of a degree only moves a thin line and
+    the cue stick, and that must still be analysed. Stream noise averages out
+    over each 4x4 block.
+    """
+    if last is None or last.shape != thumbnail.shape:
+        return True
+    return int(np.count_nonzero(cv2.absdiff(thumbnail, last) > 8)) >= 3
