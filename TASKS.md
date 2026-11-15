@@ -20,7 +20,6 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| Stick crossing balls: keep tracking instead of full detections (`tracking.py`, one-off in Codingchancer's file at Jartartarta's request) | overlay | Jartartarta | `jartartarta/stick-crossing` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Power needed for a shot:** record ~20-30 real shots (slider % at release + where the balls stop) to fit Miniclip's friction and the %-to-speed scale per cue; then compute the minimum power to pot and add it to `Detection` for Codingchancer to mark on the slider. Also confirm the slider reading on a mid-drag and a full-power frame.
@@ -33,6 +32,7 @@ Border rules:
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
 
 ## Done
+- [x] Stick crossing balls (Jartartarta, #23, one-off in Codingchancer's `tracking.py`): a thin stripe of change across a ball is the stick, so tracking carries on instead of a full detection per frame.
 - [x] Window capture + analysis in its own process (Codingchancer, #21; merged by Jartartarta after checks: tests, stress 286/300, live 8/8).
 - [x] Smoother guide, detector side (Jartartarta, #22): same results, full detect 184 -> ~115 ms, `predict_shot` ~15 ms median on shots that hit a ball. Stick crossing balls forces full detections in `tracking.py`: noted on #21 for Codingchancer.
 - [x] Ball outline where a path meets a cushion (Jartartarta, #20, one-off in Codingchancer's `capture.py`): the paths follow the ball's centre, the outline shows the ball touching the cushion.
