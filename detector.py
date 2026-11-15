@@ -71,7 +71,13 @@ def white_guide_mask(roi: np.ndarray, balls: list[tuple[int, int, int, str]],
     # while even the brightly lit, washed-out felt centre stays >= ~95. The
     # older <= 115 limit let pale felt inside the hollow reticle through.
     mask = cv2.inRange(hsv, (0, 0, 165), (255, 70, 255))
-    if _light_cloth(hsv):
+    cloth_s = _cloth_saturation(hsv) if _light_cloth(hsv) else None
+    if cloth_s is not None and cloth_s >= 40:
+        # A pale but coloured cloth (beige, sky): a thin stroke blurred with
+        # its dark outline can be no brighter than the cloth, but it is far
+        # less saturated.
+        mask = cv2.inRange(hsv, (0, 0, 165), (255, int(min(70, cloth_s * .55)), 255))
+    elif cloth_s is not None:
         # A white or pale cloth passes that test itself: a guide stroke must
         # also be clearly brighter than the cloth around it, measured as the
         # cloth's lighter values over a wide window (strokes are thin, and
@@ -99,6 +105,10 @@ DARKER_SHADE_WEIGHT = .25
 # On a light cloth a guide stroke is at least this much brighter than the
 # cloth around it.
 LIGHT_CLOTH_STROKE = 10
+
+
+def _cloth_saturation(hsv: np.ndarray) -> float:
+    return float(np.median(hsv[::8, ::8, 1]))
 
 
 def _light_cloth(hsv: np.ndarray) -> bool:
@@ -1860,15 +1870,16 @@ BALL_SIZE_SPREAD = .06
 
 
 def has_number_badge(patch_hsv: np.ndarray, xx, yy, cx: float, cy: float, r: float,
-                     min_v: float = 150) -> bool:
+                     min_v: float = 150, max_s: float = 90) -> bool:
     """True when a compact white disc (a ball's number badge, ~0.45 r) sits
     near the centre: white fills the middle around its own centroid, with
     almost no white just outside it. The game's guide lines crossing at the
     ghost ball's centre are white there too, but they run on outwards.
-    ``min_v`` is raised on a light cloth, which is itself "white" by the
-    default rule (a badge is still brighter than it).
+    ``min_v`` is raised on a light cloth and ``max_s`` lowered on a pale
+    coloured one, which are themselves "white" by the default rule (a badge
+    is still brighter, and less saturated, than they are).
     """
-    white = (patch_hsv[:, :, 1] < 90) & (patch_hsv[:, :, 2] > min_v)
+    white = (patch_hsv[:, :, 1] < max_s) & (patch_hsv[:, :, 2] > min_v)
     dist2 = (xx - cx) ** 2 + (yy - cy) ** 2
     near = white & (dist2 <= (r * .7) ** 2)
     ys, xs = np.nonzero(near)
@@ -2030,7 +2041,12 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
         if (cx, cy) in from_badge:
             # Judge the ball's own colour around the badge (white excluded).
             body = ~((inner[:, 1] < 90) & (inner[:, 2] > 150))
-            if not body.any() or float(np.mean(cloth_inside[body])) <= .25:
+            if not body.any():
+                continue
+            # A coloured body is a ball circle finding missed (packed in a
+            # rack, crossed by a guide line); a grey one is the stick's joint.
+            coloured = float(np.median(inner[body][:, 1])) >= 90 and not grey
+            if float(np.mean(cloth_inside[body])) <= .25 and not coloured:
                 continue
         if cloth_fraction > .35:
             # A solid ball the same colour as the cloth (purple 4 on a purple
@@ -2038,9 +2054,16 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
             # number badge fills the centre. Hollow rings, lettering and
             # shadows have cloth there.
             badge_v = 150.0
-            if grey and len(ring):
+            # A pale cloth (any colour) passes the default badge-white test
+            # itself; the badge must then be brighter than the cloth.
+            if len(ring) and float(np.median(ring[:, 1])) < 90:
                 badge_v = max(badge_v, float(np.percentile(ring[:, 2], 80)) + 10)
-            if not has_number_badge(patch, xx, yy, cx, cy, r, badge_v):
+            badge_s = 90.0
+            if len(ring):
+                ring_s = float(np.median(ring[:, 1]))
+                if ring_s >= 25:
+                    badge_s = min(badge_s, ring_s * .6)
+            if not has_number_badge(patch, xx, yy, cx, cy, r, badge_v, badge_s):
                 continue
         sat = float(np.median(inner[:, 1]))
         val = float(np.median(inner[:, 2]))
