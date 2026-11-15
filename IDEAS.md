@@ -16,7 +16,7 @@ Today (after PR #8, still true after #20) the live guide updates about 15 times 
 
 - **1 done** (`window_capture.py`): `BitBlt` from the mirror window, `PrintWindow` for DirectX windows, screen capture as the fallback. Built without new libraries (the internet was down). Capture is 1-5 ms instead of ~8 ms plus ~6 ms guide removal. `live_check.py` 12/12, and the guide is not in the captured frames.
 - **3 done** (`analysis_process.py`), **but no speed gain on this PC**: 16-18 updates per second with the process against 14-19 with window capture inside the app (synthetic table changing 30 times a second). The aim reading itself (`predict_shot`, 25-50 ms on shots that hit a ball) is now the limit. It stays because the app's window never waits for analysis, and it matters more once 2 makes the reading cheap.
-- **2 is now the bottleneck**: needs Jartartarta's OK (his `jartartarta/faster` task).
+- **2 is now the bottleneck**: handed to Jartartarta (TASKS.md, his Next list).
 - **0 still open**: needs UxPlay and the phone. Also check that window capture works on the UxPlay window (if it gives black, the panel says "screen capture").
 
 ### 0. Measure the mirror's own frame rate first
@@ -34,9 +34,9 @@ Use Windows Graphics Capture to record only the UxPlay window. Windows on top of
 - Check: on Windows 11 the yellow capture border can be turned off. Capture should keep working when the window is covered.
 - Open the capture session once and reuse it, and close it when the guide is turned off. Issue #13 (fixed in #15): opening a new mss capture on every frame leaked Windows GDI objects until the guide froze. `tests/test_capture_reuse.py` guards this for mss. Write the same kind of test for the new capture.
 
-### 2. Fast aim reader (Codingchancer, `tracking.py`)
+### 2. Fast aim reader (Jartartarta, `tracking.py`)
 
-While aiming, only the angle changes, and only slightly per frame. Talk to Jartartarta before starting: his `jartartarta/faster` task (faster detection per frame, same results) works on the same time budget from the detector side.
+While aiming, only the angle changes, and only slightly per frame. Handed to Jartartarta on 15 Nov (it follows on from his faster-detection work); he may edit `tracking.py` for it.
 
 - Try only angles within about ±2° of the last aim, sampling pixels along each candidate line with `cv2.remap` (~1 ms).
 - Look for the ghost ball only in a small box around where it should be on the new line (< 1 ms).

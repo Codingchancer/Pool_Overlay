@@ -22,6 +22,7 @@ Border rules:
 |---|---|---|---|
 
 ## Next — Jartartarta (detector / precision)
+- [ ] **Fast aim reader** (IDEAS.md idea 2, handed over by Codingchancer 15 Nov): read only the aim change per frame (angles within ~±2° of the last aim, ghost ball in a small box) in ~3-5 ms, with the full `predict_shot` every few frames to correct drift. Reading the aim is now the limit (16-18 updates/s). You may edit Codingchancer's `tracking.py` and `tests/test_realtime.py` for this task; keep the results within the `GuideStabilizer` tolerances and check `live_check.py`.
 - [ ] **Power needed for a shot:** record ~20-30 real shots (slider % at release + where the balls stop) to fit Miniclip's friction and the %-to-speed scale per cue; then compute the minimum power to pot and add it to `Detection` for Codingchancer to mark on the slider. Also confirm the slider reading on a mid-drag and a full-power frame.
 - [ ] **Real-game precision:** play with the guide on; wherever the guide's aim line, target ball or object/cue path does not sit exactly on the game's own white lines, save the frame (set `POOL_OVERLAY_DEBUG_DIR`, keep `capture.png`/`cleaned.png`) and have your Claude fix the detector. Keep real screenshots out of git (`outputs/` is ignored; the repo is public).
 - [ ] **Real-game tests:** turn the saved bad frames into tests that skip when the image is missing (like the existing screenshot tests), so fixes stay fixed.
