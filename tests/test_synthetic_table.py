@@ -367,6 +367,25 @@ class BlackClothTests(unittest.TestCase):
         self.assertIsNotNone(d.ghost)
 
 
+class BallSizeTests(unittest.TestCase):
+    def test_every_ball_is_drawn_at_one_true_size(self):
+        # A ball's drop shadow used to make its circle grow (up to 22% too
+        # big on synthetic frames), so the overlay drew a bigger ring.
+        for seed in range(9000, 9012):
+            frame, truth = fg.render(fg.random_scene(seed))
+            d = main.detect(frame)
+            radii = {r for _, _, r, _ in d.balls}
+            self.assertEqual(len(radii), 1, f"seed {seed}: {sorted(radii)}")
+            self.assertLessEqual(abs(radii.pop() - truth.radius), max(1.5, truth.radius * .1), f"seed {seed}")
+
+    def test_cue_ball_centre_not_pulled_by_its_shadow(self):
+        # Synthetic seeds 13 and 55: the cue ball's circle grew onto its
+        # shadow and its centre moved 3-4 px towards it.
+        for seed in (13, 55):
+            *_, truth, d, problems, stats = run(seed)
+            self.assertLessEqual(stats["cue"], 2.0, f"seed {seed}: {problems}")
+
+
 class GameLineReaderTests(unittest.TestCase):
     def test_one_pixel_guide_thread_is_not_read_as_the_game_line(self):
         # Real frame: only a short stub of Miniclip's thick object line shows
