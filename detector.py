@@ -945,6 +945,11 @@ def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
                 # was probably missed, so show the game ray only.
                 return {**empty, "aim": [((cx, cy), ghost_int[:2])], "ghost": ghost_int, "aim_dir": (ux, uy),
                         "note": f"Aim ray matched at {angle:.1f}° · ghost ball has no object ball beside it"}
+            # Reticle in a pocket mouth: the cue ball goes in (a scratch), it
+            # does not rebound off the cushion beside the pocket.
+            if pocket_outcome([((cx, cy), (gx, gy))], table, ball_r)[0] == "pot":
+                return {**empty, "aim": [((cx, cy), ghost_int[:2])], "ghost": ghost_int, "aim_dir": (ux, uy),
+                        "note": f"Aim ray matched at {angle:.1f}° · cue ball goes into the pocket"}
             # Reticle against a cushion: the cue ball rebounds there. Mirror
             # the aim off each cushion the reticle touches (both in a corner)
             # and trace on from the reticle, like the after-impact paths.
@@ -1286,6 +1291,10 @@ def table_from_pockets(frame: np.ndarray) -> tuple[int, int, int, int] | None:
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     grey = cloth_is_grey(hsv)
     dark = (hsv[:, :, 2] < (GREY_POCKET_DARKNESS if grey else POCKET_DARKNESS)).astype(np.uint8)
+    # Cut thin dark lines (the neon table's rail bands, outlines) away from
+    # the pockets, which they would otherwise join into long blobs. Pockets
+    # are far wider than this kernel.
+    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
     hue = cloth_hue(hsv, step=4)
     if grey:
         felt_like = grey_cloth_mask(hsv).astype(np.uint8)

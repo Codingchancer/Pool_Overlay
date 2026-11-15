@@ -476,6 +476,38 @@ class KnockOnTests(unittest.TestCase):
         self.assertLess(dy_, cy)            # the moving ball glances off upwards
 
 
+class NeonTableTests(unittest.TestCase):
+    """Miniclip's neon table has dark bands along the rails that touch the
+    corner pockets and joined them into long blobs: "Table not found"."""
+
+    def test_pockets_found_when_dark_bands_touch_them(self):
+        import cv2
+        import detector
+
+        for seed in range(9000, 9008):
+            frame, truth = fg.render(fg.random_scene(seed))
+            x, y, w, h = (int(round(v)) for v in truth.table)
+            for yy in (y - 6, y + h + 6):
+                cv2.line(frame, (x - 40, yy), (x + w + 40, yy), (8, 8, 8), 6)
+            for xx in (x - 6, x + w + 6):
+                cv2.line(frame, (xx, y - 40), (xx, y + h + 40), (8, 8, 8), 6)
+            found = detector.table_from_pockets(frame)
+            self.assertIsNotNone(found, f"seed {seed}")
+            self.assertLessEqual(max(abs(a - b) for a, b in zip(found, truth.table)), 3.0, f"seed {seed}")
+
+    @unittest.skipUnless((Path(__file__).resolve().parents[1] / "outputs/bad/batch3/shot9.png").exists(),
+                         "real screenshot not present")
+    def test_real_neon_table(self):
+        import cv2
+
+        frame = cv2.imread(str(Path(__file__).resolve().parents[1] / "outputs/bad/batch3/shot9.png"))
+        d = main.detect(frame)
+        for got, want in zip(d.table, (578, 340, 1017, 510)):
+            self.assertLessEqual(abs(got - want), 4, d.table)
+        self.assertGreaterEqual(len(d.balls), 15)
+        self.assertIsNotNone(d.ghost)
+
+
 class GameLineReaderTests(unittest.TestCase):
     def test_one_pixel_guide_thread_is_not_read_as_the_game_line(self):
         # Real frame: only a short stub of Miniclip's thick object line shows
