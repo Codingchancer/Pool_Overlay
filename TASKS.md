@@ -28,7 +28,6 @@ Border rules:
 - [ ] **Real-game tests:** turn the saved bad frames into tests that skip when the image is missing (like the existing screenshot tests), so fixes stay fixed.
 - [ ] Balls boxed in inside a rack can be off by ~0.5 radius.
 - [ ] Raise the synthetic pass rate (`stress_test.py --count 300`) from 283/300 towards 297+/300 without making real-game results worse.
-
 - [ ] White cloth precision: cue-ball centre (4-6 px off) and striped balls on pure white tables; check on a live white table.
 
 ## Next — Codingchancer (overlay + simulator)
