@@ -20,6 +20,7 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
+| Grey / black cloth (e.g. the Lucky Shot table): table and balls not found when the cloth has no colour | detector | Jartartarta | `jartartarta/grey-cloth` |
 | Shot power: measure how far the stick is pulled back from the cue ball (new `Detection` field; mapping to real power needs live frames later) | detector | Jartartarta | `jartartarta/stick-power` |
 
 ## Next — Jartartarta (detector / precision)
