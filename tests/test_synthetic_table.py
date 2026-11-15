@@ -302,6 +302,39 @@ class StickPullTests(unittest.TestCase):
         self.assertTrue(all(b > a for a, b in zip(readings, readings[1:])), readings)
 
 
+class PowerSliderTests(unittest.TestCase):
+    def test_slider_level_matches_the_truth(self):
+        from dataclasses import replace
+
+        good = total = 0
+        for seed in range(9000, 9016):
+            base = fg.random_scene(seed)
+            for power in (0.0, .3, .6, .9):
+                frame, _ = fg.render(replace(base, power=power))
+                level = main.detect(frame).power_level
+                total += 1
+                good += level is not None and abs(level - power) <= .02
+        # A shot whose cue stick runs across the slider can spoil a reading.
+        self.assertGreaterEqual(good, total - 4)
+
+    def test_no_slider_reads_none(self):
+        for seed in range(9000, 9010):
+            frame, _ = fg.render(fg.random_scene(seed))
+            d = main.detect(frame)
+            self.assertIsNone(d.power_slider)
+            self.assertIsNone(d.power_level)
+
+    @unittest.skipUnless((Path(__file__).resolve().parents[1] / "outputs/bad/stick-and-cushion/snip.png").exists(),
+                         "real screenshot not present")
+    def test_real_slider_at_rest(self):
+        import cv2
+
+        frame = cv2.imread(str(Path(__file__).resolve().parents[1] / "outputs/bad/stick-and-cushion/snip.png"))
+        d = main.detect(frame)
+        self.assertIsNotNone(d.power_slider)
+        self.assertLess(d.power_level, .03)
+
+
 class GameLineReaderTests(unittest.TestCase):
     def test_one_pixel_guide_thread_is_not_read_as_the_game_line(self):
         # Real frame: only a short stub of Miniclip's thick object line shows

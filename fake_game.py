@@ -52,6 +52,7 @@ class Scene:
     show_guide: bool = True
     stick_pull: float = 0.0                           # extra stick gap (in radii)
     show_stick: bool = True                           # False: opponent's turn, no stick
+    power: float | None = None                        # power slider left of the table (0..1), None: not drawn
     jpeg_quality: int | None = None
     blur: float = 0.0
     letterbox: float = .07
@@ -386,6 +387,40 @@ def draw_pocket(canvas, px, py, pr):
     fill_disc(canvas, px, py, pr * .86, (2, 2, 4))
 
 
+# Power slider as on a real frame: slot size and place relative to the table,
+# and where the cue's shaft starts at rest / where the slot's inside ends.
+SLIDER_W, SLIDER_H, SLIDER_LEFT = .052, .794, .183
+SLIDER_REST, SLIDER_END = .098, .965
+
+
+def slider_rect(table):
+    x, y, w, h = table
+    sw, sh = w * SLIDER_W, h * SLIDER_H
+    return (x - w * SLIDER_LEFT - sw / 2, y + h / 2 - sh / 2, sw, sh)
+
+
+def draw_power_slider(canvas, table, power):
+    """Grey-framed slot with a cue that slides down by ``power`` of its travel."""
+    sx, sy, sw, sh = slider_rect(table)
+    x0, y0, x1, y1 = int(round(sx)), int(round(sy)), int(round(sx + sw)), int(round(sy + sh))
+    cv2.rectangle(canvas, (x0, y0), (x1, y1), (126, 107, 108), -1)
+    border = max(2, int(round(sw * .2)))
+    inner_top, inner_bottom = y0 + border, int(round(sy + sh * SLIDER_END))
+    for row in range(inner_top, inner_bottom):
+        k = (row - inner_top) / max(1, inner_bottom - inner_top)
+        canvas[row, x0 + border:x1 - border + 1] = (20 * (1 - k) + 15 * k, 45 * (1 - k) + 15 * k, 50 * (1 - k) + 60 * k)
+    shift = power * (SLIDER_END - SLIDER_REST) * sh
+    cx, half = sx + sw / 2, sw * .09
+    parts = [(.042, .062, (227, 227, 227)), (.062, SLIDER_REST, (40, 40, 40)), (SLIDER_REST, 2.0, (113, 180, 250))]
+    for start, end, colour in parts:
+        a = sy + sh * start + shift
+        b = min(sy + sh * end + shift, sy + sh * SLIDER_END)
+        if b <= a:
+            continue
+        ya, yb = int(round(a)), int(round(b))
+        canvas[max(ya, inner_top):yb, int(round(cx - half)):int(round(cx + half)) + 1] = colour
+
+
 def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     """Draw the scene; return (BGR uint8 frame, truth)."""
     rng = np.random.default_rng(scene.seed)
@@ -403,6 +438,8 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     bar = int(H * scene.letterbox)
     canvas[:bar] = 0                                      # letterbox bars
     canvas[H - bar:] = 0
+    if scene.power is not None and slider_rect(scene.table)[0] > 0:
+        draw_power_slider(canvas, scene.table, scene.power)
     # Wooden rail.
     rail = span * .062
     rail_rect = (int(x - rail), int(y - rail), int(x + w + rail), int(y + h + rail))

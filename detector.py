@@ -40,6 +40,13 @@ class Detection:
     # cue ball). It grows as the player drags the power bar; turning it into
     # a power percentage needs measurements from the real game.
     stick_pull: float | None = None
+    # Miniclip's power slider left of the table, when the capture includes
+    # it: its outer rectangle (x, y, w, h) in frame pixels, and how far its
+    # cue has been dragged down, 0 (at rest) to 1 (cue top at the slot's
+    # bottom). Whether 1 is full power still has to be checked on a real
+    # full-power frame.
+    power_slider: tuple[int, int, int, int] | None = None
+    power_level: float | None = None
     note: str = "Guide is off"
 
 
@@ -1561,6 +1568,101 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int):
     return [(cx, cy, r, *rest, rim_open_fraction(smooth, cx, cy, r)) for _, cx, cy, r, *rest in kept]
 
 
+# Power slider, measured on a real frame (table 1136x568 px): a grey-framed
+# slot 0.052 table widths wide and 0.79 table heights tall, centred 0.183
+# table widths left of the table and level with it. At rest the cue's shaft
+# (below the white tip and dark ferrule) starts SLIDER_REST of the slot
+# height from its top; the slot's inside ends at SLIDER_END.
+SLIDER_REST = .098
+SLIDER_END = .965
+
+
+def find_power_slider(frame: np.ndarray, table: tuple[int, int, int, int]) -> tuple[int, int, int, int] | None:
+    """Outer rectangle of Miniclip's power slider left of the table, or None."""
+    left, top, width, height = table
+    if left < width * .1:
+        return None
+    region = frame[:, :left]
+    hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+    # The slot's grey frame: unsaturated, mid-bright.
+    mask = ((hsv[:, :, 1] < 80) & (hsv[:, :, 2] >= 90) & (hsv[:, :, 2] <= 190)).astype(np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 1), np.uint8))
+    count, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    candidates = []
+    for i in range(1, count):
+        x, y, w, h, area = stats[i]
+        if not (.55 * height <= h <= 1.05 * height and .025 * width <= w <= .09 * width and h >= 5 * w):
+            continue
+        # A framed slot, not a thin edge line (the real frame fills ~17% of
+        # its box, a rail edge ~5%).
+        if area < .1 * w * h:
+            continue
+        if abs(y + h / 2 - (top + height / 2)) > height * .2:
+            continue
+        candidates.append((int(x), int(y), int(w), int(h)))
+    # Closest to the table first (other tall icons sit further left); it must
+    # hold the cue, or be an empty dark slot (cue dragged all the way down).
+    for rect in sorted(candidates, key=lambda r: -r[0]):
+        if _slider_shaft_top(frame, rect) is not None or _slider_empty(frame, rect):
+            return rect
+    return None
+
+
+def _slider_empty(frame: np.ndarray, slider: tuple[int, int, int, int]) -> bool:
+    """True when the slot's middle is dark from top to bottom (no cue showing)."""
+    x, y, w, h = slider
+    centre = x + w / 2
+    half = max(2, int(round(w * .06)))
+    strip = frame[int(y + h * .06):int(y + h * .94), int(centre - half):int(centre + half) + 1]
+    if strip.size == 0:
+        return False
+    value = np.median(cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)[:, :, 2], axis=1)
+    return bool(np.mean(value < 110) > .95)
+
+
+def _slider_shaft_top(frame: np.ndarray, slider: tuple[int, int, int, int]) -> float | None:
+    """Row (fraction of the slot height from its top) where the cue's shaft starts."""
+    x, y, w, h = slider
+    centre = x + w / 2
+    half = max(2, int(round(w * .06)))
+    strip = frame[y:y + h, int(centre - half):int(centre + half) + 1]
+    if strip.size == 0:
+        return None
+    hsv = cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)
+    row = np.median(hsv, axis=1)
+    shaft = (row[:, 0] >= 5) & (row[:, 0] <= 25) & (row[:, 1] >= 70) & (row[:, 1] <= 190) & (row[:, 2] >= 170)
+    # The shaft runs down to the slot's bottom (clipped there); take the run
+    # that reaches lowest, allowing a few odd rows (segment marks).
+    ys = np.nonzero(shaft)[0]
+    if ys.size < h * .03:
+        return None
+    bottom = ys[-1]
+    if bottom < h * .8:
+        return None
+    filled = shaft.copy()
+    gap_ok = max(2, int(round(h * .01)))
+    top_row = bottom
+    misses = 0
+    for r in range(bottom, -1, -1):
+        if filled[r]:
+            top_row, misses = r, 0
+        else:
+            misses += 1
+            if misses > gap_ok:
+                break
+    return top_row / h
+
+
+def read_power_slider(frame: np.ndarray, slider: tuple[int, int, int, int] | None) -> float | None:
+    """How far the slider's cue is dragged down: 0 at rest, 1 at the bottom."""
+    if slider is None:
+        return None
+    shaft = _slider_shaft_top(frame, slider)
+    if shaft is None:
+        return 1.0 if _slider_empty(frame, slider) else None
+    return float(np.clip((shaft - SLIDER_REST) / (SLIDER_END - SLIDER_REST), 0.0, 1.0))
+
+
 def detect(frame: np.ndarray) -> Detection:
     """Find the Miniclip felt, ball centers, and current game aim ray."""
     h, w = frame.shape[:2]
@@ -1568,6 +1670,7 @@ def detect(frame: np.ndarray) -> Detection:
     if table is None:
         return Detection(note="Table not found — adjust the overlay to include the full felt.")
 
+    slider = find_power_slider(frame, table)
     x, y, tw, th = table
     roi = frame[y:y + th, x:x + tw]
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -1686,9 +1789,11 @@ def detect(frame: np.ndarray) -> Detection:
                 balls = cleaned
                 shot = predict_shot(roi, table, balls, cue[:3])
         return Detection(table=table, balls=balls, cue=cue[:3], aim_segments=shot["aim"],
+                         power_slider=slider, power_level=read_power_slider(frame, slider),
                          cue_segments=shot["cue"], object_segments=shot["object"],
                          target=shot["target"], ghost=shot["ghost"], blockers=shot["blockers"],
                          aim_dir=shot["aim_dir"], object_dir=shot["object_dir"], cue_dir=shot["cue_dir"],
                          pot=shot["pot"], pot_pocket=shot["pot_pocket"], stick_pull=shot["stick_pull"],
                          note=f"{shot['note']} · {len(balls)} ball candidates")
-    return Detection(table=table, balls=balls, note="Table found · cue ball not confidently identified")
+    return Detection(table=table, balls=balls, power_slider=slider, power_level=read_power_slider(frame, slider),
+                     note="Table found · cue ball not confidently identified")
