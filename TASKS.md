@@ -20,10 +20,9 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| Grey / black cloth (e.g. the Lucky Shot table): table and balls not found when the cloth has no colour | detector | Jartartarta | `jartartarta/grey-cloth` |
-| Shot power: measure how far the stick is pulled back from the cue ball (new `Detection` field; mapping to real power needs live frames later) | detector | Jartartarta | `jartartarta/stick-power` |
 
 ## Next — Jartartarta (detector / precision)
+- [ ] **Power needed for a shot:** record ~20-30 real shots (slider % at release + where the balls stop) to fit Miniclip's friction and the %-to-speed scale per cue; then compute the minimum power to pot and add it to `Detection` for Codingchancer to mark on the slider. Also confirm the slider reading on a mid-drag and a full-power frame.
 - [ ] **Real-game precision:** play with the guide on; wherever the guide's aim line, target ball or object/cue path does not sit exactly on the game's own white lines, save the frame (set `POOL_OVERLAY_DEBUG_DIR`, keep `capture.png`/`cleaned.png`) and have your Claude fix the detector. Keep real screenshots out of git (`outputs/` is ignored; the repo is public).
 - [ ] **Real-game tests:** turn the saved bad frames into tests that skip when the image is missing (like the existing screenshot tests), so fixes stay fixed.
 - [ ] Ghost ring hidden when the struck ball nearly touches the cue ball: find another cue for that case.
@@ -35,6 +34,8 @@ Border rules:
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
 
 ## Done
+- [x] Grey / black cloth (Jartartarta, #12): the Lucky Shot table's colourless near-black cloth is found (real frame: table within 2 px, cue / gold ball / aim / ghost found). Synthetic black 56/100 (8 ball is the weak spot), purple 84 (was 66).
+- [x] Shot power, reading (Jartartarta, #12): `Detection.power_percent` (0-100) and `power_slider` from Miniclip's power slider (needs the capture to include it), `stick_pull` from the cue stick. Real frames read 0% at rest; % scale not yet confirmed mid-drag.
 - [x] Prediction: pot or miss (Jartartarta, #10): new `Detection.pot` ("pot" / "jaw" / None) and `pot_pocket`; on 200 synthetic pot shots all 152 clear calls match the exact truth. Drawing it and passing it through `tracking.py`: issue #11 for Codingchancer.
 - [x] Any cloth colour (Jartartarta, #9): the detector measured only blue (0/40 shots on green/red/purple); now it measures the cloth hue. Synthetic, 100 shots each: blue 95, green 91, red 86, brown 92, teal 92, purple 66 (test purple = ball 4's colour). Not yet checked on a real non-blue table.
 - [x] Prediction: more cushion bounces (Jartartarta, #9): live paths follow up to 3 cushions (`PATH_BOUNCES`), checked against exact truth (`fake_game.truth_path`); simulator keeps 1. Also fixed the drawn cue path ignoring the corrected cue direction (up to 7 deg off).
