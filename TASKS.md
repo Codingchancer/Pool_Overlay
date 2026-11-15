@@ -20,7 +20,6 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| Guide follows a turning stick (sweep simulation; `GuideStabilizer` one-off in Codingchancer's `overlay.py` at Jartartarta's request) | overlay | Jartartarta | `jartartarta/follow-stick` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Fast aim reader** (IDEAS.md idea 2, handed over by Codingchancer 15 Nov): read only the aim change per frame (angles within ~±2° of the last aim, ghost ball in a small box) in ~3-5 ms, with the full `predict_shot` every few frames to correct drift. Reading the aim is now the limit (16-18 updates/s). You may edit Codingchancer's `tracking.py` and `tests/test_realtime.py` for this task; keep the results within the `GuideStabilizer` tolerances and check `live_check.py`.
@@ -34,6 +33,7 @@ Border rules:
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
 
 ## Done
+- [x] Guide follows a turning stick (Jartartarta, #24, one-off in Codingchancer's `overlay.py`): the stabilizer draws every frame while the aim keeps turning one way (sweep simulation, slow aiming: 0.20 -> 0.06 deg behind). Faster turning: ~one analysis' delay left.
 - [x] Stick crossing balls (Jartartarta, #23, one-off in Codingchancer's `tracking.py`): a thin stripe of change across a ball is the stick, so tracking carries on instead of a full detection per frame.
 - [x] Window capture + analysis in its own process (Codingchancer, #21; merged by Jartartarta after checks: tests, stress 286/300, live 8/8).
 - [x] Smoother guide, detector side (Jartartarta, #22): same results, full detect 184 -> ~115 ms, `predict_shot` ~15 ms median on shots that hit a ball. Stick crossing balls forces full detections in `tracking.py`: noted on #21 for Codingchancer.
