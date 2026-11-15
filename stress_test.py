@@ -270,7 +270,7 @@ def main_cli():
     parser.add_argument("--count", type=int, default=200)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--kind")
-    parser.add_argument("--cloth", default="blue", help="cloth colour: " + ", ".join(fg.CLOTH_HUES))
+    parser.add_argument("--cloth", default="blue", help="cloth colour: " + ", ".join(fg.CLOTH_HUES) + ", black")
     parser.add_argument("--save-failures")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()

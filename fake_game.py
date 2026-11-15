@@ -53,6 +53,7 @@ class Scene:
     stick_pull: float = 0.0                           # extra stick gap (in radii)
     show_stick: bool = True                           # False: opponent's turn, no stick
     power: float | None = None                        # power slider left of the table (0..1), None: not drawn
+    cloth_black: bool = False                         # colourless near-black cloth (Lucky Shot table)
     jpeg_quality: int | None = None
     blur: float = 0.0
     letterbox: float = .07
@@ -454,7 +455,8 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     cushion = span * .02
     cv2.rectangle(canvas, (int(round(x - cushion)), int(round(y - cushion))),
                   (int(round(x + w + cushion)), int(round(y + h + cushion))),
-                  tuple(float(v) for v in _hsv_bgr(tint(1), 175, 205)), -1)
+                  tuple(float(v) for v in (_hsv_bgr(0, 0, 90) if scene.cloth_black
+                                           else _hsv_bgr(tint(1), 175, 205))), -1)
     for i, (px, py) in enumerate(pockets):
         pr = middle_r if i in (1, 4) else corner_r
         draw_pocket(canvas, px, py, pr)
@@ -464,6 +466,11 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     radial = np.hypot((xx - w / 2) / (w / 2), (yy - h / 2) / (h / 2))
     value = (188 - 46 * np.clip(radial, 0, 1.4) + rng.normal(0, 2.2, radial.shape)).clip(0, 255)
     saturation = (134 + 14 * np.clip(radial, 0, 1.4)).clip(0, 255)
+    if scene.cloth_black:
+        # Measured on the real Lucky Shot frame: no colour, brightness ~58 in
+        # the middle down to ~12 at the rails.
+        value = (58 - 46 * np.clip(radial, 0, 1.0) + rng.normal(0, 1.2, radial.shape)).clip(10, 255)
+        saturation = np.zeros_like(value)
     cloth = np.dstack([np.full_like(value, tint(0)), saturation, value]).astype(np.uint8)
     cloth = cv2.cvtColor(cloth, cv2.COLOR_HSV2BGR).astype(np.float32)
     x0i, y0i = int(np.floor(x)), int(np.floor(y))
@@ -478,7 +485,8 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     # Bright cushion-nose highlight just outside the cloth.
     for p0, p1 in (((x, y - 1.2), (x + w, y - 1.2)), ((x, y + h + 1.2), (x + w, y + h + 1.2)),
                    ((x - 1.2, y), (x - 1.2, y + h)), ((x + w + 1.2, y), (x + w + 1.2, y + h))):
-        stroke_line(canvas, p0, p1, 1.6, tuple(float(v) for v in _hsv_bgr(tint(0), 150, 245)))
+        stroke_line(canvas, p0, p1, 1.6, tuple(float(v) for v in (_hsv_bgr(0, 0, 120) if scene.cloth_black
+                                                                   else _hsv_bgr(tint(0), 150, 245))))
     # Re-open the pocket mouths over cushion and highlight.
     for i, (px, py) in enumerate(pockets):
         pr = middle_r if i in (1, 4) else corner_r
@@ -495,8 +503,9 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     # Faint table decorations that must not become balls or aim lines:
     # a head-string line and a large watermark ring with lettering.
     stroke_line(canvas, (x + w / 4, y + 2), (x + w / 4, y + h - 2), 1.4,
-                tuple(float(v) for v in _hsv_bgr(tint(0), 120, 215)), alpha=.7)
-    darker = tuple(float(v) for v in _hsv_bgr(tint(3), 165, 140))
+                tuple(float(v) for v in (_hsv_bgr(0, 0, 70) if scene.cloth_black
+                                         else _hsv_bgr(tint(0), 120, 215))), alpha=.7)
+    darker = tuple(float(v) for v in (_hsv_bgr(0, 0, 32) if scene.cloth_black else _hsv_bgr(tint(3), 165, 140)))
     stroke_ring(canvas, x + w * .55, y + h * .52, r * 3.2, r * .45, darker)
     cv2.putText(canvas, "PRACTICE", (int(x + w * .36), int(y + h * .6)), cv2.FONT_HERSHEY_DUPLEX,
                 r / 9, darker, max(2, int(r / 3)), cv2.LINE_AA)
@@ -574,8 +583,11 @@ CLOTH_HUES = {"blue": 98, "green": 60, "red": 176, "purple": 140, "brown": 12, "
 
 
 def random_scene(seed: int, kind: str | None = None, cloth: str | int = "blue") -> Scene:
-    """Random scene; ``cloth`` is a CLOTH_HUES name or an OpenCV hue.
-    The same seed gives the same layout whatever the cloth colour."""
+    """Random scene; ``cloth`` is a CLOTH_HUES name, "black" (colourless
+    Lucky Shot cloth) or an OpenCV hue. The same seed gives the same layout
+    whatever the cloth colour."""
+    if cloth == "black":
+        return replace(_random_scene(seed, kind), cloth_black=True)
     hue = CLOTH_HUES[cloth] if isinstance(cloth, str) else int(cloth)
     return replace(_random_scene(seed, kind), cloth_hue=hue)
 

@@ -1104,6 +1104,9 @@ POCKET_TO_CUSHION = .0095
 # Pocket mouths are near-black; dark UI panels and navy side panels sit at
 # brightness 32-60 and must not merge into the pocket blobs.
 POCKET_DARKNESS = 45
+# On a black cloth (brightness ~12 at the rails) the pocket's black core
+# (0-5) is still darker; this limit separates them.
+GREY_POCKET_DARKNESS = 8
 
 
 # Miniclip's default cloth is blue (OpenCV hue ~98), but tables come in green,
@@ -1131,6 +1134,19 @@ def cloth_hue(hsv: np.ndarray, step: int = 1) -> float:
     return float((peak + (weights @ (window - peak)) / max(1.0, weights.sum())) % 180)
 
 
+def cloth_is_grey(hsv: np.ndarray, step: int = 4) -> bool:
+    """True for a cloth with no colour (black or grey tables, e.g. Lucky
+    Shot): few saturated pixels in the middle of the image."""
+    h, w = hsv.shape[:2]
+    middle = hsv[h // 4:h * 3 // 4:step, w // 4:w * 3 // 4:step]
+    return middle.size > 0 and float(np.mean(middle[:, :, 1] >= 45)) < .25
+
+
+def grey_cloth_mask(hsv: np.ndarray) -> np.ndarray:
+    """Pixels that can be a grey cloth: unsaturated, not black, not bright."""
+    return (hsv[:, :, 1] < 50) & (hsv[:, :, 2] >= 8) & (hsv[:, :, 2] <= 140)
+
+
 def hue_near(hue: np.ndarray, centre: float, below: float, above: float) -> np.ndarray:
     """Boolean mask: ``hue`` within [centre - below, centre + above], circularly."""
     delta = (hue.astype(np.float32) - centre + 90) % 180 - 90
@@ -1150,10 +1166,14 @@ def table_from_pockets(frame: np.ndarray) -> tuple[int, int, int, int] | None:
     real ones). The pockets are symmetric and unambiguous.
     """
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    dark = (hsv[:, :, 2] < POCKET_DARKNESS).astype(np.uint8)
+    grey = cloth_is_grey(hsv)
+    dark = (hsv[:, :, 2] < (GREY_POCKET_DARKNESS if grey else POCKET_DARKNESS)).astype(np.uint8)
     hue = cloth_hue(hsv, step=4)
-    felt_like = (hue_near(hsv[:, :, 0], hue, 23, 27) & (hsv[:, :, 1] >= 45)
-                 & (hsv[:, :, 2] >= 65)).astype(np.uint8)
+    if grey:
+        felt_like = grey_cloth_mask(hsv).astype(np.uint8)
+    else:
+        felt_like = (hue_near(hsv[:, :, 0], hue, 23, 27) & (hsv[:, :, 1] >= 45)
+                     & (hsv[:, :, 2] >= 65)).astype(np.uint8)
     count, _, stats, centres = cv2.connectedComponentsWithStats(dark, connectivity=8)
     blobs = []
     for i in range(1, count):
@@ -1202,7 +1222,8 @@ def table_from_pockets(frame: np.ndarray) -> tuple[int, int, int, int] | None:
     y0, y1 = (a[1] + b[1]) / 2 + inset, (c[1] + d[1]) / 2 - inset
     inner = hsv[int(y0 + (y1 - y0) * .25):int(y1 - (y1 - y0) * .25),
                 int(x0 + (x1 - x0) * .25):int(x1 - (x1 - x0) * .25)]
-    felt = hue_near(inner[:, :, 0], hue, 23, 27) & (inner[:, :, 1] >= 45)
+    felt = (grey_cloth_mask(inner) if grey
+            else hue_near(inner[:, :, 0], hue, 23, 27) & (inner[:, :, 1] >= 45))
     if inner.size == 0 or float(felt.mean()) < .5:
         return None
     return int(round(x0)), int(round(y0)), int(round(x1 - x0)), int(round(y1 - y0))
@@ -1228,6 +1249,14 @@ def refine_table_edges(frame: np.ndarray, table: tuple[int, int, int, int]) -> t
         i = int(np.argmax(drops))
         if drops[i] < 15:
             return None
+        # The nose is the innermost strong drop: a chrome rail outside a
+        # dark cushion bevel (black Lucky Shot table) drops first, and more.
+        strong = np.nonzero(drops >= max(15.0, drops[i] * .5))[0]
+        last = int(strong[-1])
+        # Step to that drop's own peak (the edge can span two samples).
+        while last + 1 < len(drops) and drops[last + 1] > drops[last]:
+            last += 1
+        i = last
         offset = 0.0
         if 0 < i < len(drops) - 1:
             a, b, c = drops[i - 1], drops[i], drops[i + 1]
@@ -1284,8 +1313,11 @@ def find_table_bounds(frame: np.ndarray) -> tuple[int, int, int, int] | None:
     # the full desktop. The felt is less saturated than the cushions. A broad
     # threshold merges both and makes the fitted guide too tall.
     hue = cloth_hue(hsv, step=4)
-    band = (hue_near(hsv[:, :, 0], hue, 23, 27) & (hsv[:, :, 1] >= 45) & (hsv[:, :, 1] <= 190)
-            & (hsv[:, :, 2] >= 65))
+    if cloth_is_grey(hsv):
+        band = grey_cloth_mask(hsv)
+    else:
+        band = (hue_near(hsv[:, :, 0], hue, 23, 27) & (hsv[:, :, 1] >= 45) & (hsv[:, :, 1] <= 190)
+                & (hsv[:, :, 2] >= 65))
     # On a red or brown table the wooden rail falls in the same hue band;
     # keep only pixels close to the cloth's own colour.
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB).astype(np.float32)
@@ -1337,9 +1369,12 @@ def _felt_lab(roi: np.ndarray, roi_hsv: np.ndarray | None = None) -> np.ndarray:
     if roi_hsv is None:
         roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
-    centre = cloth_hue(roi_hsv, step=2)
-    cloth = (hue_near(roi_hsv[:, :, 0], centre, 18, 17) & (roi_hsv[:, :, 1] >= 50)
-             & (roi_hsv[:, :, 1] <= 235)).astype(np.uint8)
+    if cloth_is_grey(roi_hsv, step=2):
+        cloth = (grey_cloth_mask(roi_hsv) & (roi_hsv[:, :, 2] <= 110)).astype(np.uint8)
+    else:
+        centre = cloth_hue(roi_hsv, step=2)
+        cloth = (hue_near(roi_hsv[:, :, 0], centre, 18, 17) & (roi_hsv[:, :, 1] >= 50)
+                 & (roi_hsv[:, :, 1] <= 235)).astype(np.uint8)
     if cv2.countNonZero(cloth) <= 100:
         cloth = None
     # Exact median of 8-bit values from each channel's histogram (much faster
@@ -1476,6 +1511,11 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int):
     th, tw = roi.shape[:2]
     roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     felt_hue, felt_sat = felt_reference(roi_hsv)
+    # A grey or black cloth has no hue to compare; judge it by Lab colour.
+    grey = cloth_is_grey(roi_hsv, step=2)
+    roi_lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32) if grey else None
+    felt_lab = _felt_lab(roi, roi_hsv) if grey else None
+    lab_weights = np.array([.5, 1.0, 1.0], np.float32)
     distance = felt_distance_image(roi, roi_hsv, as_float=True)
     # Colour-distance edges of a blue ball on blue cloth are weaker than grey
     # edges of other balls, hence the lower Canny threshold for that image.
@@ -1498,6 +1538,25 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int):
             # The colour-distance proposal comes first and wins duplicates.
             if all((cx - px) ** 2 + (cy - py) ** 2 > (min_r * .6) ** 2 for px, py, _ in proposals):
                 proposals.append((cx, cy, r))
+    # A ball the same colour as the cloth (the black 8 on a black table) has
+    # no edge for circle finding, but its white number badge (a disc ~0.45
+    # radii) stands out. Propose a ball on each such disc; the checks below
+    # (and has_number_badge) decide whether it is one.
+    typical = float(np.median([p[2] for p in proposals])) if proposals else (min_r + max_r) / 2
+    from_badge: set[tuple[int, int]] = set()
+    white = ((roi_hsv[:, :, 1] < 90) & (roi_hsv[:, :, 2] > 150)).astype(np.uint8)
+    count, _, stats, centres = cv2.connectedComponentsWithStats(white, connectivity=8)
+    badge_area = np.pi * (typical * .45) ** 2
+    for i in range(1, count):
+        bx, by, bw, bh, area = stats[i]
+        if not (.45 * badge_area <= area <= 1.6 * badge_area):
+            continue
+        if not (.7 <= bw / max(1, bh) <= 1.43) or area < .55 * bw * bh:
+            continue
+        cx, cy = int(round(centres[i][0])), int(round(centres[i][1]))
+        if all((cx - px) ** 2 + (cy - py) ** 2 > (min_r * .6) ** 2 for px, py, _ in proposals):
+            proposals.append((cx, cy, int(round(typical))))
+            from_badge.add((cx, cy))
     # Pocket centres lie just outside the cushion noses (corners ~1 inset,
     # middles ~2 insets beyond the rail line).
     inset = POCKET_TO_CUSHION * tw
@@ -1534,8 +1593,23 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int):
                                 if len(ring_cloth) >= 12 else (felt_hue, felt_sat))
         cloth_inside = ((np.abs(hue_delta(inner[:, 0], local_hue)) <= 7) & (np.abs(inner[:, 1] - local_sat) <= 35)
                         & (inner[:, 2] >= 50))
+        if grey:
+            lab_patch = roi_lab[y0:y1, x0:x1]
+            ring_lab = lab_patch[(dist2 >= (r * 1.35) ** 2) & (dist2 <= (r * 1.8) ** 2)]
+            near_cloth = ring_lab[np.sqrt(((ring_lab - felt_lab) * lab_weights) ** 2).sum(axis=1) < 25]                 if len(ring_lab) else ring_lab
+            local = np.median(near_cloth, axis=0) if len(near_cloth) >= 12 else felt_lab
+            inner_lab = lab_patch[dist2 <= (r * .62) ** 2]
+            cloth_inside = np.sqrt((((inner_lab - local) * lab_weights) ** 2).sum(axis=1)) < 10
         cloth_fraction = float(np.mean(cloth_inside))
         centre = patch[dist2 <= (r * .4) ** 2]
+        # A badge-only proposal stands for a ball that looks like cloth; a
+        # light-centred disc that is not cloth-coloured (a metal joint on the
+        # cue stick) would have been found by circle finding if it were a ball.
+        if (cx, cy) in from_badge:
+            # Judge the ball's own colour around the badge (white excluded).
+            body = ~((inner[:, 1] < 90) & (inner[:, 2] > 150))
+            if not body.any() or float(np.mean(cloth_inside[body])) <= .25:
+                continue
         if cloth_fraction > .35:
             # A solid ball the same colour as the cloth (purple 4 on a purple
             # table, red 3 on red) looks like cloth inside, but its white
