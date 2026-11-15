@@ -1177,7 +1177,9 @@ def fit_target_on_ghost(roi: np.ndarray, ghost: tuple[float, float], target: tup
     if patch.size == 0:
         return None
     hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
-    distance = cv2.GaussianBlur(felt_distance_image(patch, hsv, as_float=True, reference=_felt_lab(roi)),
+    # The cloth colour from every other pixel of the table: the same median
+    # to within a level, a quarter of the work (this runs on every frame).
+    distance = cv2.GaussianBlur(felt_distance_image(patch, hsv, as_float=True, reference=_felt_lab(roi[::2, ::2])),
                                 (0, 0), 1.0)
     gx, gy = ghost[0] - ox, ghost[1] - oy
     target = (target[0] - ox, target[1] - oy)
