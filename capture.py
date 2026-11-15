@@ -144,6 +144,24 @@ def paint_guide(p: QPainter, d: Detection, width: int, height: int, adjusting: b
     for bx, by, br in d.blockers or []:
         p.setPen(pen(QColor(255, 140, 40, a), 2, Qt.PenStyle.DotLine))
         p.drawEllipse(QPointF(bx, by), br + 5, br + 5)
+    # One level through a ball in the way: where that ball goes (orange, like
+    # its dotted ring) and where the moving ball deflects to (dash-dot in the
+    # colour of the path it was on). Entry 0 follows the object path, entry 1
+    # the cue path.
+    limit = None if style.show_bounce else 1
+    # Fainter than the main lines: they start on a ball that already has its
+    # ring, blocker ring and a path end, and overlapping strokes add up; the
+    # whole layer must stay under the opacity remove_overlay can undo.
+    knock_alpha = round(a * .5)
+    for segments in getattr(d, "knock_paths", None) or []:
+        for start, end in (segments or [])[:limit]:
+            p.setPen(pen(QColor(255, 140, 40, knock_alpha), 2.5 * thick, Qt.PenStyle.DashLine))
+            p.drawLine(QPoint(*start), QPoint(*end))
+    for index, segments in enumerate(getattr(d, "deflect_paths", None) or []):
+        colour = style.colour("object" if index == 0 else "cue", knock_alpha)
+        for start, end in (segments or [])[:limit]:
+            p.setPen(pen(colour, 2 * thick, Qt.PenStyle.DashDotLine))
+            p.drawLine(QPoint(*start), QPoint(*end))
     if d.target:
         tx, ty, tr = d.target
         p.setPen(pen(style.colour("object", a), 3 * thick))

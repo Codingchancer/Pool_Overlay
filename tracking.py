@@ -15,7 +15,7 @@ import time
 
 import numpy as np
 
-from detector import Detection, detect, predict_shot
+from detector import Detection, detect, predict_shot, read_power_slider
 
 
 class ShotTracker:
@@ -93,4 +93,8 @@ class ShotTracker:
                          cue_segments=shot["cue"], object_segments=shot["object"],
                          target=shot["target"], ghost=shot["ghost"], blockers=shot["blockers"],
                          aim_dir=shot["aim_dir"], object_dir=shot["object_dir"], cue_dir=shot["cue_dir"],
+                         pot=shot["pot"], pot_pocket=shot["pot_pocket"], stick_pull=shot["stick_pull"],
+                         knock_paths=shot["knock"], deflect_paths=shot["deflect"],
+                         power_slider=base.power_slider,
+                         power_percent=read_power_slider(frame, base.power_slider),
                          note=f"{shot['note']} · {len(base.balls)} ball candidates")
