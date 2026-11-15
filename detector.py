@@ -41,12 +41,12 @@ class Detection:
     # a power percentage needs measurements from the real game.
     stick_pull: float | None = None
     # Miniclip's power slider left of the table, when the capture includes
-    # it: its outer rectangle (x, y, w, h) in frame pixels, and how far its
-    # cue has been dragged down, 0 (at rest) to 1 (cue top at the slot's
-    # bottom). Whether 1 is full power still has to be checked on a real
-    # full-power frame.
+    # it: its outer rectangle (x, y, w, h) in frame pixels, and the power set
+    # on it in percent: 0 with the cue at rest, 100 with the cue's top at the
+    # slot's bottom. That 100 is Miniclip's full power, and that power grows
+    # evenly along the slot, still has to be checked on real frames.
     power_slider: tuple[int, int, int, int] | None = None
-    power_level: float | None = None
+    power_percent: float | None = None
     note: str = "Guide is off"
 
 
@@ -1654,13 +1654,13 @@ def _slider_shaft_top(frame: np.ndarray, slider: tuple[int, int, int, int]) -> f
 
 
 def read_power_slider(frame: np.ndarray, slider: tuple[int, int, int, int] | None) -> float | None:
-    """How far the slider's cue is dragged down: 0 at rest, 1 at the bottom."""
+    """Power set on the slider in percent: 0 at rest, 100 at the bottom."""
     if slider is None:
         return None
     shaft = _slider_shaft_top(frame, slider)
     if shaft is None:
-        return 1.0 if _slider_empty(frame, slider) else None
-    return float(np.clip((shaft - SLIDER_REST) / (SLIDER_END - SLIDER_REST), 0.0, 1.0))
+        return 100.0 if _slider_empty(frame, slider) else None
+    return float(np.clip((shaft - SLIDER_REST) / (SLIDER_END - SLIDER_REST), 0.0, 1.0)) * 100
 
 
 def detect(frame: np.ndarray) -> Detection:
@@ -1789,11 +1789,11 @@ def detect(frame: np.ndarray) -> Detection:
                 balls = cleaned
                 shot = predict_shot(roi, table, balls, cue[:3])
         return Detection(table=table, balls=balls, cue=cue[:3], aim_segments=shot["aim"],
-                         power_slider=slider, power_level=read_power_slider(frame, slider),
+                         power_slider=slider, power_percent=read_power_slider(frame, slider),
                          cue_segments=shot["cue"], object_segments=shot["object"],
                          target=shot["target"], ghost=shot["ghost"], blockers=shot["blockers"],
                          aim_dir=shot["aim_dir"], object_dir=shot["object_dir"], cue_dir=shot["cue_dir"],
                          pot=shot["pot"], pot_pocket=shot["pot_pocket"], stick_pull=shot["stick_pull"],
                          note=f"{shot['note']} · {len(balls)} ball candidates")
-    return Detection(table=table, balls=balls, power_slider=slider, power_level=read_power_slider(frame, slider),
+    return Detection(table=table, balls=balls, power_slider=slider, power_percent=read_power_slider(frame, slider),
                      note="Table found · cue ball not confidently identified")

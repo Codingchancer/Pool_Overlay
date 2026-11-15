@@ -311,9 +311,9 @@ class PowerSliderTests(unittest.TestCase):
             base = fg.random_scene(seed)
             for power in (0.0, .3, .6, .9):
                 frame, _ = fg.render(replace(base, power=power))
-                level = main.detect(frame).power_level
+                percent = main.detect(frame).power_percent
                 total += 1
-                good += level is not None and abs(level - power) <= .02
+                good += percent is not None and abs(percent - power * 100) <= 2
         # A shot whose cue stick runs across the slider can spoil a reading.
         self.assertGreaterEqual(good, total - 4)
 
@@ -322,7 +322,7 @@ class PowerSliderTests(unittest.TestCase):
             frame, _ = fg.render(fg.random_scene(seed))
             d = main.detect(frame)
             self.assertIsNone(d.power_slider)
-            self.assertIsNone(d.power_level)
+            self.assertIsNone(d.power_percent)
 
     @unittest.skipUnless((Path(__file__).resolve().parents[1] / "outputs/bad/stick-and-cushion/snip.png").exists(),
                          "real screenshot not present")
@@ -332,7 +332,7 @@ class PowerSliderTests(unittest.TestCase):
         frame = cv2.imread(str(Path(__file__).resolve().parents[1] / "outputs/bad/stick-and-cushion/snip.png"))
         d = main.detect(frame)
         self.assertIsNotNone(d.power_slider)
-        self.assertLess(d.power_level, .03)
+        self.assertLess(d.power_percent, 3)
 
 
 class GameLineReaderTests(unittest.TestCase):
