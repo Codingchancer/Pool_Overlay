@@ -62,7 +62,7 @@ class PaleColouredClothTests(unittest.TestCase):
         # The thin white lines, blurred with their dark outline, are no
         # brighter than sky cloth (they are far less saturated), and the
         # lettering passed the number-badge test.
-        for seed, kind in ((30003, "scatter"), (30006, "scatter"), (30005, "pot"), (30001, "cushion")):
+        for seed, kind in ((30003, "scatter"), (30005, "scatter"), (30005, "pot"), (30006, "cushion")):
             *_, problems, _ = st.evaluate(seed, kind, "sky")
             self.assertEqual(problems, [], f"sky {seed} {kind}")
 

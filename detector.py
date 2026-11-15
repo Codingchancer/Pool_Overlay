@@ -1563,11 +1563,14 @@ def table_from_pockets(frame: np.ndarray) -> tuple[int, int, int, int] | None:
         member = labels[y:y + bh, x:x + bw] == i
         darkest = float(values[member].min())
         core = member & (values <= darkest + .5 * (limit - darkest))
+        cx_, cy_ = float(centres[i][0]), float(centres[i][1])
         if int(core.sum()) >= .25 * area:
             ys, xs = np.nonzero(core)
-            cx_, cy_ = x + float(xs.mean()), y + float(ys.mean())
-        else:
-            cx_, cy_ = float(centres[i][0]), float(centres[i][1])
+            kx, ky = x + float(xs.mean()), y + float(ys.mean())
+            # Only a real slide moves it (a sub-pixel change would shift the
+            # whole table fit for nothing).
+            if np.hypot(kx - cx_, ky - cy_) > 1.5:
+                cx_, cy_ = kx, ky
         blobs.append((cx_, cy_, float(bw), float(area)))
     blobs = sorted(blobs, key=lambda b: -b[3])[:40]
     best = None
@@ -1933,33 +1936,45 @@ RING_ON_CUE_SCORE = .12
 def refit_beside_ring(distance: np.ndarray, cx: float, cy: float, r: float,
                       gx: float, gy: float, ring_r: float) -> tuple[float, float]:
     """Ball centre near (cx, cy) fitted on the cloth-distance image, leaving
-    out rim samples that fall on the ghost ring drawn at (gx, gy)."""
+    out rim samples that fall on the ghost ring drawn at (gx, gy). The fit
+    is kept only when it is clearly better than (cx, cy) itself."""
     cos, sin = np.cos(_RIM_ANGLES), np.sin(_RIM_ANGLES)
     band = max(3.0, ring_r * .3)
-    best, best_score = (cx, cy), -np.inf
+
+    def score(px: float, py: float) -> float | None:
+        ix, iy = px + (r - 1.5) * cos, py + (r - 1.5) * sin
+        ox, oy = px + (r + 1.5) * cos, py + (r + 1.5) * sin
+        clear = ((np.abs(np.hypot(ix - gx, iy - gy) - ring_r) > band)
+                 & (np.abs(np.hypot(ox - gx, oy - gy) - ring_r) > band))
+        if clear.mean() < .4:
+            return None
+        inside = cv2.remap(distance, ix[None].astype(np.float32), iy[None].astype(np.float32),
+                           cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
+        outside = cv2.remap(distance, ox[None].astype(np.float32), oy[None].astype(np.float32),
+                            cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
+        return float((inside - outside)[clear].mean())
+
+    best, best_score = (cx, cy), None
     for step, span in ((1.0, r * 1.2), (.25, 1.5)):
         offsets = np.arange(-span, span + 1e-6, step)
-        gxs, gys = np.meshgrid(best[0] + offsets, best[1] + offsets)
-        centres = np.column_stack([gxs.ravel(), gys.ravel()])
-        best_score = -np.inf
-        for px, py in centres:
-            ix, iy = px + (r - 1.5) * cos, py + (r - 1.5) * sin
-            ox, oy = px + (r + 1.5) * cos, py + (r + 1.5) * sin
-            clear = ((np.abs(np.hypot(ix - gx, iy - gy) - ring_r) > band)
-                     & (np.abs(np.hypot(ox - gx, oy - gy) - ring_r) > band))
-            if clear.mean() < .4:
-                continue
-            inside = cv2.remap(distance, ix[None].astype(np.float32), iy[None].astype(np.float32),
-                               cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
-            outside = cv2.remap(distance, ox[None].astype(np.float32), oy[None].astype(np.float32),
-                                cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
-            score = float((inside - outside)[clear].mean())
-            if score > best_score:
-                best_score, chosen = score, (float(px), float(py))
-        if best_score == -np.inf:
+        found = None
+        for px in best[0] + offsets:
+            for py in best[1] + offsets:
+                value = score(float(px), float(py))
+                if value is not None and (found is None or value > found[0]):
+                    found = (value, (float(px), float(py)))
+        if found is None:
             return cx, cy
-        best = chosen
+        best_score, best = found
+    start = score(cx, cy)
+    # Measured: real fixes score >= ~1.9x the start (or the start sits on
+    # the ring), wrong moves 1.1-1.4x.
+    if start is not None and best_score < start * RING_REFIT_GAIN:
+        return cx, cy
     return best
+
+
+RING_REFIT_GAIN = 1.6
 
 
 # All pool balls are the same size. A fitted radius further than this share
@@ -2191,7 +2206,9 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
     for item in accepted:
         _, cx, cy, r = item[:4]
         clash = [k for k in kept if (cx - k[1]) ** 2 + (cy - k[2]) ** 2 < (diameter * .6) ** 2]
-        if all(item[6] >= .5 and k[6] >= .5 for k in clash):
+        # (A badge-only proposal is centred on its white badge, so it looks
+        # mostly white too; it is a duplicate of the ball found there.)
+        if all(item[6] >= .5 and k[6] >= .5 and (item[1], item[2]) not in from_badge for k in clash):
             kept.append(item)
     # Same size for every ball: a shadow must not make one circle bigger or
     # pull its centre towards the shadow.
@@ -2207,6 +2224,10 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
         if (cx, cy) in refit:
             fx, fy = refit_centre(smooth, float(cx), float(cy), typical, reach=typical * .6)
             if np.hypot(fx - cx, fy - cy) <= typical * .6:
+                # Landing on another detection: it was that ball's badge.
+                if any((fx - k[1]) ** 2 + (fy - k[2]) ** 2 < (diameter * .6) ** 2
+                       for k in kept if (k[1], k[2]) != (cx, cy)):
+                    continue
                 cx, cy = int(round(fx)), int(round(fy))
         white_ball = rest[2] >= .5  # (sat, val, white_fraction, red_spot)
         if white_ball and r > typical * (1 + BALL_SIZE_SPREAD) and rim_open_fraction(smooth, cx, cy, typical) >= .65:
