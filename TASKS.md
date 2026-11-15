@@ -20,13 +20,12 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| Ghost ring on top of the cue ball (struck ball right next to it): find the aim from the game's object line | detector | Jartartarta | `jartartarta/near-cue-ghost` |
+| Ball outline where a path meets a cushion (`capture.py`, one-off in Codingchancer's file at Jartartarta's request) | overlay | Jartartarta | `jartartarta/cushion-outline` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Power needed for a shot:** record ~20-30 real shots (slider % at release + where the balls stop) to fit Miniclip's friction and the %-to-speed scale per cue; then compute the minimum power to pot and add it to `Detection` for Codingchancer to mark on the slider. Also confirm the slider reading on a mid-drag and a full-power frame.
 - [ ] **Real-game precision:** play with the guide on; wherever the guide's aim line, target ball or object/cue path does not sit exactly on the game's own white lines, save the frame (set `POOL_OVERLAY_DEBUG_DIR`, keep `capture.png`/`cleaned.png`) and have your Claude fix the detector. Keep real screenshots out of git (`outputs/` is ignored; the repo is public).
 - [ ] **Real-game tests:** turn the saved bad frames into tests that skip when the image is missing (like the existing screenshot tests), so fixes stay fixed.
-- [ ] Ghost ring hidden when the struck ball nearly touches the cue ball: find another cue for that case.
 - [ ] Balls boxed in inside a rack can be off by ~0.5 radius.
 - [ ] Raise the synthetic pass rate (`stress_test.py --count 300`) from 283/300 towards 297+/300 without making real-game results worse.
 
@@ -34,6 +33,7 @@ Border rules:
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
 
 ## Done
+- [x] Ghost ring on top of the cue ball + stick rings (Jartartarta, #19): aim found from the game's object line when the ring is hidden (synthetic near shots: struck ball's path right on 28/40, was 0); rings centred on the stick's axis are no longer balls (stress 286/300).
 - [x] Draw the paths through other balls (Jartartarta, #18, one-off in Codingchancer's `capture.py` / `tracking.py`): orange dashes for the ball in the way, dash-dot for the deflection; tracking mode now passes pot, stick pull, power slider and these paths too (the `tracking.py` part of #11).
 - [x] Prediction: paths through other balls (Jartartarta, #17): `Detection.knock_paths` / `deflect_paths` (where a ball in the way goes, where the moving ball deflects to; synthetic median 1.4 deg). Drawn since #18.
 - [x] Table fit with a covered corner pocket (Jartartarta, #16/#17): three corners + the middle pocket fix the table, so Fit table no longer shrinks the overlay. Also: the neon table is found (dark rail bands cut off the pockets), no cushion rebound from a pocket mouth.
