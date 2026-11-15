@@ -20,8 +20,6 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| Prediction: paths through other balls | detector | Jartartarta | `jartartarta/paths-through-balls` |
-| Table fit with a covered corner pocket (overlay resized to a too-small table when the cue ball sat on a pocket) | detector | Jartartarta | `jartartarta/covered-pocket` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Power needed for a shot:** record ~20-30 real shots (slider % at release + where the balls stop) to fit Miniclip's friction and the %-to-speed scale per cue; then compute the minimum power to pot and add it to `Detection` for Codingchancer to mark on the slider. Also confirm the slider reading on a mid-drag and a full-power frame.
@@ -30,12 +28,13 @@ Border rules:
 - [ ] Ghost ring hidden when the struck ball nearly touches the cue ball: find another cue for that case.
 - [ ] Balls boxed in inside a rack can be off by ~0.5 radius.
 - [ ] Raise the synthetic pass rate (`stress_test.py --count 300`) from 283/300 towards 297+/300 without making real-game results worse.
-- [ ] **Prediction: paths through other balls.** Today a path stops at the first ball in the way (orange dotted ring). Predict what happens next: the blocking ball's direction after the hit and where the original ball deflects to (same ghost-ball/90° rule as the main shot), at least one level deep. Keep `blockers` as it is; add new fields for the extra paths and tell Codingchancer so the overlay can draw them.
 
 ## Next — Codingchancer (overlay + simulator)
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
 
 ## Done
+- [x] Prediction: paths through other balls (Jartartarta, #17): `Detection.knock_paths` / `deflect_paths` (where a ball in the way goes, where the moving ball deflects to; synthetic median 1.4 deg). Not drawn yet: needs `capture.py` + `tracking.py`.
+- [x] Table fit with a covered corner pocket (Jartartarta, #16/#17): three corners + the middle pocket fix the table, so Fit table no longer shrinks the overlay. Also: the neon table is found (dark rail bands cut off the pockets), no cushion rebound from a pocket mouth.
 - [x] Freeze fix (Jartartarta, #15, one-off in `overlay.py` while Codingchancer was away): one screen capture per worker thread instead of a new one per frame; GDI objects stay at ~26 instead of hitting Windows' 10,000 limit after ~2 min. `tests/test_capture_reuse.py` guards it. Closes #13.
 - [x] Freeze + polish (Jartartarta, #14): every ball drawn at one size (shadows made circles up to 22% too big), cue ball centre no longer pulled by its shadow; stress test 285/300. Freeze found: `overlay.py` leaks a screen capture per frame until Windows' GDI limit (~2 min on the synthetic table); tested patch in issue #13 for Codingchancer.
 - [x] Grey / black cloth (Jartartarta, #12): the Lucky Shot table's colourless near-black cloth is found (real frame: table within 2 px, cue / gold ball / aim / ghost found). Synthetic black 56/100 (8 ball is the weak spot), purple 84 (was 66).
