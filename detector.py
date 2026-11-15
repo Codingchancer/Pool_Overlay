@@ -1476,6 +1476,26 @@ def refine_circle(distance: np.ndarray, cx: float, cy: float, r: float,
     return cx, cy, r
 
 
+def refit_centre(distance: np.ndarray, cx: float, cy: float, r: float,
+                 reach: float = 3.0) -> tuple[float, float]:
+    """Best centre for a circle of a fixed radius ``r`` near (cx, cy)."""
+    best = (cx, cy)
+    for step, span in ((1.0, reach), (.25, 1.5)):
+        offsets = np.arange(-span, span + 1e-6, step)
+        gx, gy = np.meshgrid(best[0] + offsets, best[1] + offsets)
+        centres = np.column_stack([gx.ravel(), gy.ravel()])
+        scores = _rim_scores(distance, centres, r)
+        i = int(np.argmax(scores))
+        best = (float(centres[i, 0]), float(centres[i, 1]))
+    return best
+
+
+# All pool balls are the same size. A fitted radius further than this share
+# from the typical one has grown onto the ball's drop shadow (or shrunk
+# against a neighbour); its centre is fitted again at the typical radius.
+BALL_SIZE_SPREAD = .06
+
+
 def has_number_badge(patch_hsv: np.ndarray, xx, yy, cx: float, cy: float, r: float) -> bool:
     """True when a compact white disc (a ball's number badge, ~0.45 r) sits
     near the centre: white fills the middle around its own centroid, with
@@ -1639,7 +1659,31 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int):
         clash = [k for k in kept if (cx - k[1]) ** 2 + (cy - k[2]) ** 2 < (diameter * .6) ** 2]
         if all(item[6] >= .5 and k[6] >= .5 for k in clash):
             kept.append(item)
-    return [(cx, cy, r, *rest, rim_open_fraction(smooth, cx, cy, r)) for _, cx, cy, r, *rest in kept]
+    # Same size for every ball: a shadow must not make one circle bigger or
+    # pull its centre towards the shadow.
+    typical = float(np.median([item[3] for item in kept]))
+    result = []
+    for _, cx, cy, r, *rest in kept:
+        # Smaller circles keep their size: the cue-stick filter tells stick
+        # rings from balls by it. Every ball is drawn at one size in the end
+        # (``uniform_ball_size``).
+        # Only a white ball (the cue ball, whose centre sets the aim) has an
+        # edge strong enough to beat its shadow in this fit; on a ball close
+        # to the cloth colour the shadow would win and pull the centre.
+        white_ball = rest[2] >= .5  # (sat, val, white_fraction, red_spot)
+        if white_ball and r > typical * (1 + BALL_SIZE_SPREAD) and rim_open_fraction(smooth, cx, cy, typical) >= .65:
+            fx, fy = refit_centre(smooth, float(cx), float(cy), typical)
+            cx, cy = int(round(fx)), int(round(fy))
+        result.append((cx, cy, r, *rest, rim_open_fraction(smooth, cx, cy, r)))
+    return result
+
+
+def uniform_ball_size(balls):
+    """All pool balls are one size: report every ball at the median radius."""
+    if not balls:
+        return balls
+    typical = int(round(float(np.median([b[2] for b in balls]))))
+    return [(x, y, typical, kind) for x, y, _, kind in balls]
 
 
 # Power slider, measured on a real frame (table 1136x568 px): a grey-framed
@@ -1849,7 +1893,8 @@ def detect(frame: np.ndarray) -> Detection:
             bx, by, br, _ = balls[cue_index]
             balls[cue_index] = (bx, by, br, "cue")
     if len(balls) > 24:
-        return Detection(table=table, balls=[], note=f"Table found · {len(balls)} circle candidates · too many to track confidently")
+        return Detection(table=table, balls=[], power_slider=slider, power_percent=read_power_slider(frame, slider),
+                         note=f"Table found · {len(balls)} circle candidates · too many to track confidently")
     if cue:
         shot = predict_shot(roi, table, balls, cue[:3])
         if shot["ghost"]:
@@ -1862,6 +1907,8 @@ def detect(frame: np.ndarray) -> Detection:
             if len(cleaned) != len(balls):
                 balls = cleaned
                 shot = predict_shot(roi, table, balls, cue[:3])
+        balls = uniform_ball_size(balls)
+        cue = (*cue[:2], balls[0][2]) if balls else cue
         return Detection(table=table, balls=balls, cue=cue[:3], aim_segments=shot["aim"],
                          power_slider=slider, power_percent=read_power_slider(frame, slider),
                          cue_segments=shot["cue"], object_segments=shot["object"],
@@ -1869,5 +1916,6 @@ def detect(frame: np.ndarray) -> Detection:
                          aim_dir=shot["aim_dir"], object_dir=shot["object_dir"], cue_dir=shot["cue_dir"],
                          pot=shot["pot"], pot_pocket=shot["pot_pocket"], stick_pull=shot["stick_pull"],
                          note=f"{shot['note']} · {len(balls)} ball candidates")
-    return Detection(table=table, balls=balls, power_slider=slider, power_percent=read_power_slider(frame, slider),
+    return Detection(table=table, balls=uniform_ball_size(balls), power_slider=slider,
+                     power_percent=read_power_slider(frame, slider),
                      note="Table found · cue ball not confidently identified")
