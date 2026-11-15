@@ -552,6 +552,7 @@ def separate_cue_stick_detections(
     distance: np.ndarray | None = None,
     offset: tuple[int, int] = (0, 0),
     body: dict[tuple[int, int], tuple[float, float, float]] | None = None,
+    min_behind: float = 1.35,
 ) -> list[tuple[int, int, int, str]]:
     """Drop circle-like cue-stick ornaments lying behind the tracked cue ball.
 
@@ -577,7 +578,7 @@ def separate_cue_stick_detections(
         across = abs(dx * uy - dy * ux)
         shaft_half_width = max(9.0, min(cr * 1.05, br * 1.1))
         # The stick reaches ~30 ball radii behind the cue ball on real frames.
-        if cr * 1.35 < behind < typical_r * 40 and across <= shaft_half_width:
+        if cr * min_behind < behind < typical_r * 40 and across <= shaft_half_width:
             # A ring centred on the stick's own axis is one of its
             # decorations (bands, joints, the glowing collar on real cues)
             # unless something non-cloth shows on both sides of the stick at
@@ -1977,6 +1978,56 @@ def refit_beside_ring(distance: np.ndarray, cx: float, cy: float, r: float,
 RING_REFIT_GAIN = 1.6
 
 
+def stick_matches_cue(stick_matches, cue) -> bool:
+    """True when the best stick match ends at the chosen cue ball."""
+    best = min(stick_matches, key=lambda item: item[:6])[6]
+    return best is cue
+
+
+def stick_direction(stick_lines, cue_xy: tuple[float, float], radius: float,
+                    roi_hsv: np.ndarray | None = None) -> tuple[float, float] | None:
+    """Shot direction implied by the longest line ending at the cue ball.
+
+    The stick and the game's aim ray lie on one axis, on opposite sides of
+    the ball; the ray is the very bright side (near-white, light cyan on a
+    blue table). The direction points from the stick towards the ray."""
+    if stick_lines is None:
+        return None
+    cx, cy = cue_xy
+    best = None
+    for x1, y1, x2, y2 in stick_lines[:, 0, :].astype(float):
+        length = float(np.hypot(x2 - x1, y2 - y1))
+        if length < radius * 4:
+            continue
+        gap = abs((cx - x1) * (y2 - y1) - (cy - y1) * (x2 - x1)) / length
+        near, far = ((x1, y1), (x2, y2)) if np.hypot(cx - x1, cy - y1) < np.hypot(cx - x2, cy - y2)             else ((x2, y2), (x1, y1))
+        if gap > radius * 1.4 or np.hypot(cx - near[0], cy - near[1]) > radius * 2.2:
+            continue
+        if best is None or length > best[0]:
+            dx, dy = cx - far[0], cy - far[1]
+            n = float(np.hypot(dx, dy))
+            best = (length, (dx / n, dy / n))
+    if best is None:
+        return None
+    ux, uy = best[1]
+    if roi_hsv is not None:
+        def bright_share(sign: float) -> float:
+            t = np.arange(3, 12.01, .5) * radius
+            hits = []
+            for k in np.linspace(-.3, .3, 5) * radius:
+                px = np.clip((cx + sign * ux * t - uy * k).astype(int), 0, roi_hsv.shape[1] - 1)
+                py = np.clip((cy + sign * uy * t + ux * k).astype(int), 0, roi_hsv.shape[0] - 1)
+                samples = roi_hsv[py, px]
+                hits.append((samples[:, 1] <= 120) & (samples[:, 2] >= 225))
+            return float(np.any(hits, axis=0).mean())
+        ahead, behind = bright_share(1.0), bright_share(-1.0)
+        if behind > ahead + .2:
+            ux, uy = -ux, -uy
+        elif ahead <= behind + .2:
+            return None        # no clear ray side: do not guess
+    return ux, uy
+
+
 # All pool balls are the same size. A fitted radius further than this share
 # from the typical one has grown onto the ball's drop shadow (or shrunk
 # against a neighbour); its centre is fitted again at the typical radius.
@@ -2443,13 +2494,24 @@ def detect(frame: np.ndarray) -> Detection:
             balls = separate_cue_overlap_detections(balls, cue_position)
             local_balls = [(bx-x, by-y, br, kind) for bx, by, br, kind in balls]
             aim = aim_direction(roi, (cue_position[0]-x, cue_position[1]-y, cue_position[2]), local_balls)
-            if aim:
+            stick_aim = aim
+            if not stick_aim and stick_matches and stick_matches_cue(stick_matches, cue):
+                # No aim ray read, but the stick still lies behind the cue
+                # ball: filter its rings along the stick itself.
+                stick_aim = stick_direction(stick_lines, (cue_position[0] - x, cue_position[1] - y),
+                                            cue_position[2], cv2.cvtColor(roi, cv2.COLOR_BGR2HSV))
+            if stick_aim:
+                aim_for_stick = stick_aim
+                # Read from the stick alone the side can be wrong; a struck
+                # ball right in front must not be dropped then.
+                min_behind = 1.35 if aim else 3.5
                 distance = shared.get("distance")
                 if distance is None:
                     distance = felt_distance_image(roi, cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), as_float=True)
                 body = {(c[0], c[1]): (c[3], c[4], c[5]) for c in cue_candidates}
-                balls = separate_cue_stick_detections(balls, cue_position, aim, rim_open,
-                                                      distance=distance, offset=(x, y), body=body)
+                balls = separate_cue_stick_detections(balls, cue_position, aim_for_stick, rim_open,
+                                                      distance=distance, offset=(x, y), body=body,
+                                                      min_behind=min_behind)
             # Exactly one ball is the cue ball; other white/striped detections
             # remain valid object-ball targets under 8-ball rules.
             cue_index = min(range(len(balls)), key=lambda i: np.hypot(balls[i][0]-cue[0], balls[i][1]-cue[1]))
