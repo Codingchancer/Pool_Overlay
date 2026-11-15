@@ -139,7 +139,7 @@ def _ring_kernel_cached(radius: float) -> np.ndarray:
 
 
 def find_ghost_ball(white: np.ndarray, cue: tuple[int, int, int], direction: tuple[float, float] | None,
-                    radius: float) -> tuple[float, float, float, float] | None:
+                    radius: float, roi: np.ndarray | None = None) -> tuple[float, float, float, float] | None:
     """Locate Miniclip's hollow ghost-ball reticle along the rough aim ray.
 
     The reticle centre is where the game places the cue ball at impact, so it
@@ -218,8 +218,50 @@ def find_ghost_ball(white: np.ndarray, cue: tuple[int, int, int], direction: tup
             best = _ring_peak(score, best, wx0 + x0, wy0 + y0, float(ring_radius))
     if best is None or best[0] < threshold:
         return None
+    # The reticle is hollow: cloth inside (besides its own lines, or the cue
+    # ball when they overlap). White bits of packed balls can add up to a
+    # ring, but a ball's colour fills it.
+    if roi is not None and not ring_interior_is_cloth(roi, float(best[1]), float(best[2]), best[3]):
+        return None
     # (x, y, ring radius, ring score)
     return float(best[1]), float(best[2]), best[3], float(best[0])
+
+
+def ring_interior_is_cloth(roi: np.ndarray, gx: float, gy: float, r: float) -> bool:
+    """False when the inside of a ring at (gx, gy) is largely another colour
+    than the cloth around it (a ball's). Lighter or darker shades of the
+    cloth (the guide lines' dark outlines, shading) and colourless pixels
+    (white lines, a cue ball under the ring) do not count against it."""
+    h, w = roi.shape[:2]
+    reach = int(np.ceil(r * 1.7))
+    x0, x1 = max(0, int(gx) - reach), min(w, int(gx) + reach + 1)
+    y0, y1 = max(0, int(gy) - reach), min(h, int(gy) + reach + 1)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return True
+    lab = cv2.cvtColor(roi[y0:y1, x0:x1], cv2.COLOR_BGR2LAB).astype(np.float32)
+    a, b = lab[:, :, 1] - 128, lab[:, :, 2] - 128
+    chroma = np.hypot(a, b)
+    yy, xx = np.ogrid[y0:y1, x0:x1]
+    d = np.hypot(xx - gx, yy - gy)
+    around = (d >= r * 1.25) & (d <= r * 1.6)
+    inside = d <= r * .55
+    cloth_a, cloth_b = float(np.median(a[around])), float(np.median(b[around]))
+    coloured = inside & (chroma >= 15)
+    if int(coloured.sum()) < max(10, .15 * int(inside.sum())):
+        # Mostly colourless inside (white lines, outlines, a cue ball under
+        # the ring, or a colourless cloth): nothing to judge by.
+        return True
+    if np.hypot(cloth_a, cloth_b) < 8:
+        # Colourless cloth: plenty of colour inside is a ball's.
+        return False
+    cloth_hue = np.arctan2(cloth_b, cloth_a)
+    turn = np.abs((np.arctan2(b[coloured], a[coloured]) - cloth_hue + np.pi) % (2 * np.pi) - np.pi)
+    return float(np.mean(turn > np.radians(RING_INTERIOR_HUE))) < .5
+
+
+# Hue turn (degrees, Lab) beyond which a pixel inside a ghost ring is
+# another colour than the cloth.
+RING_INTERIOR_HUE = 35.0
 
 
 def _ring_peak(score: np.ndarray, best, ox: int, oy: int, ring_radius: float):
@@ -995,13 +1037,13 @@ def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
     # Of the candidate ray directions, the real one ends in the ghost ball.
     direction, ghost = None, None
     for candidate in aim_candidates(roi, cue_local, balls_local):
-        found = find_ghost_ball(ghost_mask, cue_local, candidate, ball_r)
+        found = find_ghost_ball(ghost_mask, cue_local, candidate, ball_r, roi)
         if direction is None:
             direction = candidate
         if found is not None and (ghost is None or found[3] > ghost[3]):
             direction, ghost = candidate, found
     if ghost is None:
-        ghost = find_ghost_ball(ghost_mask, cue_local, None, ball_r) if direction is None else None
+        ghost = find_ghost_ball(ghost_mask, cue_local, None, ball_r, roi) if direction is None else None
     near_ghost = None
 
     def ball_touches(gxl, gyl):
@@ -2353,7 +2395,7 @@ def detect(frame: np.ndarray) -> Detection:
                     continue
                 ghost = None
                 for direction in directions:
-                    ghost = find_ghost_ball(ghost_mask, local, direction, radius)
+                    ghost = find_ghost_ball(ghost_mask, local, direction, radius, roi)
                     if ghost is not None:
                         break
                 verified.append((ghost is not None, candidate is cue, candidate[5], candidate))
