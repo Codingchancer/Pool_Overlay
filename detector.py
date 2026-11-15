@@ -71,7 +71,13 @@ def white_guide_mask(roi: np.ndarray, balls: list[tuple[int, int, int, str]],
     # while even the brightly lit, washed-out felt centre stays >= ~95. The
     # older <= 115 limit let pale felt inside the hollow reticle through.
     mask = cv2.inRange(hsv, (0, 0, 165), (255, 70, 255))
-    if _light_cloth(hsv):
+    cloth_s = _cloth_saturation(hsv) if _light_cloth(hsv) else None
+    if cloth_s is not None and cloth_s >= 40:
+        # A pale but coloured cloth (beige, sky): a thin stroke blurred with
+        # its dark outline can be no brighter than the cloth, but it is far
+        # less saturated.
+        mask = cv2.inRange(hsv, (0, 0, 165), (255, int(min(70, cloth_s * .55)), 255))
+    elif cloth_s is not None:
         # A white or pale cloth passes that test itself: a guide stroke must
         # also be clearly brighter than the cloth around it, measured as the
         # cloth's lighter values over a wide window (strokes are thin, and
@@ -99,6 +105,10 @@ DARKER_SHADE_WEIGHT = .25
 # On a light cloth a guide stroke is at least this much brighter than the
 # cloth around it.
 LIGHT_CLOTH_STROKE = 10
+
+
+def _cloth_saturation(hsv: np.ndarray) -> float:
+    return float(np.median(hsv[::8, ::8, 1]))
 
 
 def _light_cloth(hsv: np.ndarray) -> bool:
@@ -129,7 +139,7 @@ def _ring_kernel_cached(radius: float) -> np.ndarray:
 
 
 def find_ghost_ball(white: np.ndarray, cue: tuple[int, int, int], direction: tuple[float, float] | None,
-                    radius: float) -> tuple[float, float, float, float] | None:
+                    radius: float, roi: np.ndarray | None = None) -> tuple[float, float, float, float] | None:
     """Locate Miniclip's hollow ghost-ball reticle along the rough aim ray.
 
     The reticle centre is where the game places the cue ball at impact, so it
@@ -208,8 +218,50 @@ def find_ghost_ball(white: np.ndarray, cue: tuple[int, int, int], direction: tup
             best = _ring_peak(score, best, wx0 + x0, wy0 + y0, float(ring_radius))
     if best is None or best[0] < threshold:
         return None
+    # The reticle is hollow: cloth inside (besides its own lines, or the cue
+    # ball when they overlap). White bits of packed balls can add up to a
+    # ring, but a ball's colour fills it.
+    if roi is not None and not ring_interior_is_cloth(roi, float(best[1]), float(best[2]), best[3]):
+        return None
     # (x, y, ring radius, ring score)
     return float(best[1]), float(best[2]), best[3], float(best[0])
+
+
+def ring_interior_is_cloth(roi: np.ndarray, gx: float, gy: float, r: float) -> bool:
+    """False when the inside of a ring at (gx, gy) is largely another colour
+    than the cloth around it (a ball's). Lighter or darker shades of the
+    cloth (the guide lines' dark outlines, shading) and colourless pixels
+    (white lines, a cue ball under the ring) do not count against it."""
+    h, w = roi.shape[:2]
+    reach = int(np.ceil(r * 1.7))
+    x0, x1 = max(0, int(gx) - reach), min(w, int(gx) + reach + 1)
+    y0, y1 = max(0, int(gy) - reach), min(h, int(gy) + reach + 1)
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return True
+    lab = cv2.cvtColor(roi[y0:y1, x0:x1], cv2.COLOR_BGR2LAB).astype(np.float32)
+    a, b = lab[:, :, 1] - 128, lab[:, :, 2] - 128
+    chroma = np.hypot(a, b)
+    yy, xx = np.ogrid[y0:y1, x0:x1]
+    d = np.hypot(xx - gx, yy - gy)
+    around = (d >= r * 1.25) & (d <= r * 1.6)
+    inside = d <= r * .55
+    cloth_a, cloth_b = float(np.median(a[around])), float(np.median(b[around]))
+    coloured = inside & (chroma >= 15)
+    if int(coloured.sum()) < max(10, .15 * int(inside.sum())):
+        # Mostly colourless inside (white lines, outlines, a cue ball under
+        # the ring, or a colourless cloth): nothing to judge by.
+        return True
+    if np.hypot(cloth_a, cloth_b) < 8:
+        # Colourless cloth: plenty of colour inside is a ball's.
+        return False
+    cloth_hue = np.arctan2(cloth_b, cloth_a)
+    turn = np.abs((np.arctan2(b[coloured], a[coloured]) - cloth_hue + np.pi) % (2 * np.pi) - np.pi)
+    return float(np.mean(turn > np.radians(RING_INTERIOR_HUE))) < .5
+
+
+# Hue turn (degrees, Lab) beyond which a pixel inside a ghost ring is
+# another colour than the cloth.
+RING_INTERIOR_HUE = 35.0
 
 
 def _ring_peak(score: np.ndarray, best, ox: int, oy: int, ring_radius: float):
@@ -499,6 +551,9 @@ def separate_cue_stick_detections(
     rim_open: dict[tuple[int, int], float] | None = None,
     distance: np.ndarray | None = None,
     offset: tuple[int, int] = (0, 0),
+    body: dict[tuple[int, int], tuple[float, float, float]] | None = None,
+    min_behind: float = 1.35,
+    axis_rule: bool = True,
 ) -> list[tuple[int, int, int, str]]:
     """Drop circle-like cue-stick ornaments lying behind the tracked cue ball.
 
@@ -524,17 +579,25 @@ def separate_cue_stick_detections(
         across = abs(dx * uy - dy * ux)
         shaft_half_width = max(9.0, min(cr * 1.05, br * 1.1))
         # The stick reaches ~30 ball radii behind the cue ball on real frames.
-        if cr * 1.35 < behind < typical_r * 40 and across <= shaft_half_width:
+        if cr * min_behind < behind < typical_r * 40 and across <= shaft_half_width:
             # A ring centred on the stick's own axis is one of its
             # decorations (bands, joints, the glowing collar on real cues)
             # unless something non-cloth shows on both sides of the stick at
             # most of a ball radius out: a ball under the stick does, a
             # decoration is narrower.
-            if across <= typical_r * STICK_AXIS_SHARE and not _wider_than_stick(
+            if axis_rule and across <= typical_r * STICK_AXIS_SHARE and not _wider_than_stick(
                     distance, bx - offset[0], by - offset[1], ux, uy, typical_r):
                 continue
+            # A grey metal body (barely saturated, mid brightness, not white)
+            # on the stick's axis is one of its joints: no ball looks like
+            # that (the 8 is dark, the cue ball and stripes mostly white).
+            sat, val, white = (body or {}).get((bx, by), (255.0, 0.0, 0.0))
+            if across <= typical_r * STICK_AXIS_SHARE and sat < 60 and 50 < val < 175 and white < .3:
+                continue
+            # (Without the aim's axis rule a ball half under the stick, its
+            # circle shrunk by the stick, must not be lost on size alone.)
             ball_like = (rim_open is not None and rim_open.get((bx, by), 0.0) >= STICK_BALL_RIM
-                         and br >= typical_r * STICK_BALL_SIZE)
+                         and (br >= typical_r * STICK_BALL_SIZE or not axis_rule))
             if ball_like and distance is not None:
                 width = stick_half_width(distance, bx - offset[0], by - offset[1], ux, uy, br)
                 ball_like = width is None or width < typical_r * STICK_WIDTH_SHARE
@@ -978,13 +1041,13 @@ def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
     # Of the candidate ray directions, the real one ends in the ghost ball.
     direction, ghost = None, None
     for candidate in aim_candidates(roi, cue_local, balls_local):
-        found = find_ghost_ball(ghost_mask, cue_local, candidate, ball_r)
+        found = find_ghost_ball(ghost_mask, cue_local, candidate, ball_r, roi)
         if direction is None:
             direction = candidate
         if found is not None and (ghost is None or found[3] > ghost[3]):
             direction, ghost = candidate, found
     if ghost is None:
-        ghost = find_ghost_ball(ghost_mask, cue_local, None, ball_r) if direction is None else None
+        ghost = find_ghost_ball(ghost_mask, cue_local, None, ball_r, roi) if direction is None else None
     near_ghost = None
 
     def ball_touches(gxl, gyl):
@@ -1483,7 +1546,7 @@ def table_from_pockets(frame: np.ndarray) -> tuple[int, int, int, int] | None:
     if not grey:
         felt_like |= hue_near(hsv[:, :, 0], hue, 23, 27) & (hsv[:, :, 1] >= 45) & (hsv[:, :, 2] >= 65)
     felt_like = felt_like.astype(np.uint8)
-    count, _, stats, centres = cv2.connectedComponentsWithStats(dark, connectivity=8)
+    count, labels, stats, centres = cv2.connectedComponentsWithStats(dark, connectivity=8)
     blobs = []
     for i in range(1, count):
         x, y, bw, bh, area = stats[i]
@@ -1497,7 +1560,22 @@ def table_from_pockets(frame: np.ndarray) -> tuple[int, int, int, int] | None:
         around = felt_like[max(0, y - pad):y + bh + pad, max(0, x - pad):x + bw + pad]
         if around.size == 0 or float(np.count_nonzero(around)) / around.size < .08:
             continue
-        blobs.append((float(centres[i][0]), float(centres[i][1]), float(bw), float(area)))
+        # Centre on the hole's darkest core: a darker display (lower
+        # brightness, higher gamma) pulls the pocket's shaded rim under the
+        # limit too, and the whole blob's centre slides towards it.
+        values = hsv[y:y + bh, x:x + bw, 2]
+        member = labels[y:y + bh, x:x + bw] == i
+        darkest = float(values[member].min())
+        core = member & (values <= darkest + .5 * (limit - darkest))
+        cx_, cy_ = float(centres[i][0]), float(centres[i][1])
+        if int(core.sum()) >= .25 * area:
+            ys, xs = np.nonzero(core)
+            kx, ky = x + float(xs.mean()), y + float(ys.mean())
+            # Only a real slide moves it (a sub-pixel change would shift the
+            # whole table fit for nothing).
+            if np.hypot(kx - cx_, ky - cy_) > 1.5:
+                cx_, cy_ = kx, ky
+        blobs.append((cx_, cy_, float(bw), float(area)))
     blobs = sorted(blobs, key=lambda b: -b[3])[:40]
     best = None
     for a in blobs:
@@ -1853,6 +1931,106 @@ def refit_centre(distance: np.ndarray, cx: float, cy: float, r: float,
     return best
 
 
+# White-mask ring score at the cue ball's centre above which the "cue ball"
+# is the ghost ring lying on it (measured: 0.17 locked, at most 0.03 on real
+# cue balls).
+RING_ON_CUE_SCORE = .12
+
+
+def refit_beside_ring(distance: np.ndarray, cx: float, cy: float, r: float,
+                      gx: float, gy: float, ring_r: float) -> tuple[float, float]:
+    """Ball centre near (cx, cy) fitted on the cloth-distance image, leaving
+    out rim samples that fall on the ghost ring drawn at (gx, gy). The fit
+    is kept only when it is clearly better than (cx, cy) itself."""
+    cos, sin = np.cos(_RIM_ANGLES), np.sin(_RIM_ANGLES)
+    band = max(3.0, ring_r * .3)
+
+    def score(px: float, py: float) -> float | None:
+        ix, iy = px + (r - 1.5) * cos, py + (r - 1.5) * sin
+        ox, oy = px + (r + 1.5) * cos, py + (r + 1.5) * sin
+        clear = ((np.abs(np.hypot(ix - gx, iy - gy) - ring_r) > band)
+                 & (np.abs(np.hypot(ox - gx, oy - gy) - ring_r) > band))
+        if clear.mean() < .4:
+            return None
+        inside = cv2.remap(distance, ix[None].astype(np.float32), iy[None].astype(np.float32),
+                           cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
+        outside = cv2.remap(distance, ox[None].astype(np.float32), oy[None].astype(np.float32),
+                            cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
+        return float((inside - outside)[clear].mean())
+
+    best, best_score = (cx, cy), None
+    for step, span in ((1.0, r * 1.2), (.25, 1.5)):
+        offsets = np.arange(-span, span + 1e-6, step)
+        found = None
+        for px in best[0] + offsets:
+            for py in best[1] + offsets:
+                value = score(float(px), float(py))
+                if value is not None and (found is None or value > found[0]):
+                    found = (value, (float(px), float(py)))
+        if found is None:
+            return cx, cy
+        best_score, best = found
+    start = score(cx, cy)
+    # Measured: real fixes score >= ~1.9x the start (or the start sits on
+    # the ring), wrong moves 1.1-1.4x.
+    if start is not None and best_score < start * RING_REFIT_GAIN:
+        return cx, cy
+    return best
+
+
+RING_REFIT_GAIN = 1.6
+
+
+def stick_matches_cue(stick_matches, cue) -> bool:
+    """True when the best stick match ends at the chosen cue ball."""
+    best = min(stick_matches, key=lambda item: item[:6])[6]
+    return best is cue
+
+
+def stick_direction(stick_lines, cue_xy: tuple[float, float], radius: float,
+                    roi_hsv: np.ndarray | None = None) -> tuple[float, float] | None:
+    """Shot direction implied by the longest line ending at the cue ball.
+
+    The stick and the game's aim ray lie on one axis, on opposite sides of
+    the ball; the ray is the very bright side (near-white, light cyan on a
+    blue table). The direction points from the stick towards the ray."""
+    if stick_lines is None:
+        return None
+    cx, cy = cue_xy
+    best = None
+    for x1, y1, x2, y2 in stick_lines[:, 0, :].astype(float):
+        length = float(np.hypot(x2 - x1, y2 - y1))
+        if length < radius * 4:
+            continue
+        gap = abs((cx - x1) * (y2 - y1) - (cy - y1) * (x2 - x1)) / length
+        near, far = ((x1, y1), (x2, y2)) if np.hypot(cx - x1, cy - y1) < np.hypot(cx - x2, cy - y2)             else ((x2, y2), (x1, y1))
+        if gap > radius * 1.4 or np.hypot(cx - near[0], cy - near[1]) > radius * 2.2:
+            continue
+        if best is None or length > best[0]:
+            dx, dy = cx - far[0], cy - far[1]
+            n = float(np.hypot(dx, dy))
+            best = (length, (dx / n, dy / n))
+    if best is None:
+        return None
+    ux, uy = best[1]
+    if roi_hsv is not None:
+        def bright_share(sign: float) -> float:
+            t = np.arange(3, 12.01, .5) * radius
+            hits = []
+            for k in np.linspace(-.3, .3, 5) * radius:
+                px = np.clip((cx + sign * ux * t - uy * k).astype(int), 0, roi_hsv.shape[1] - 1)
+                py = np.clip((cy + sign * uy * t + ux * k).astype(int), 0, roi_hsv.shape[0] - 1)
+                samples = roi_hsv[py, px]
+                hits.append((samples[:, 1] <= 120) & (samples[:, 2] >= 225))
+            return float(np.any(hits, axis=0).mean())
+        ahead, behind = bright_share(1.0), bright_share(-1.0)
+        if behind > ahead + .2:
+            ux, uy = -ux, -uy
+        elif ahead <= behind + .2:
+            return None        # no clear ray side: do not guess
+    return ux, uy
+
+
 # All pool balls are the same size. A fitted radius further than this share
 # from the typical one has grown onto the ball's drop shadow (or shrunk
 # against a neighbour); its centre is fitted again at the typical radius.
@@ -1860,15 +2038,16 @@ BALL_SIZE_SPREAD = .06
 
 
 def has_number_badge(patch_hsv: np.ndarray, xx, yy, cx: float, cy: float, r: float,
-                     min_v: float = 150) -> bool:
+                     min_v: float = 150, max_s: float = 90) -> bool:
     """True when a compact white disc (a ball's number badge, ~0.45 r) sits
     near the centre: white fills the middle around its own centroid, with
     almost no white just outside it. The game's guide lines crossing at the
     ghost ball's centre are white there too, but they run on outwards.
-    ``min_v`` is raised on a light cloth, which is itself "white" by the
-    default rule (a badge is still brighter than it).
+    ``min_v`` is raised on a light cloth and ``max_s`` lowered on a pale
+    coloured one, which are themselves "white" by the default rule (a badge
+    is still brighter, and less saturated, than they are).
     """
-    white = (patch_hsv[:, :, 1] < 90) & (patch_hsv[:, :, 2] > min_v)
+    white = (patch_hsv[:, :, 1] < max_s) & (patch_hsv[:, :, 2] > min_v)
     dist2 = (xx - cx) ** 2 + (yy - cy) ** 2
     near = white & (dist2 <= (r * .7) ** 2)
     ys, xs = np.nonzero(near)
@@ -1955,6 +2134,7 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
     pockets_local = [(-inset, -inset), (tw / 2, -2 * inset), (tw + inset, -inset),
                      (-inset, th + inset), (tw / 2, th + 2 * inset), (tw + inset, th + inset)]
     accepted = []
+    refit: set[tuple[int, int]] = set()
     for cx, cy, r in proposals:
         if not (0 <= cx < tw and 0 <= cy < th):
             continue
@@ -2030,17 +2210,35 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
         if (cx, cy) in from_badge:
             # Judge the ball's own colour around the badge (white excluded).
             body = ~((inner[:, 1] < 90) & (inner[:, 2] > 150))
-            if not body.any() or float(np.mean(cloth_inside[body])) <= .25:
+            if not body.any():
                 continue
+            # A coloured body is a ball circle finding missed (packed in a
+            # rack, crossed by a guide line); a grey one is the stick's joint.
+            coloured = float(np.median(inner[body][:, 1])) >= 90 and not grey
+            if float(np.mean(cloth_inside[body])) <= .25:
+                if not coloured:
+                    continue
+                # Another hue than the cloth, so it has a rim to fit: the
+                # badge is printed off the ball's centre.
+                body_hue = float(np.median(hue_delta(inner[body][:, 0], local_hue)))
+                if abs(body_hue) > 15:
+                    refit.add((cx, cy))
         if cloth_fraction > .35:
             # A solid ball the same colour as the cloth (purple 4 on a purple
             # table, red 3 on red) looks like cloth inside, but its white
             # number badge fills the centre. Hollow rings, lettering and
             # shadows have cloth there.
             badge_v = 150.0
-            if grey and len(ring):
+            # A pale cloth (any colour) passes the default badge-white test
+            # itself; the badge must then be brighter than the cloth.
+            if len(ring) and float(np.median(ring[:, 1])) < 90:
                 badge_v = max(badge_v, float(np.percentile(ring[:, 2], 80)) + 10)
-            if not has_number_badge(patch, xx, yy, cx, cy, r, badge_v):
+            badge_s = 90.0
+            if len(ring):
+                ring_s = float(np.median(ring[:, 1]))
+                if ring_s >= 25:
+                    badge_s = min(badge_s, ring_s * .6)
+            if not has_number_badge(patch, xx, yy, cx, cy, r, badge_v, badge_s):
                 continue
         sat = float(np.median(inner[:, 1]))
         val = float(np.median(inner[:, 2]))
@@ -2062,7 +2260,9 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
     for item in accepted:
         _, cx, cy, r = item[:4]
         clash = [k for k in kept if (cx - k[1]) ** 2 + (cy - k[2]) ** 2 < (diameter * .6) ** 2]
-        if all(item[6] >= .5 and k[6] >= .5 for k in clash):
+        # (A badge-only proposal is centred on its white badge, so it looks
+        # mostly white too; it is a duplicate of the ball found there.)
+        if all(item[6] >= .5 and k[6] >= .5 and (item[1], item[2]) not in from_badge for k in clash):
             kept.append(item)
     # Same size for every ball: a shadow must not make one circle bigger or
     # pull its centre towards the shadow.
@@ -2075,6 +2275,14 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
         # Only a white ball (the cue ball, whose centre sets the aim) has an
         # edge strong enough to beat its shadow in this fit; on a ball close
         # to the cloth colour the shadow would win and pull the centre.
+        if (cx, cy) in refit:
+            fx, fy = refit_centre(smooth, float(cx), float(cy), typical, reach=typical * .6)
+            if np.hypot(fx - cx, fy - cy) <= typical * .6:
+                # Landing on another detection: it was that ball's badge.
+                if any((fx - k[1]) ** 2 + (fy - k[2]) ** 2 < (diameter * .6) ** 2
+                       for k in kept if (k[1], k[2]) != (cx, cy)):
+                    continue
+                cx, cy = int(round(fx)), int(round(fy))
         white_ball = rest[2] >= .5  # (sat, val, white_fraction, red_spot)
         if white_ball and r > typical * (1 + BALL_SIZE_SPREAD) and rim_open_fraction(smooth, cx, cy, typical) >= .65:
             fx, fy = refit_centre(smooth, float(cx), float(cy), typical)
@@ -2273,7 +2481,7 @@ def detect(frame: np.ndarray) -> Detection:
                     continue
                 ghost = None
                 for direction in directions:
-                    ghost = find_ghost_ball(ghost_mask, local, direction, radius)
+                    ghost = find_ghost_ball(ghost_mask, local, direction, radius, roi)
                     if ghost is not None:
                         break
                 verified.append((ghost is not None, candidate is cue, candidate[5], candidate))
@@ -2281,6 +2489,15 @@ def detect(frame: np.ndarray) -> Detection:
                 best = max(verified, key=lambda item: item[:3])
                 if best[0] or cue is None:
                     cue = best[3]
+            # The ray and ghost of a struck ball right next to the cue ball
+            # are hidden under the ring, while a striped ball's own object
+            # line can pass for a ray ending in a "ghost". The cue ball is
+            # the purest white ball: a much whiter, less saturated candidate
+            # wins over a striped one.
+            whitest = max(cue_candidates, key=lambda c: c[5])
+            if (cue is not None and whitest is not cue and whitest[5] >= .75
+                    and whitest[5] >= cue[5] + .15 and whitest[3] <= cue[3] - 10):
+                cue = whitest
         if cue:
             cue_position = cue[:3]
             cue_index = min(range(len(balls)), key=lambda i: np.hypot(balls[i][0]-cue[0], balls[i][1]-cue[1]))
@@ -2289,12 +2506,24 @@ def detect(frame: np.ndarray) -> Detection:
             balls = separate_cue_overlap_detections(balls, cue_position)
             local_balls = [(bx-x, by-y, br, kind) for bx, by, br, kind in balls]
             aim = aim_direction(roi, (cue_position[0]-x, cue_position[1]-y, cue_position[2]), local_balls)
-            if aim:
+            stick_aim = aim
+            if not stick_aim and stick_matches and stick_matches_cue(stick_matches, cue):
+                # No aim ray read, but the stick still lies behind the cue
+                # ball: filter its rings along the stick itself.
+                stick_aim = stick_direction(stick_lines, (cue_position[0] - x, cue_position[1] - y),
+                                            cue_position[2], cv2.cvtColor(roi, cv2.COLOR_BGR2HSV))
+            if stick_aim:
+                aim_for_stick = stick_aim
+                # Read from the stick alone the side can be wrong; a struck
+                # ball right in front must not be dropped then.
+                min_behind = 1.35 if aim else 3.5
                 distance = shared.get("distance")
                 if distance is None:
                     distance = felt_distance_image(roi, cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), as_float=True)
-                balls = separate_cue_stick_detections(balls, cue_position, aim, rim_open,
-                                                      distance=distance, offset=(x, y))
+                body = {(c[0], c[1]): (c[3], c[4], c[5]) for c in cue_candidates}
+                balls = separate_cue_stick_detections(balls, cue_position, aim_for_stick, rim_open,
+                                                      distance=distance, offset=(x, y), body=body,
+                                                      min_behind=min_behind, axis_rule=bool(aim))
             # Exactly one ball is the cue ball; other white/striped detections
             # remain valid object-ball targets under 8-ball rules.
             cue_index = min(range(len(balls)), key=lambda i: np.hypot(balls[i][0]-cue[0], balls[i][1]-cue[1]))
@@ -2314,7 +2543,7 @@ def detect(frame: np.ndarray) -> Detection:
                 balls, cue[:3], aim_now, rim_open,
                 distance=shared.get("distance") if shared.get("distance") is not None
                 else felt_distance_image(roi, cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), as_float=True),
-                offset=(x, y))
+                offset=(x, y), body={(c[0], c[1]): (c[3], c[4], c[5]) for c in cue_candidates})
             if len(filtered) != len(balls):
                 balls = filtered
                 shot = predict_shot(roi, table, balls, cue[:3])
@@ -2327,6 +2556,39 @@ def detect(frame: np.ndarray) -> Detection:
             cleaned = [b for b in balls if b[3] == "cue" or np.hypot(b[0] - gx, b[1] - gy) > gr * .6]
             if len(cleaned) != len(balls):
                 balls = cleaned
+                shot = predict_shot(roi, table, balls, cue[:3])
+        ring_on_cue = None
+        if balls:
+            radius = float(np.median([b[2] for b in balls]))
+            if shot["ghost"] and np.hypot(cue[0] - shot["ghost"][0], cue[1] - shot["ghost"][1]) < radius * 1.5:
+                ring_on_cue = shot["ghost"]
+            elif not shot["ghost"]:
+                # No ghost found: the "cue ball" may be the ring itself.
+                white = white_guide_mask(roi, []).astype(np.float32) / 255
+                lx, ly = cue[0] - x, cue[1] - y
+                k = _ring_kernel(radius)
+                y0_, x0_ = max(0, ly - k.shape[0]), max(0, lx - k.shape[1])
+                local = white[y0_:ly + k.shape[0] + 1, x0_:lx + k.shape[1] + 1]
+                score = cv2.filter2D(local, -1, k, borderType=cv2.BORDER_CONSTANT)
+                sy, sx = ly - y0_, lx - x0_
+                near = score[max(0, sy - 2):sy + 3, max(0, sx - 2):sx + 3]
+                if near.size and float(near.max()) >= RING_ON_CUE_SCORE:
+                    ring_on_cue = (cue[0], cue[1], radius)
+        if ring_on_cue is not None:
+            # The struck ball right next to the cue ball puts the ghost ring
+            # on top of the cue ball, and circle finding can lock onto the
+            # ring (a crisp white circle) instead of the ball under it. Fit
+            # the ball again with the ring's pixels left out.
+            gx, gy, gr = ring_on_cue
+            distance = shared.get("distance")
+            if distance is None:
+                distance = felt_distance_image(roi, cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), as_float=True)
+            fx, fy = refit_beside_ring(cv2.GaussianBlur(distance, (0, 0), 1.0), cue[0] - x, cue[1] - y,
+                                       radius, gx - x, gy - y, gr)
+            moved = (int(round(fx + x)), int(round(fy + y)))
+            if moved != tuple(cue[:2]) and np.hypot(moved[0] - cue[0], moved[1] - cue[1]) <= radius * 1.2:
+                balls = [(moved[0], moved[1], b[2], b[3]) if b[3] == "cue" else b for b in balls]
+                cue = (moved[0], moved[1], *cue[2:])
                 shot = predict_shot(roi, table, balls, cue[:3])
         balls = uniform_ball_size(balls)
         cue = (*cue[:2], balls[0][2]) if balls else cue
