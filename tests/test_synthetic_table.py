@@ -386,6 +386,128 @@ class BallSizeTests(unittest.TestCase):
             self.assertLessEqual(stats["cue"], 2.0, f"seed {seed}: {problems}")
 
 
+class CoveredPocketTests(unittest.TestCase):
+    """The cue ball or the stick on a corner pocket used to make the pocket
+    fit give up; on a real frame the colour fallback then returned a table
+    too small, and Fit table resized the overlay to it."""
+
+    def test_pocket_fit_works_with_one_corner_covered(self):
+        import cv2
+        import detector
+
+        for seed in range(9000, 9010):
+            frame, truth = fg.render(fg.random_scene(seed))
+            holes = fg.pocket_holes(truth.table)
+            for corner in (0, 2, 3, 5):
+                covered = frame.copy()
+                px, py, hole = holes[corner]
+                cv2.circle(covered, (int(px), int(py)), int(hole * 1.3), (230, 232, 232), -1)
+                found = detector.table_from_pockets(covered)
+                self.assertIsNotNone(found, f"seed {seed}, corner {corner}")
+                err = max(abs(a - b) for a, b in zip(found, truth.table))
+                self.assertLessEqual(err, 3.0, f"seed {seed}, corner {corner}: {found}")
+
+    @unittest.skipUnless((Path(__file__).resolve().parents[1] / "outputs/bad/resize-stick-top/window.png").exists(),
+                         "real screenshot not present")
+    def test_real_frame_with_cue_ball_on_a_corner_pocket(self):
+        import cv2
+        import detector
+
+        frame = cv2.imread(str(Path(__file__).resolve().parents[1] / "outputs/bad/resize-stick-top/window.png"))
+        table = detector.find_table_bounds(frame)
+        for got, want in zip(table, (331, 219, 966, 484)):
+            self.assertLessEqual(abs(got - want), 4, table)
+
+
+class KnockOnTests(unittest.TestCase):
+    """A predicted path used to stop at the first ball in its way; now the
+    hit ball's path and the moving ball's deflection are predicted too."""
+
+    def test_knocked_ball_direction_matches_the_truth(self):
+        errors = []
+        for kind in (None, "pot"):
+            for seed in range(9000, 9080):
+                *_, truth, d, problems, stats = run(seed, kind)
+                if truth.target is None or d.target is None:
+                    continue
+                tx, ty = truth.balls[truth.target]
+                if np.hypot(d.target[0] - tx, d.target[1] - ty) > truth.radius * .5:
+                    continue
+                others = [p for n, p in truth.balls.items() if n != truth.target]
+                knock = fg.truth_knock((tx, ty), truth.object_dir, truth.table, truth.radius, others)
+                if knock is None or knock[3] < truth.radius * .4:
+                    continue
+                hit, direction = knock[0], knock[1]
+                path = d.knock_paths[0] if d.knock_paths else []
+                if not path or np.hypot(path[0][0][0] - hit[0], path[0][0][1] - hit[1]) > truth.radius * .6:
+                    continue
+                contact = d.object_segments[-1][1]
+                got = np.degrees(np.arctan2(path[0][0][1] - contact[1], path[0][0][0] - contact[0]))
+                errors.append(st.angle_diff(got, np.degrees(np.arctan2(direction[1], direction[0]))))
+        self.assertGreaterEqual(len(errors), 20)
+        self.assertLessEqual(np.median(errors), 2.5)
+        self.assertLessEqual(np.percentile(errors, 90), 6.0)
+
+    def test_lists_are_object_then_cue_and_empty_when_unblocked(self):
+        for seed in range(9000, 9010):
+            *_, truth, d, problems, stats = run(seed)
+            if d.target is None:
+                continue
+            self.assertEqual(len(d.knock_paths), 2)
+            self.assertEqual(len(d.deflect_paths), 2)
+            for path, knock in ((d.object_segments, d.knock_paths[0]), (d.cue_segments, d.knock_paths[1])):
+                if knock:
+                    # It starts on a blocker the path ends against.
+                    self.assertIn(tuple(knock[0][0]), [tuple(b[:2]) for b in d.blockers])
+
+    def test_knock_on_geometry(self):
+        import detector
+
+        bounds, r = (10.0, 10.0, 990.0, 490.0), 10.0
+        # Moving right along y=250 into a ball offset half a radius below.
+        path = [((300, 250), (480, 250))]
+        hit = (499, 255, 10)
+        knocked, deflected = detector.knock_on(path, [hit], [hit], bounds, r, 1)
+        (ax, ay), (bx, by) = knocked[0]
+        self.assertEqual((ax, ay), (499, 255))
+        self.assertGreater(bx, ax)
+        self.assertGreater(by, ay)          # pushed down-right, along the line of centres
+        (cx, cy), (dx_, dy_) = deflected[0]
+        self.assertLess(dy_, cy)            # the moving ball glances off upwards
+
+
+class NeonTableTests(unittest.TestCase):
+    """Miniclip's neon table has dark bands along the rails that touch the
+    corner pockets and joined them into long blobs: "Table not found"."""
+
+    def test_pockets_found_when_dark_bands_touch_them(self):
+        import cv2
+        import detector
+
+        for seed in range(9000, 9008):
+            frame, truth = fg.render(fg.random_scene(seed))
+            x, y, w, h = (int(round(v)) for v in truth.table)
+            for yy in (y - 6, y + h + 6):
+                cv2.line(frame, (x - 40, yy), (x + w + 40, yy), (8, 8, 8), 6)
+            for xx in (x - 6, x + w + 6):
+                cv2.line(frame, (xx, y - 40), (xx, y + h + 40), (8, 8, 8), 6)
+            found = detector.table_from_pockets(frame)
+            self.assertIsNotNone(found, f"seed {seed}")
+            self.assertLessEqual(max(abs(a - b) for a, b in zip(found, truth.table)), 3.0, f"seed {seed}")
+
+    @unittest.skipUnless((Path(__file__).resolve().parents[1] / "outputs/bad/batch3/shot9.png").exists(),
+                         "real screenshot not present")
+    def test_real_neon_table(self):
+        import cv2
+
+        frame = cv2.imread(str(Path(__file__).resolve().parents[1] / "outputs/bad/batch3/shot9.png"))
+        d = main.detect(frame)
+        for got, want in zip(d.table, (578, 340, 1017, 510)):
+            self.assertLessEqual(abs(got - want), 4, d.table)
+        self.assertGreaterEqual(len(d.balls), 15)
+        self.assertIsNotNone(d.ghost)
+
+
 class GameLineReaderTests(unittest.TestCase):
     def test_one_pixel_guide_thread_is_not_read_as_the_game_line(self):
         # Real frame: only a short stub of Miniclip's thick object line shows

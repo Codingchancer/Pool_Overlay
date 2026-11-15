@@ -40,6 +40,13 @@ class Detection:
     # cue ball). It grows as the player drags the power bar; turning it into
     # a power percentage needs measurements from the real game.
     stick_pull: float | None = None
+    # One level through the balls in the way: where a ball that a predicted
+    # path runs into goes (``knock_paths``), and where the moving ball goes
+    # after that hit (``deflect_paths``). Two entries each when a target was
+    # hit: [after the object path, after the cue path], an empty list where
+    # that path is not blocked. ``blockers`` stays as it was.
+    knock_paths: list | None = None
+    deflect_paths: list | None = None
     # Miniclip's power slider left of the table, when the capture includes
     # it: its outer rectangle (x, y, w, h) in frame pixels, and the power set
     # on it in percent: 0 with the cue at rest, 100 with the cue's top at the
@@ -645,6 +652,52 @@ def pocket_outcome(segments, table: tuple[int, int, int, int], radius: float):
     return None, None
 
 
+# The knock-on depends on exactly where two balls touch, so a small angle
+# error after a long path (through cushions) swings it a lot: only predict it
+# for a ball reached within this many ball radii of travel. And the moving
+# ball's deflection is only drawn for a hit this far from full (sine of the
+# cut), where its direction is stable.
+KNOCK_REACH_RADII = 25.0
+KNOCK_MIN_CUT = .25
+
+
+def knock_on(path, blockers, obstacles, bounds, radius: float, max_bounces: int):
+    """(hit ball's path, moving ball's path after the hit) when ``path``
+    ends against one of ``blockers``; ([], []) otherwise.
+
+    Same equal-mass, no-spin rule as the main shot: the hit ball leaves
+    along the line of centres, the moving ball along the tangent (nothing
+    when the hit is nearly full, as the moving ball then stops).
+    """
+    if not path or not blockers:
+        return [], []
+    travel = sum(float(np.hypot(b[0] - a[0], b[1] - a[1])) for a, b in path)
+    if travel > KNOCK_REACH_RADII * radius:
+        return [], []
+    (sx, sy), (ex, ey) = path[-1]
+    hit = min(blockers, key=lambda b: abs(np.hypot(b[0] - ex, b[1] - ey) - 2 * radius))
+    gap = float(np.hypot(hit[0] - ex, hit[1] - ey))
+    if abs(gap - 2 * radius) > max(2.5, radius * .2):
+        return [], []
+    length = float(np.hypot(ex - sx, ey - sy))
+    if length < 1e-6 or gap < 1e-6:
+        return [], []
+    ux, uy = (ex - sx) / length, (ey - sy) / length
+    nx, ny = (hit[0] - ex) / gap, (hit[1] - ey) / gap
+    if ux * nx + uy * ny <= 0:
+        return [], []
+    # The hit ball and the moving ball's old spot are not obstacles.
+    others = [o for o in obstacles if (o[0], o[1]) != (hit[0], hit[1])
+              and np.hypot(o[0] - ex, o[1] - ey) > radius * .5]
+    knocked = trace_bounces((hit[0], hit[1]), (nx, ny), bounds, radius, max_bounces=max_bounces,
+                            obstacles=others)
+    dot = ux * nx + uy * ny
+    tx, ty = ux - dot * nx, uy - dot * ny
+    deflected = (trace_bounces((ex, ey), (tx, ty), bounds, radius, max_bounces=max_bounces, obstacles=others)
+                 if np.hypot(tx, ty) > KNOCK_MIN_CUT else [])
+    return knocked, deflected
+
+
 def collision_paths(cue: tuple[int, int, int], target: tuple[int, int, int],
                     direction: tuple[float, float], table: tuple[int, int, int, int],
                     contact: tuple[float, float] | None = None, radius: float | None = None,
@@ -814,7 +867,8 @@ def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
     """
     left, top, width, height = table
     empty = {"aim": [], "cue": [], "object": [], "target": None, "ghost": None, "blockers": [],
-             "aim_dir": None, "object_dir": None, "cue_dir": None, "pot": None, "pot_pocket": None}
+             "aim_dir": None, "object_dir": None, "cue_dir": None, "pot": None, "pot_pocket": None,
+             "knock": [], "deflect": []}
     cue_local = (cue[0] - left, cue[1] - top, cue[2])
     balls_local = [(bx-left, by-top, br, kind) for bx, by, br, kind in balls]
     cx, cy, cr = cue
@@ -891,6 +945,11 @@ def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
                 # was probably missed, so show the game ray only.
                 return {**empty, "aim": [((cx, cy), ghost_int[:2])], "ghost": ghost_int, "aim_dir": (ux, uy),
                         "note": f"Aim ray matched at {angle:.1f}° · ghost ball has no object ball beside it"}
+            # Reticle in a pocket mouth: the cue ball goes in (a scratch), it
+            # does not rebound off the cushion beside the pocket.
+            if pocket_outcome([((cx, cy), (gx, gy))], table, ball_r)[0] == "pot":
+                return {**empty, "aim": [((cx, cy), ghost_int[:2])], "ghost": ghost_int, "aim_dir": (ux, uy),
+                        "note": f"Aim ray matched at {angle:.1f}° · cue ball goes into the pocket"}
             # Reticle against a cushion: the cue ball rebounds there. Mirror
             # the aim off each cushion the reticle touches (both in a corner)
             # and trace on from the reticle, like the after-impact paths.
@@ -992,9 +1051,19 @@ def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
         on = float(np.hypot(ox, oy))
         obj_dir = (ox / on, oy / on) if on > 1e-6 else None
     pot, pot_pocket = pocket_outcome(object_path, table, ball_r)
+    # One level through a ball in the way of either path. The struck ball
+    # has left its spot, so it is no obstacle any more.
+    bounds = (left + ball_r, top + ball_r, left + width - ball_r, top + height - ball_r)
+    moving_free = [o for o in obstacles if np.hypot(o[0] - selected[0], o[1] - selected[1]) > ball_r * .5]
+    knock, deflect = [], []
+    for path in (object_path, cue_path):
+        hit_path, after = knock_on(path, blockers, moving_free, bounds, ball_r, PATH_BOUNCES - 1)
+        knock.append(hit_path)
+        deflect.append(after)
     return {"aim": approach, "cue": cue_path, "object": object_path, "target": target,
             "ghost": ghost_int, "blockers": blockers, "aim_dir": (ux, uy),
             "object_dir": obj_dir, "cue_dir": final_cue, "pot": pot, "pot_pocket": pot_pocket,
+            "knock": knock, "deflect": deflect,
             "note": f"Aim ray matched · target ({bx},{by}) at {angle:.1f}° · "
                     f"{' + '.join(sources)} · paths are estimates"}
 
@@ -1158,6 +1227,60 @@ def hue_delta(hue, centre: float):
     return (np.asarray(hue, np.float32) - centre + 90) % 180 - 90
 
 
+def _three_corner_fit(blobs, dark: np.ndarray):
+    """(error, tl, tr, bl, br) from three corner pockets, the fourth inferred.
+
+    ``blobs`` are pocket candidates (x, y, width, area). Two corners on one
+    long side, a third straight above or below one of them, and a middle
+    pocket on that long side (checked in the ``dark`` mask directly: the
+    cushion cuts it into a shape the blob filter drops); the hidden corner
+    completes the rectangle.
+    """
+    h, w = dark.shape[:2]
+    best = None
+    for a in blobs:
+        for b in blobs:
+            dx = b[0] - a[0]
+            if dx < 200 or abs(b[1] - a[1]) > dx * .03:
+                continue
+            size = (a[2] + b[2]) / 2
+            if not (.035 * dx <= size <= .1 * dx) or max(a[3], b[3]) > 2 * min(a[3], b[3]):
+                continue
+            row_y = (a[1] + b[1]) / 2
+            # The middle pocket of this side: halfway along, a little outside
+            # the corner row (middle pockets sit further out), smaller.
+            mid_x = (a[0] + b[0]) / 2
+            half = max(3, int(round(dx * .012)))
+            x0m, x1m = int(mid_x - half), int(mid_x + half) + 1
+            y0m, y1m = int(row_y - dx * .03), int(row_y + dx * .03) + 1
+            box = dark[max(0, y0m):min(h, y1m), max(0, x0m):min(w, x1m)]
+            if box.size == 0 or float(box.mean()) < .25:
+                continue
+            for c in blobs:
+                if c is a or c is b:
+                    continue
+                for corner, other in ((a, b), (b, a)):
+                    dy = c[1] - corner[1]
+                    if abs(c[0] - corner[0]) > dx * .03 or not (.44 * dx <= abs(dy) <= .58 * dx):
+                        continue
+                    if max(c[3], corner[3]) > 2 * min(c[3], corner[3]):
+                        continue
+                    # The hidden corner: under/over the other one, level with c.
+                    hidden = (other[0], c[1], other[2], other[3])
+                    if dy > 0:
+                        tl, tr = (a, b)
+                        bl, br = (c, hidden) if corner is a else (hidden, c)
+                    else:
+                        bl, br = (a, b)
+                        tl, tr = (c, hidden) if corner is a else (hidden, c)
+                    height = (bl[1] + br[1]) / 2 - (tl[1] + tr[1]) / 2
+                    error = (abs(c[0] - corner[0]) + abs(b[1] - a[1]) + abs(height / dx - .51) * dx * .2
+                             + dx * .01)  # a little worse than any four-corner fit
+                    if best is None or error < best[0]:
+                        best = (error, tl, tr, bl, br)
+    return best
+
+
 def table_from_pockets(frame: np.ndarray) -> tuple[int, int, int, int] | None:
     """Fit the playing area from the four dark corner pockets.
 
@@ -1168,6 +1291,10 @@ def table_from_pockets(frame: np.ndarray) -> tuple[int, int, int, int] | None:
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     grey = cloth_is_grey(hsv)
     dark = (hsv[:, :, 2] < (GREY_POCKET_DARKNESS if grey else POCKET_DARKNESS)).astype(np.uint8)
+    # Cut thin dark lines (the neon table's rail bands, outlines) away from
+    # the pockets, which they would otherwise join into long blobs. Pockets
+    # are far wider than this kernel.
+    dark = cv2.morphologyEx(dark, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
     hue = cloth_hue(hsv, step=4)
     if grey:
         felt_like = grey_cloth_mask(hsv).astype(np.uint8)
@@ -1213,6 +1340,11 @@ def table_from_pockets(frame: np.ndarray) -> tuple[int, int, int, int] | None:
                              + abs(dy / dx - .51) * dx * .2)
                     if best is None or error < best[0]:
                         best = (error, a, b, c, d)
+    if best is None:
+        # A corner pocket can be hidden (the cue ball or the stick on it).
+        # Three corners still fix the table when the long side's middle
+        # pocket confirms the row that has both corners.
+        best = _three_corner_fit(blobs, dark)
     if best is None:
         return None
     _, a, b, c, d = best
@@ -1915,6 +2047,7 @@ def detect(frame: np.ndarray) -> Detection:
                          target=shot["target"], ghost=shot["ghost"], blockers=shot["blockers"],
                          aim_dir=shot["aim_dir"], object_dir=shot["object_dir"], cue_dir=shot["cue_dir"],
                          pot=shot["pot"], pot_pocket=shot["pot_pocket"], stick_pull=shot["stick_pull"],
+                         knock_paths=shot["knock"], deflect_paths=shot["deflect"],
                          note=f"{shot['note']} · {len(balls)} ball candidates")
     return Detection(table=table, balls=uniform_ball_size(balls), power_slider=slider,
                      power_percent=read_power_slider(frame, slider),
