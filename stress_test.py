@@ -270,7 +270,7 @@ def main_cli():
     parser.add_argument("--count", type=int, default=200)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--kind")
-    parser.add_argument("--cloth", default="blue", help="cloth colour: " + ", ".join(fg.CLOTH_HUES) + ", black")
+    parser.add_argument("--cloth", default="blue", help="cloth colour: " + ", ".join(list(fg.CLOTH_HUES) + list(fg.CLOTH_HSV)) + ", black, or h,s,v")
     parser.add_argument("--save-failures")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
@@ -278,7 +278,8 @@ def main_cli():
     categories = Counter()
     collected = {}
     for seed in range(args.start, args.start + args.count):
-        scene, frame, truth, d, problems, stats = evaluate(seed, args.kind, args.cloth)
+        cloth = tuple(int(v) for v in args.cloth.split(",")) if args.cloth.count(",") == 2 else args.cloth
+        scene, frame, truth, d, problems, stats = evaluate(seed, args.kind, cloth)
         for key, value in stats.items():
             collected.setdefault(key, []).append(value)
         if problems:

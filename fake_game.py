@@ -54,6 +54,7 @@ class Scene:
     show_stick: bool = True                           # False: opponent's turn, no stick
     power: float | None = None                        # power slider left of the table (0..1), None: not drawn
     cloth_black: bool = False                         # colourless near-black cloth (Lucky Shot table)
+    cloth_hsv: tuple | None = None                    # any cloth: OpenCV (hue, saturation, value) mid-table
     jpeg_quality: int | None = None
     blur: float = 0.0
     letterbox: float = .07
@@ -445,6 +446,24 @@ def draw_power_slider(canvas, table, power):
         canvas[max(ya, inner_top):yb, int(round(cx - half)):int(round(cx + half)) + 1] = colour
 
 
+def _cloth_part(scene, part):
+    """Colours of the table parts for an arbitrary cloth (``cloth_hsv``):
+    cushions a little lighter and more saturated (darker on a very light
+    cloth), a nose highlight, a faint head string, darker lettering."""
+    h, s, v = scene.cloth_hsv
+    h = int(h) % 180
+    light = v > 200
+    if part == "cushion":
+        return _hsv_bgr(h, int(min(255, s + 35)), int(v - 45 if light else min(255, v + 25)))
+    if part == "highlight":
+        return _hsv_bgr(h, int(s * .9), int(v - 70 if light else min(255, v + 60)))
+    if part == "string":
+        return _hsv_bgr(h, int(s * .85), int(v - 30 if light else min(255, v + 25)))
+    # A darker shade of the cloth itself (adding saturation to a colourless
+    # cloth would tint it red).
+    return _hsv_bgr(h, int(min(255, s * 1.15)), int(v * .72))
+
+
 def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     """Draw the scene; return (BGR uint8 frame, truth)."""
     rng = np.random.default_rng(scene.seed)
@@ -479,6 +498,7 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     cv2.rectangle(canvas, (int(round(x - cushion)), int(round(y - cushion))),
                   (int(round(x + w + cushion)), int(round(y + h + cushion))),
                   tuple(float(v) for v in (_hsv_bgr(0, 0, 90) if scene.cloth_black
+                                           else _cloth_part(scene, "cushion") if scene.cloth_hsv
                                            else _hsv_bgr(tint(1), 175, 205))), -1)
     for i, (px, py) in enumerate(pockets):
         pr = middle_r if i in (1, 4) else corner_r
@@ -494,7 +514,14 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
         # the middle down to ~12 at the rails.
         value = (58 - 46 * np.clip(radial, 0, 1.0) + rng.normal(0, 1.2, radial.shape)).clip(10, 255)
         saturation = np.zeros_like(value)
-    cloth = np.dstack([np.full_like(value, tint(0)), saturation, value]).astype(np.uint8)
+    cloth_hue = tint(0)
+    if scene.cloth_hsv is not None:
+        # Any colour: the same lighter-middle shading, scaled to the cloth.
+        ch, cs, cv = scene.cloth_hsv
+        cloth_hue = int(ch) % 180
+        value = (cv - .22 * cv * np.clip(radial, 0, 1.4) + rng.normal(0, 2.0, radial.shape)).clip(0, 255)
+        saturation = (cs * (1 + .1 * np.clip(radial, 0, 1.4))).clip(0, 255)
+    cloth = np.dstack([np.full_like(value, cloth_hue), saturation, value]).astype(np.uint8)
     cloth = cv2.cvtColor(cloth, cv2.COLOR_HSV2BGR).astype(np.float32)
     x0i, y0i = int(np.floor(x)), int(np.floor(y))
     fx, fy = x - x0i, y - y0i
@@ -509,6 +536,7 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     for p0, p1 in (((x, y - 1.2), (x + w, y - 1.2)), ((x, y + h + 1.2), (x + w, y + h + 1.2)),
                    ((x - 1.2, y), (x - 1.2, y + h)), ((x + w + 1.2, y), (x + w + 1.2, y + h))):
         stroke_line(canvas, p0, p1, 1.6, tuple(float(v) for v in (_hsv_bgr(0, 0, 120) if scene.cloth_black
+                                                                   else _cloth_part(scene, "highlight") if scene.cloth_hsv
                                                                    else _hsv_bgr(tint(0), 150, 245))))
     # Re-open the pocket mouths over cushion and highlight.
     for i, (px, py) in enumerate(pockets):
@@ -527,8 +555,11 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     # a head-string line and a large watermark ring with lettering.
     stroke_line(canvas, (x + w / 4, y + 2), (x + w / 4, y + h - 2), 1.4,
                 tuple(float(v) for v in (_hsv_bgr(0, 0, 70) if scene.cloth_black
+                                         else _cloth_part(scene, "string") if scene.cloth_hsv
                                          else _hsv_bgr(tint(0), 120, 215))), alpha=.7)
-    darker = tuple(float(v) for v in (_hsv_bgr(0, 0, 32) if scene.cloth_black else _hsv_bgr(tint(3), 165, 140)))
+    darker = tuple(float(v) for v in (_hsv_bgr(0, 0, 32) if scene.cloth_black
+                                      else _cloth_part(scene, "lettering") if scene.cloth_hsv
+                                      else _hsv_bgr(tint(3), 165, 140)))
     stroke_ring(canvas, x + w * .55, y + h * .52, r * 3.2, r * .45, darker)
     cv2.putText(canvas, "PRACTICE", (int(x + w * .36), int(y + h * .6)), cv2.FONT_HERSHEY_DUPLEX,
                 r / 9, darker, max(2, int(r / 3)), cv2.LINE_AA)
@@ -603,6 +634,11 @@ def _free(point, others, gap):
 
 # Cloth colours to test with (OpenCV hue). Miniclip's tables come in these.
 CLOTH_HUES = {"blue": 98, "green": 60, "red": 176, "purple": 140, "brown": 12, "teal": 85}
+# Cloths a hue alone does not describe: pale, colourless or very light.
+CLOTH_HSV = {"white": (0, 0, 228), "light grey": (0, 0, 175), "grey": (0, 0, 120),
+             "beige": (20, 60, 200), "pink": (170, 90, 215), "yellow": (28, 170, 220),
+             "orange": (12, 200, 220), "navy": (115, 200, 90), "lime": (40, 180, 200),
+             "dark green": (65, 180, 80), "maroon": (175, 190, 90), "sky": (100, 80, 225)}
 
 
 def random_scene(seed: int, kind: str | None = None, cloth: str | int = "blue") -> Scene:
@@ -611,6 +647,10 @@ def random_scene(seed: int, kind: str | None = None, cloth: str | int = "blue") 
     whatever the cloth colour."""
     if cloth == "black":
         return replace(_random_scene(seed, kind), cloth_black=True)
+    if isinstance(cloth, tuple):
+        return replace(_random_scene(seed, kind), cloth_hsv=tuple(cloth))
+    if cloth in CLOTH_HSV:
+        return replace(_random_scene(seed, kind), cloth_hsv=CLOTH_HSV[cloth])
     hue = CLOTH_HUES[cloth] if isinstance(cloth, str) else int(cloth)
     return replace(_random_scene(seed, kind), cloth_hue=hue)
 
