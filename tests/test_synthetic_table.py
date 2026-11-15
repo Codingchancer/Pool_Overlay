@@ -419,6 +419,63 @@ class CoveredPocketTests(unittest.TestCase):
             self.assertLessEqual(abs(got - want), 4, table)
 
 
+class KnockOnTests(unittest.TestCase):
+    """A predicted path used to stop at the first ball in its way; now the
+    hit ball's path and the moving ball's deflection are predicted too."""
+
+    def test_knocked_ball_direction_matches_the_truth(self):
+        errors = []
+        for kind in (None, "pot"):
+            for seed in range(9000, 9080):
+                *_, truth, d, problems, stats = run(seed, kind)
+                if truth.target is None or d.target is None:
+                    continue
+                tx, ty = truth.balls[truth.target]
+                if np.hypot(d.target[0] - tx, d.target[1] - ty) > truth.radius * .5:
+                    continue
+                others = [p for n, p in truth.balls.items() if n != truth.target]
+                knock = fg.truth_knock((tx, ty), truth.object_dir, truth.table, truth.radius, others)
+                if knock is None or knock[3] < truth.radius * .4:
+                    continue
+                hit, direction = knock[0], knock[1]
+                path = d.knock_paths[0] if d.knock_paths else []
+                if not path or np.hypot(path[0][0][0] - hit[0], path[0][0][1] - hit[1]) > truth.radius * .6:
+                    continue
+                contact = d.object_segments[-1][1]
+                got = np.degrees(np.arctan2(path[0][0][1] - contact[1], path[0][0][0] - contact[0]))
+                errors.append(st.angle_diff(got, np.degrees(np.arctan2(direction[1], direction[0]))))
+        self.assertGreaterEqual(len(errors), 20)
+        self.assertLessEqual(np.median(errors), 2.5)
+        self.assertLessEqual(np.percentile(errors, 90), 6.0)
+
+    def test_lists_are_object_then_cue_and_empty_when_unblocked(self):
+        for seed in range(9000, 9010):
+            *_, truth, d, problems, stats = run(seed)
+            if d.target is None:
+                continue
+            self.assertEqual(len(d.knock_paths), 2)
+            self.assertEqual(len(d.deflect_paths), 2)
+            for path, knock in ((d.object_segments, d.knock_paths[0]), (d.cue_segments, d.knock_paths[1])):
+                if knock:
+                    # It starts on a blocker the path ends against.
+                    self.assertIn(tuple(knock[0][0]), [tuple(b[:2]) for b in d.blockers])
+
+    def test_knock_on_geometry(self):
+        import detector
+
+        bounds, r = (10.0, 10.0, 990.0, 490.0), 10.0
+        # Moving right along y=250 into a ball offset half a radius below.
+        path = [((300, 250), (480, 250))]
+        hit = (499, 255, 10)
+        knocked, deflected = detector.knock_on(path, [hit], [hit], bounds, r, 1)
+        (ax, ay), (bx, by) = knocked[0]
+        self.assertEqual((ax, ay), (499, 255))
+        self.assertGreater(bx, ax)
+        self.assertGreater(by, ay)          # pushed down-right, along the line of centres
+        (cx, cy), (dx_, dy_) = deflected[0]
+        self.assertLess(dy_, cy)            # the moving ball glances off upwards
+
+
 class GameLineReaderTests(unittest.TestCase):
     def test_one_pixel_guide_thread_is_not_read_as_the_game_line(self):
         # Real frame: only a short stub of Miniclip's thick object line shows

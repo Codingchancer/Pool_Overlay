@@ -103,6 +103,29 @@ def pocket_holes(table):
             for i, (px, py) in enumerate(pocket_centres(table))]
 
 
+def truth_knock(start, direction, table, radius, balls=(), bounces=3):
+    """Exact one-level knock-on: when the path from ``start`` runs into one of
+    ``balls``, return (that ball, its direction, the moving ball's direction
+    after the hit or None, margin), else None. ``margin`` is how far (px)
+    the line of travel is from just missing that ball (a near-graze is
+    ill-conditioned: a tiny angle change swings the knock direction)."""
+    points, stop = truth_path(start, direction, table, radius, bounces=bounces, balls=balls)
+    if stop != "ball" or len(points) < 2:
+        return None
+    (sx, sy), (ex, ey) = points[-2], points[-1]
+    hit = min(balls, key=lambda b: abs(np.hypot(b[0] - ex, b[1] - ey) - 2 * radius))
+    length = float(np.hypot(ex - sx, ey - sy))
+    ux, uy = (ex - sx) / length, (ey - sy) / length
+    nx, ny = hit[0] - ex, hit[1] - ey
+    n = float(np.hypot(nx, ny))
+    nx, ny = nx / n, ny / n
+    dot = ux * nx + uy * ny
+    tx, ty = ux - dot * nx, uy - dot * ny
+    t = float(np.hypot(tx, ty))
+    across = abs((hit[0] - sx) * uy - (hit[1] - sy) * ux)
+    return hit, (nx, ny), ((tx / t, ty / t) if t > .12 else None), 2 * radius - across
+
+
 def truth_pot(start, direction, table, radius, balls=(), bounces=3):
     """Exact pot decision for a ball sent from ``start`` along ``direction``.
 
