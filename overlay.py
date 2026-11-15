@@ -21,7 +21,9 @@ from capture import (GUIDE_COLOURS, GUIDE_THICKNESS, PAINT_SETTLE, DEFAULT_STYLE
                      load_guide_style, logical_to_physical, paint_guide, physical_to_logical, remove_overlay,
                      render_guide_layer, save_guide_style, shown_layer)
 from detector import Detection, find_table_bounds
-from tracking import ShotTracker
+from tracking import ShotTracker, change_thumbnail, screen_changed  # noqa: F401 (re-exported)
+from window_capture import WindowCapture, window_under
+from analysis_process import AnalysisProcess
 from simulator_ui import ScreenshotTester, ShotSimulator
 
 
@@ -156,6 +158,9 @@ class GrabPlan:
     overlay: dict
     panel: dict | None
     paints: list
+    # The mirror window under the guide, captured on its own (no guide in
+    # the picture). None: capture the screen and remove the guide instead.
+    window: int | None = None
 
 
 def grab_clean(capture, plan: GrabPlan) -> np.ndarray | None:
@@ -239,26 +244,6 @@ def _layer_for(paint: tuple) -> np.ndarray:
     return layer
 
 
-def change_thumbnail(frame: np.ndarray) -> np.ndarray:
-    """A quarter-size grey copy for telling whether the screen changed."""
-    h, w = frame.shape[:2]
-    return cv2.resize(cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), (max(1, w // 4), max(1, h // 4)),
-                      interpolation=cv2.INTER_AREA)
-
-
-def screen_changed(thumbnail: np.ndarray, last: np.ndarray | None) -> bool:
-    """True unless the frame is the same as the last analysed one.
-
-    Looks for any small spot that changed, not an average over the whole
-    frame: turning the aim a fraction of a degree only moves a thin line and
-    the cue stick, and that must still be analysed. Stream noise averages out
-    over each 4x4 block.
-    """
-    if last is None or last.shape != thumbnail.shape:
-        return True
-    return int(np.count_nonzero(cv2.absdiff(thumbnail, last) > 8)) >= 3
-
-
 # One mss capture per worker thread, kept by the thread's id. (A
 # threading.local does not work here: PySide clears it after every
 # QRunnable, so a new capture was opened for each frame and never closed;
@@ -278,19 +263,57 @@ def _capture_for_this_thread():
     return capture
 
 
+# One window capture per worker thread too (same reason: its GDI objects
+# are made once and reused, never once per frame).
+_window_captures: dict[int, WindowCapture] = {}
+
+
+def _window_capture_for_this_thread(hwnd: int) -> WindowCapture:
+    key = threading.get_ident()
+    with _captures_lock:
+        capture = _window_captures.get(key)
+        if capture is not None and capture.hwnd != hwnd:
+            capture.close()
+            capture = None
+        if capture is None:
+            capture = _window_captures[key] = WindowCapture(hwnd)
+    return capture
+
+
+def grab_window(plan: GrabPlan) -> np.ndarray | None:
+    """The guide area from the mirror window's own picture, or None if that fails.
+
+    The guide and the control panel are not in this picture at all, so
+    nothing has to be removed and no recent drawing has to be matched.
+    """
+    if plan.window is None:
+        return None
+    frame = _window_capture_for_this_thread(plan.window).grab(plan.region)
+    if frame is not None:
+        debug_dir = os.environ.get("POOL_OVERLAY_DEBUG_DIR")
+        if debug_dir:
+            # Same three files as the screen path; here the capture is already clean.
+            _debug_dump(debug_dir, "capture.png", frame)
+            if plan.paints:
+                _debug_dump(debug_dir, "layer.png", _layer_for(plan.paints[0]))
+            _debug_dump(debug_dir, "cleaned.png", frame)
+    return frame
+
+
 def close_captures():
     """Close every worker's capture (on exit)."""
     with _captures_lock:
-        for capture in _captures.values():
+        for capture in list(_captures.values()) + list(_window_captures.values()):
             try:
                 capture.close()
             except Exception:
                 pass
         _captures.clear()
+        _window_captures.clear()
 
 
 class AnalysisSignals(QObject):
-    completed = Signal(object, object, object)
+    completed = Signal(object, object, object, str)
     skipped = Signal()
     failed = Signal(str)
 
@@ -312,7 +335,11 @@ class AnalysisTask(QRunnable):
 
     def run(self):
         try:
-            shot = grab_clean(_capture_for_this_thread(), self.plan)
+            source = "window capture"
+            shot = grab_window(self.plan)
+            if shot is None:
+                source = "screen capture"
+                shot = grab_clean(_capture_for_this_thread(), self.plan)
             if shot is None:
                 self.signals.skipped.emit()
                 return
@@ -320,7 +347,7 @@ class AnalysisTask(QRunnable):
             if not screen_changed(thumbnail, self.last_thumbnail):
                 self.signals.skipped.emit()
                 return
-            self.signals.completed.emit(self.tracker.detect(shot), self.geometry, thumbnail)
+            self.signals.completed.emit(self.tracker.detect(shot), self.geometry, thumbnail, source)
         except Exception as exc:
             self.signals.failed.emit(str(exc))
 
@@ -527,6 +554,10 @@ class GuideSettings(QDialog):
 
 
 class Control(QMainWindow):
+    # Results from the analysis process arrive on a reader thread; this signal
+    # hands them to the window thread.
+    process_result = Signal(object)
+
     def __init__(self):
         super().__init__()
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
@@ -542,6 +573,17 @@ class Control(QMainWindow):
         self.cue_tracker = CueTracker()
         self.stabilizer = GuideStabilizer()
         self._stabilized_rect = None
+        self._mirror_hwnd: int | None = None
+        # Analysis in its own process while a mirror window can be captured.
+        self.process: AnalysisProcess | None = None
+        self._process_job = None
+        self._generation = 0
+        self._job_geometry = QRect()
+        self._window_failed_at = -1e9
+        self._no_table_count = 0
+        self.process_result.connect(self._process_message)
+        self._mirror_checked_at = 0.0
+        self._mirror_overlay: dict | None = None
         self._analysed_at: list[float] = []
         self.label = QLabel("Position the guide over the complete pool table, then enable it.")
         self.label.setWordWrap(True)
@@ -651,7 +693,25 @@ class Control(QMainWindow):
         panel = None
         if self.isVisible() and not self.isMinimized():
             panel = logical_to_physical(self.frameGeometry(), self.screen() or QGuiApplication.primaryScreen())
-        return GrabPlan(region, self.overlay.capture_rect(), panel, self.overlay.recent_paints())
+        overlay = self.overlay.capture_rect()
+        return GrabPlan(region, overlay, panel, self.overlay.recent_paints(), self._mirror_window(overlay))
+
+    # How often to look again for the window under the guide (it is cheap to
+    # check that the known one still exists, but a full search walks every window).
+    MIRROR_SEARCH_SECONDS = 1.0
+
+    def _mirror_window(self, overlay: dict) -> int | None:
+        """The mirror window under the guide, if window capture is allowed."""
+        if os.environ.get("POOL_OVERLAY_SCREEN_CAPTURE"):
+            return None  # force the old screen capture (for comparisons)
+        now = time.monotonic()
+        if now - self._mirror_checked_at > self.MIRROR_SEARCH_SECONDS or self._mirror_overlay != overlay:
+            self._mirror_checked_at, self._mirror_overlay = now, dict(overlay)
+            try:
+                self._mirror_hwnd = window_under(overlay)
+            except Exception:
+                self._mirror_hwnd = None
+        return self._mirror_hwnd
 
     def _grab_without_overlay(self, region: dict) -> np.ndarray | None:
         """Capture ``region`` (physical pixels) and undo the guide's own drawing.
@@ -773,6 +833,7 @@ class Control(QMainWindow):
         else:
             self.timer.stop(); self.last_thumbnail = None; self.overlay.detection = Detection(note="Guide is off")
             self.cue_tracker.reset(); self.stabilizer.reset(); self.tracker = ShotTracker()
+            self._pause_process(); self._generation += 1
             self.overlay.update(); self.label.setText("Guide is off")
 
     def toggle_adjust(self):
@@ -782,11 +843,16 @@ class Control(QMainWindow):
 
     def analyze(self):
         if not self.overlay.active:
-            return
-        if self.analysis_pending:
+            self._pause_process()
             return
         if self.overlay.adjusting:
+            self._pause_process()
             self.label.setText("Positioning mode · analysis paused")
+            return
+        if self._use_process(self.overlay.capture_rect()):
+            return
+        self._pause_process()
+        if self.analysis_pending:
             return
         # No waiting for the compositor after a repaint: the worker checks
         # which recent drawing the capture shows and subtracts that one.
@@ -804,8 +870,74 @@ class Control(QMainWindow):
             self.analysis_pending = False
             self.label.setText(f"Screen capture failed: {exc}")
 
+    # After the mirror window gave no picture (or no table), use screen capture this long.
+    WINDOW_RETRY_SECONDS = 2.0
+    NO_TABLE_FRAMES = 15
+
+    def _use_process(self, overlay: dict) -> bool:
+        """Keep the analysis process working on the mirror window; False if it cannot."""
+        if os.environ.get("POOL_OVERLAY_NO_PROCESS"):
+            return False
+        if time.monotonic() - self._window_failed_at < self.WINDOW_RETRY_SECONDS:
+            return False
+        hwnd = self._mirror_window(overlay)
+        if hwnd is None:
+            return False
+        if self.process is None or not self.process.alive():
+            try:
+                self.process = AnalysisProcess(self.process_result.emit)
+            except Exception as exc:
+                self.process = None
+                self._window_failed_at = time.monotonic()
+                self.label.setText(f"Analysis process failed to start: {exc}")
+                return False
+            self._process_job = None
+        job = (hwnd, tuple(sorted(overlay.items())))
+        if job != self._process_job:
+            if self._process_job is None or self._process_job[1] != job[1]:
+                # New area (or a fresh start): old coordinates no longer apply.
+                self._generation += 1
+                self._job_geometry = QRect(self.overlay.geometry())
+                self.stabilizer.reset()
+            self.process.send_job(hwnd, overlay, self._generation)
+            self._process_job = job
+        return True
+
+    def _pause_process(self):
+        if self.process is not None and self._process_job is not None:
+            self.process.pause()
+        self._process_job = None
+
+    def _process_message(self, message):
+        kind, generation = message[0], message[1]
+        if generation != self._generation or self._process_job is None:
+            return  # from before a Re-detect, a move, or a pause
+        if kind == "detection":
+            detection = message[2]
+            # The captured window shows no table for a second: probably not the
+            # mirror (another app's window under the guide). Screen capture
+            # sees what the player sees, so use that for a while.
+            self._no_table_count = 0 if detection.table is not None else self._no_table_count + 1
+            if self._no_table_count >= self.NO_TABLE_FRAMES:
+                self._no_table_count = 0
+                self._window_failed_at = time.monotonic()
+                self._pause_process()
+                self.analyze()
+                return
+            if self.overlay.active and not self.overlay.adjusting and self.overlay.geometry() == self._job_geometry:
+                self._show(detection, self._job_geometry, "window capture")
+        elif kind == "no picture":
+            # The mirror window gives no picture: screen capture for a while.
+            self._window_failed_at = time.monotonic()
+            self._process_job = None
+            self.analyze()
+        elif kind == "failed" and self.overlay.active:
+            self.label.setText(f"Image analysis failed: {message[2]}")
+
     def redetect_now(self):
         """Find the table and every ball again on the next frame."""
+        self._generation += 1
+        self._process_job = None
         self.tracker = ShotTracker()
         self.last_thumbnail = None
         self.analyze()
@@ -823,12 +955,17 @@ class Control(QMainWindow):
         self.analysis_task = None
         self._next_frame(self.IDLE_RETRY_MS)
 
-    def _analysis_completed(self, detection: Detection, geometry: QRect, thumbnail):
+    def _analysis_completed(self, detection: Detection, geometry: QRect, thumbnail, source: str = ""):
         self.analysis_pending = False
         self.analysis_task = None
         if not self.overlay.active or self.overlay.adjusting or self.overlay.geometry() != geometry:
             return
         self.last_thumbnail = thumbnail
+        self._show(detection, geometry, source)
+        self._next_frame()
+
+    def _show(self, detection: Detection, geometry: QRect, source: str):
+        """Steady the new detection and draw it (shared by both analysis paths)."""
         detection = self.cue_tracker.update(detection, geometry)
         if geometry.getRect() != self._stabilized_rect:
             # The overlay moved or was resized: old coordinates no longer apply.
@@ -840,14 +977,13 @@ class Control(QMainWindow):
         # Analysed frames in the last second, shown so the speed is visible.
         now = time.monotonic()
         self._analysed_at = [t for t in self._analysed_at if now - t < 1.0] + [now]
-        self.label.setText(f"{shown.note} · {len(self._analysed_at)} updates/s")
+        self.label.setText(f"{shown.note} · {len(self._analysed_at)} updates/s · {source}")
         # Same shot as on screen: no repaint, so the guide stays perfectly still.
         if shown is not self.overlay.detection:
             self.overlay.detection = shown
             # Paint now rather than later, so the next capture's plan already
             # knows this drawing (the screen may show it by then).
             self.overlay.repaint()
-        self._next_frame()
 
     def _analysis_failed(self, message: str):
         self.analysis_pending = False
@@ -862,6 +998,8 @@ class Control(QMainWindow):
         if self.synthetic_window is not None:
             self.synthetic_window.close()
         self.capture.close()
+        if self.process is not None:
+            self.process.stop()
         self.thread_pool.waitForDone(2000)
         close_captures()
         super().closeEvent(e)
