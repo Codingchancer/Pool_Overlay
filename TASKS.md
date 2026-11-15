@@ -20,7 +20,6 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| Every cloth colour (white, light grey, beige, pale and dark cloths fail today) | detector | Jartartarta | `jartartarta/any-table-colour` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Fast aim reader** (IDEAS.md idea 2, handed over by Codingchancer 15 Nov): read only the aim change per frame (angles within ~±2° of the last aim, ghost ball in a small box) in ~3-5 ms, with the full `predict_shot` every few frames to correct drift. Reading the aim is now the limit (16-18 updates/s). You may edit Codingchancer's `tracking.py` and `tests/test_realtime.py` for this task; keep the results within the `GuideStabilizer` tolerances and check `live_check.py`.
@@ -34,6 +33,8 @@ Border rules:
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
 
 ## Done
+- [x] Every cloth colour (Jartartarta, #25): pale cloths work. Synthetic, 20 shots each: white 1 -> 10, light grey 2 -> 15, beige 0 -> 15, sky 6 -> 11; other colours unchanged, blue stress 286/300. Real beige frame now picks the right cue ball. Left: on white cloth the cue centre can be 4-6 px off and some stripes are missed; not tried on a live white table.
+- [ ] (follow-up) White cloth precision: cue-ball centre and striped balls on pure white tables; check on a live white table.
 - [x] Guide follows a turning stick (Jartartarta, #24, one-off in Codingchancer's `overlay.py`): the stabilizer draws every frame while the aim keeps turning one way (sweep simulation, slow aiming: 0.20 -> 0.06 deg behind). Faster turning: ~one analysis' delay left.
 - [x] Stick crossing balls (Jartartarta, #23, one-off in Codingchancer's `tracking.py`): a thin stripe of change across a ball is the stick, so tracking carries on instead of a full detection per frame.
 - [x] Window capture + analysis in its own process (Codingchancer, #21; merged by Jartartarta after checks: tests, stress 286/300, live 8/8).
