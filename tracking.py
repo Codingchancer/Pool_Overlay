@@ -26,6 +26,12 @@ class ShotTracker:
     INNER = .7
     CHANGE_LEVEL = 40
     CHANGED_SHARE = .35
+    # Above this share the ball moved, whatever the shape of the change.
+    MOVED_SHARE = .8
+    # A change whose spread across its own length is at most this share of
+    # the inner radius is a thin stripe: the cue stick (up to ~0.8 ball radii
+    # wide) crossing the ball.
+    STRIPE_SPREAD = .36
     # A full detection now and then catches what the per-ball check cannot see
     # (a ball appearing where there was none, e.g. a respot).
     REFRESH_SECONDS = 3.0
@@ -82,8 +88,25 @@ class ShotTracker:
         then_patch = self.reference[y0:y1, x0:x1].astype(np.int16)
         yy, xx = np.mgrid[y0:y1, x0:x1]
         disc = (xx - x) ** 2 + (yy - y) ** 2 <= inner * inner
-        change = np.abs(now_patch - then_patch).max(axis=2)[disc]
-        return change.size > 0 and float(np.mean(change > self.CHANGE_LEVEL)) < self.CHANGED_SHARE
+        changed = (np.abs(now_patch - then_patch).max(axis=2) > self.CHANGE_LEVEL) & disc
+        area = int(disc.sum())
+        if area == 0:
+            return False
+        share = float(changed.sum()) / area
+        if share < self.CHANGED_SHARE:
+            return True
+        if share >= self.MOVED_SHARE:
+            return False
+        # While aiming, the cue stick passes over balls: the change is then a
+        # thin straight stripe across the disc. A ball that moved changes
+        # most of it, or a crescent that is not thin. Without this, every
+        # frame with the stick over a ball fell back to a full detection.
+        ys, xs = np.nonzero(changed)
+        if len(xs) < 3:
+            return True
+        cov = np.cov(np.vstack([xs, ys]).astype(np.float64))
+        thinnest = float(np.sqrt(max(0.0, np.linalg.eigvalsh(cov)[0])))
+        return thinnest <= inner * self.STRIPE_SPREAD
 
     def _track(self, frame: np.ndarray) -> Detection:
         base = self.base
