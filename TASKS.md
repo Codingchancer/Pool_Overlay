@@ -21,6 +21,7 @@ Border rules:
 | Task | Area | Who | Branch |
 |---|---|---|---|
 | Smoother guide: faster detection per frame (same results) | detector | Jartartarta | `jartartarta/faster` |
+| Window capture + analysis in its own process (IDEAS.md ideas 1 and 3; overlay files only) | overlay | Codingchancer | `codingchancer/window-capture` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Power needed for a shot:** record ~20-30 real shots (slider % at release + where the balls stop) to fit Miniclip's friction and the %-to-speed scale per cue; then compute the minimum power to pot and add it to `Detection` for Codingchancer to mark on the slider. Also confirm the slider reading on a mid-drag and a full-power frame.
