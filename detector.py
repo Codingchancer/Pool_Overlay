@@ -58,18 +58,19 @@ class Detection:
 
 
 def white_guide_mask(roi: np.ndarray, balls: list[tuple[int, int, int, str]],
-                     ball_scale: float = 1.18) -> np.ndarray:
+                     ball_scale: float = 1.18, hsv: np.ndarray | None = None) -> np.ndarray:
     """Pixels of Miniclip's white guide graphics, with ball faces removed.
 
     Miniclip draws its aim ray, ghost-ball reticle, object-ball line and
     cue-deflection line in near-white. Ball faces (cue ball, stripes, number
     badges) are white too, so they are masked out.
     """
-    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    if hsv is None:
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     # Measured on both bundled frames: guide strokes have saturation <= ~60,
     # while even the brightly lit, washed-out felt centre stays >= ~95. The
     # older <= 115 limit let pale felt inside the hollow reticle through.
-    mask = np.where((hsv[:, :, 2] >= 165) & (hsv[:, :, 1] <= 70), 255, 0).astype(np.uint8)
+    mask = cv2.inRange(hsv, (0, 0, 165), (255, 70, 255))
     for bx, by, br, _ in balls:
         cv2.circle(mask, (int(bx), int(by)), int(br * ball_scale), 0, thickness=-1)
     return mask
@@ -128,7 +129,7 @@ def find_ghost_ball(white: np.ndarray, cue: tuple[int, int, int], direction: tup
     if x1 - x0 < 8 or y1 - y0 < 8:
         return None
     crop = white[y0:y1, x0:x1].astype(np.float32) / 255.0
-    yy, xx = np.mgrid[y0:y1, x0:x1]
+    yy, xx = np.ogrid[y0:y1, x0:x1]
     if direction is None:
         dist = np.hypot(xx - cx, yy - cy)
         corridor = (dist >= cr * 1.6) & (dist <= radius * 5)
@@ -937,10 +938,11 @@ def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
     # All balls share one size; use the robust median rather than each circle's
     # slightly noisy Hough radius.
     ball_r = float(np.median([br for _, _, br, _ in balls])) if balls else float(cr)
-    white = white_guide_mask(roi, balls_local)
+    roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    white = white_guide_mask(roi, balls_local, hsv=roi_hsv)
     # The reticle ring touches the struck ball, so mask only the ball faces
     # here; the wider mask above would erase the ring's near side.
-    ghost_mask = white_guide_mask(roi, balls_local, ball_scale=.9)
+    ghost_mask = white_guide_mask(roi, balls_local, ball_scale=.9, hsv=roi_hsv)
     # Of the candidate ray directions, the real one ends in the ghost ball.
     direction, ghost = None, None
     for candidate in aim_candidates(roi, cue_local, balls_local):
@@ -1307,6 +1309,12 @@ def grey_cloth_mask(hsv: np.ndarray) -> np.ndarray:
 
 def hue_near(hue: np.ndarray, centre: float, below: float, above: float) -> np.ndarray:
     """Boolean mask: ``hue`` within [centre - below, centre + above], circularly."""
+    if hue.dtype == np.uint8:
+        # Same test through a 256-entry table (an 8-bit hue has few values);
+        # converting whole frames to float was the slowest step of detect.
+        values = (np.arange(256, dtype=np.float32) - centre + 90) % 180 - 90
+        table = ((values >= -below) & (values <= above)).astype(np.uint8)
+        return cv2.LUT(hue, table).astype(bool)
     delta = (hue.astype(np.float32) - centre + 90) % 180 - 90
     return (delta >= -below) & (delta <= above)
 
@@ -1738,7 +1746,7 @@ def has_number_badge(patch_hsv: np.ndarray, xx, yy, cx: float, cy: float, r: flo
     return float(middle.mean()) >= .5 and float(outside.mean()) <= .08
 
 
-def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int):
+def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared: dict | None = None):
     """Ball circles in the table ROI: (x, y, r, sat, val, white_fraction, red_spot).
 
     Candidates come from circle finding on grey levels and on colour distance
@@ -1758,6 +1766,9 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int):
     felt_lab = _felt_lab(roi, roi_hsv) if grey else None
     lab_weights = np.array([.5, 1.0, 1.0], np.float32)
     distance = felt_distance_image(roi, roi_hsv, as_float=True)
+    if shared is not None:
+        # detect() needs the same image again for the cue-stick filter.
+        shared["distance"] = distance
     # Colour-distance edges of a blue ball on blue cloth are weaker than grey
     # edges of other balls, hence the lower Canny threshold for that image.
     sources = ((cv2.medianBlur(np.clip(distance * 3, 0, 255).astype(np.uint8), 5), 60), (gray, 100))
@@ -2023,7 +2034,8 @@ def detect(frame: np.ndarray) -> Detection:
     balls: list[tuple[int, int, int, str]] = []
     cue_candidates: list[tuple[int, int, int, float, float, float, float]] = []
     rim_open: dict[tuple[int, int], float] = {}
-    for cx, cy, r, sat, val, white_fraction, red_spot, open_rim in find_balls(roi, gray, min_r, max_r):
+    shared: dict = {}
+    for cx, cy, r, sat, val, white_fraction, red_spot, open_rim in find_balls(roi, gray, min_r, max_r, shared):
         ball = (x + cx, y + cy, r)
         rim_open[(x + cx, y + cy)] = open_rim
         # Keep every detection eligible as an object ball until the actual
@@ -2105,7 +2117,9 @@ def detect(frame: np.ndarray) -> Detection:
             local_balls = [(bx-x, by-y, br, kind) for bx, by, br, kind in balls]
             aim = aim_direction(roi, (cue_position[0]-x, cue_position[1]-y, cue_position[2]), local_balls)
             if aim:
-                distance = felt_distance_image(roi, cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), as_float=True)
+                distance = shared.get("distance")
+                if distance is None:
+                    distance = felt_distance_image(roi, cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), as_float=True)
                 balls = separate_cue_stick_detections(balls, cue_position, aim, rim_open,
                                                       distance=distance, offset=(x, y))
             # Exactly one ball is the cue ball; other white/striped detections
@@ -2125,7 +2139,8 @@ def detect(frame: np.ndarray) -> Detection:
             # rings along the real aim and predict again.
             filtered = separate_cue_stick_detections(
                 balls, cue[:3], aim_now, rim_open,
-                distance=felt_distance_image(roi, cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), as_float=True),
+                distance=shared.get("distance") if shared.get("distance") is not None
+                else felt_distance_image(roi, cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), as_float=True),
                 offset=(x, y))
             if len(filtered) != len(balls):
                 balls = filtered
