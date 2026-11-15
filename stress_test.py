@@ -195,6 +195,10 @@ def evaluate(seed: int, kind: str | None = None, cloth: str | int = "blue"):
     else:
         if d.target is not None:
             problems.append(f"target: reported {d.target[:2]} but the aim hits no ball")
+    # Stick pull-back (raw measure for shot power): reported, not a pass/fail
+    # check yet; the watermark under the stick can still cut it short.
+    if d.cue is not None and getattr(d, "stick_pull", None) is not None:
+        stats["stick_pull"] = abs(d.stick_pull - (scene.stick_pull + fg.STICK_REST))
     # Pot or miss: only judged when the truth is clear of a decision boundary
     # by a quarter radius (a pixel of angle error can flip a near-jaw call).
     target_found = (truth.target is not None and d.target is not None and
@@ -266,7 +270,7 @@ def main_cli():
     parser.add_argument("--count", type=int, default=200)
     parser.add_argument("--start", type=int, default=0)
     parser.add_argument("--kind")
-    parser.add_argument("--cloth", default="blue", help="cloth colour: " + ", ".join(fg.CLOTH_HUES))
+    parser.add_argument("--cloth", default="blue", help="cloth colour: " + ", ".join(fg.CLOTH_HUES) + ", black")
     parser.add_argument("--save-failures")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()

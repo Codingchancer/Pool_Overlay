@@ -35,6 +35,18 @@ class Detection:
     # centre in frame pixels.
     pot: str | None = None
     pot_pocket: tuple[int, int] | None = None
+    # How far the cue stick is pulled back: the gap from the cue ball's rim
+    # to the stick's tip, in ball radii (None when no stick lies behind the
+    # cue ball). It grows as the player drags the power bar; turning it into
+    # a power percentage needs measurements from the real game.
+    stick_pull: float | None = None
+    # Miniclip's power slider left of the table, when the capture includes
+    # it: its outer rectangle (x, y, w, h) in frame pixels, and the power set
+    # on it in percent: 0 with the cue at rest, 100 with the cue's top at the
+    # slot's bottom. That 100 is Miniclip's full power, and that power grows
+    # evenly along the slot, still has to be checked on real frames.
+    power_slider: tuple[int, int, int, int] | None = None
+    power_percent: float | None = None
     note: str = "Guide is off"
 
 
@@ -685,8 +697,116 @@ def collision_paths(cue: tuple[int, int, int], target: tuple[int, int, int],
     return approach, cue_path, object_path, (int(bx), int(by), int(br))
 
 
+# Weighted Lab distance (lightness halved, as in ``felt_distance_image``) at
+# which a pixel on the stick's line no longer looks like the cloth beside it.
+STICK_CONTRAST = 10.0
+
+
+def stick_pull(roi: np.ndarray, cue_local: tuple[float, float], aim: tuple[float, float],
+               radius: float) -> float | None:
+    """Gap from the cue ball's rim to the cue stick's tip, in ball radii.
+
+    Samples only the line behind the cue ball (opposite the aim) and two
+    lines 1.4 radii to either side of it, so each spot is compared with the
+    cloth right beside it (lighting and cloth colour do not matter). The tip
+    is where the line stops looking like cloth and keeps differing for four
+    radii (a stick is long; a ball or shadow is not). None when there is no
+    stick there, e.g. on the opponent's turn.
+    """
+    if aim is None or radius <= 0:
+        return None
+    cx, cy = cue_local
+    ux, uy = aim
+    norm = float(np.hypot(ux, uy))
+    if norm < 1e-6:
+        return None
+    ux, uy = ux / norm, uy / norm
+    height, width = roi.shape[:2]
+    # Start just outside the cue ball's shadow-darkened rim.
+    steps = np.arange(radius * 1.12, radius * 16, .5, dtype=np.float32)
+    side = radius * 1.4
+    xs = cx - ux * steps
+    ys = cy - uy * steps
+    points = [(xs, ys), (xs - uy * side, ys + ux * side), (xs + uy * side, ys - ux * side)]
+    valid = [(px >= 0) & (px <= width - 1) & (py >= 0) & (py <= height - 1) for px, py in points]
+    # The line can run off the table (the stick crosses the cushion); only
+    # the part on the cloth is used.
+    count = int(np.argmin(valid[0])) if not valid[0].all() else len(steps)
+    if count < 8:
+        return None
+    lab = []
+    for px, py in points:
+        mapx = np.clip(px[:count], 0, width - 1).reshape(1, -1).astype(np.float32)
+        mapy = np.clip(py[:count], 0, height - 1).reshape(1, -1).astype(np.float32)
+        sampled = cv2.remap(roi, mapx, mapy, cv2.INTER_LINEAR)
+        lab.append(cv2.cvtColor(sampled, cv2.COLOR_BGR2LAB)[0].astype(np.float32))
+    weights = np.array([.5, 1.0, 1.0], np.float32)
+
+    def apart(a, b):
+        return np.sqrt((((a - b) * weights) ** 2).sum(axis=1))
+
+    # A ball beside the line spoils one side; the other side is cloth. A
+    # side off the table does not count.
+    far = np.float32(1e6)
+    left = np.where(valid[1][:count], apart(lab[0], lab[1]), far)
+    right = np.where(valid[2][:count], apart(lab[0], lab[2]), far)
+    contrast = np.minimum(left, right)
+    usable = contrast < far
+    # Two limits: a firm one where the tip starts, a lower one to follow a
+    # dark stick whose colour comes close to the cloth's.
+    on = (contrast > STICK_CONTRAST) & usable
+    along = (contrast > STICK_CONTRAST * .6) & usable
+    full = int(round(radius * 4 / .5))
+    least = int(round(radius * 1.5 / .5))
+    solid = max(2, int(round(radius / .5)))
+    tip_index = None
+    for i in np.nonzero(on)[0]:
+        # The stick keeps going for four radii, or until the line leaves the
+        # table (at least 1.5 radii of it on the cloth).
+        stretch = along[i:i + full]
+        if len(stretch) < least or stretch.mean() < .85:
+            continue
+        # The tip starts a solid stretch: the cue ball's drop shadow is a
+        # short dark patch with cloth after it.
+        if on[i:i + solid].mean() < .9 and not along[i:i + least].all():
+            continue
+        if len(stretch) < full and i + full <= count:
+            continue
+        tip_index = int(i)
+        break
+    if tip_index is None:
+        return None
+    i = tip_index
+    if i == 0:
+        # Already stick at the first sample: the tip touches the cue ball.
+        return float(steps[0] / radius - 1)
+    # Sub-sample tip: where the contrast crosses halfway between the cloth
+    # just before it and the stick just after.
+    level = (float(contrast[i - 1]) + float(np.median(contrast[i:i + full]))) / 2
+    a, b = float(contrast[i - 1]), float(contrast[i])
+    frac = 0.0 if b <= a else float(np.clip((level - a) / (b - a), 0, 1))
+    tip = float(steps[i - 1] + .5 * frac)
+    return tip / radius - 1
+
+
 def predict_shot(roi: np.ndarray, table: tuple[int, int, int, int],
                  balls: list[tuple[int, int, int, str]], cue: tuple[int, int, int]) -> dict:
+    """Follow the game's aim graphics and estimate cue/object paths.
+
+    Returns a dict with aim/cue/object segments, target, ghost, blockers,
+    pot call, stick pull and a note. All coordinates are in frame pixels (the
+    same frame ``table`` is in).
+    """
+    shot = _predict_paths(roi, table, balls, cue)
+    pull = None
+    if shot.get("aim_dir") is not None:
+        ball_r = float(np.median([br for _, _, br, _ in balls])) if balls else float(cue[2])
+        pull = stick_pull(roi, (cue[0] - table[0], cue[1] - table[1]), shot["aim_dir"], ball_r)
+    return {**shot, "stick_pull": pull}
+
+
+def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
+                   balls: list[tuple[int, int, int, str]], cue: tuple[int, int, int]) -> dict:
     """Follow the game's aim graphics and estimate cue/object paths.
 
     Returns a dict with aim/cue/object segments, target, ghost, blockers and a
@@ -984,6 +1104,9 @@ POCKET_TO_CUSHION = .0095
 # Pocket mouths are near-black; dark UI panels and navy side panels sit at
 # brightness 32-60 and must not merge into the pocket blobs.
 POCKET_DARKNESS = 45
+# On a black cloth (brightness ~12 at the rails) the pocket's black core
+# (0-5) is still darker; this limit separates them.
+GREY_POCKET_DARKNESS = 8
 
 
 # Miniclip's default cloth is blue (OpenCV hue ~98), but tables come in green,
@@ -1011,6 +1134,19 @@ def cloth_hue(hsv: np.ndarray, step: int = 1) -> float:
     return float((peak + (weights @ (window - peak)) / max(1.0, weights.sum())) % 180)
 
 
+def cloth_is_grey(hsv: np.ndarray, step: int = 4) -> bool:
+    """True for a cloth with no colour (black or grey tables, e.g. Lucky
+    Shot): few saturated pixels in the middle of the image."""
+    h, w = hsv.shape[:2]
+    middle = hsv[h // 4:h * 3 // 4:step, w // 4:w * 3 // 4:step]
+    return middle.size > 0 and float(np.mean(middle[:, :, 1] >= 45)) < .25
+
+
+def grey_cloth_mask(hsv: np.ndarray) -> np.ndarray:
+    """Pixels that can be a grey cloth: unsaturated, not black, not bright."""
+    return (hsv[:, :, 1] < 50) & (hsv[:, :, 2] >= 8) & (hsv[:, :, 2] <= 140)
+
+
 def hue_near(hue: np.ndarray, centre: float, below: float, above: float) -> np.ndarray:
     """Boolean mask: ``hue`` within [centre - below, centre + above], circularly."""
     delta = (hue.astype(np.float32) - centre + 90) % 180 - 90
@@ -1030,10 +1166,14 @@ def table_from_pockets(frame: np.ndarray) -> tuple[int, int, int, int] | None:
     real ones). The pockets are symmetric and unambiguous.
     """
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    dark = (hsv[:, :, 2] < POCKET_DARKNESS).astype(np.uint8)
+    grey = cloth_is_grey(hsv)
+    dark = (hsv[:, :, 2] < (GREY_POCKET_DARKNESS if grey else POCKET_DARKNESS)).astype(np.uint8)
     hue = cloth_hue(hsv, step=4)
-    felt_like = (hue_near(hsv[:, :, 0], hue, 23, 27) & (hsv[:, :, 1] >= 45)
-                 & (hsv[:, :, 2] >= 65)).astype(np.uint8)
+    if grey:
+        felt_like = grey_cloth_mask(hsv).astype(np.uint8)
+    else:
+        felt_like = (hue_near(hsv[:, :, 0], hue, 23, 27) & (hsv[:, :, 1] >= 45)
+                     & (hsv[:, :, 2] >= 65)).astype(np.uint8)
     count, _, stats, centres = cv2.connectedComponentsWithStats(dark, connectivity=8)
     blobs = []
     for i in range(1, count):
@@ -1082,7 +1222,8 @@ def table_from_pockets(frame: np.ndarray) -> tuple[int, int, int, int] | None:
     y0, y1 = (a[1] + b[1]) / 2 + inset, (c[1] + d[1]) / 2 - inset
     inner = hsv[int(y0 + (y1 - y0) * .25):int(y1 - (y1 - y0) * .25),
                 int(x0 + (x1 - x0) * .25):int(x1 - (x1 - x0) * .25)]
-    felt = hue_near(inner[:, :, 0], hue, 23, 27) & (inner[:, :, 1] >= 45)
+    felt = (grey_cloth_mask(inner) if grey
+            else hue_near(inner[:, :, 0], hue, 23, 27) & (inner[:, :, 1] >= 45))
     if inner.size == 0 or float(felt.mean()) < .5:
         return None
     return int(round(x0)), int(round(y0)), int(round(x1 - x0)), int(round(y1 - y0))
@@ -1108,6 +1249,14 @@ def refine_table_edges(frame: np.ndarray, table: tuple[int, int, int, int]) -> t
         i = int(np.argmax(drops))
         if drops[i] < 15:
             return None
+        # The nose is the innermost strong drop: a chrome rail outside a
+        # dark cushion bevel (black Lucky Shot table) drops first, and more.
+        strong = np.nonzero(drops >= max(15.0, drops[i] * .5))[0]
+        last = int(strong[-1])
+        # Step to that drop's own peak (the edge can span two samples).
+        while last + 1 < len(drops) and drops[last + 1] > drops[last]:
+            last += 1
+        i = last
         offset = 0.0
         if 0 < i < len(drops) - 1:
             a, b, c = drops[i - 1], drops[i], drops[i + 1]
@@ -1164,8 +1313,11 @@ def find_table_bounds(frame: np.ndarray) -> tuple[int, int, int, int] | None:
     # the full desktop. The felt is less saturated than the cushions. A broad
     # threshold merges both and makes the fitted guide too tall.
     hue = cloth_hue(hsv, step=4)
-    band = (hue_near(hsv[:, :, 0], hue, 23, 27) & (hsv[:, :, 1] >= 45) & (hsv[:, :, 1] <= 190)
-            & (hsv[:, :, 2] >= 65))
+    if cloth_is_grey(hsv):
+        band = grey_cloth_mask(hsv)
+    else:
+        band = (hue_near(hsv[:, :, 0], hue, 23, 27) & (hsv[:, :, 1] >= 45) & (hsv[:, :, 1] <= 190)
+                & (hsv[:, :, 2] >= 65))
     # On a red or brown table the wooden rail falls in the same hue band;
     # keep only pixels close to the cloth's own colour.
     lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB).astype(np.float32)
@@ -1217,9 +1369,12 @@ def _felt_lab(roi: np.ndarray, roi_hsv: np.ndarray | None = None) -> np.ndarray:
     if roi_hsv is None:
         roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
-    centre = cloth_hue(roi_hsv, step=2)
-    cloth = (hue_near(roi_hsv[:, :, 0], centre, 18, 17) & (roi_hsv[:, :, 1] >= 50)
-             & (roi_hsv[:, :, 1] <= 235)).astype(np.uint8)
+    if cloth_is_grey(roi_hsv, step=2):
+        cloth = (grey_cloth_mask(roi_hsv) & (roi_hsv[:, :, 2] <= 110)).astype(np.uint8)
+    else:
+        centre = cloth_hue(roi_hsv, step=2)
+        cloth = (hue_near(roi_hsv[:, :, 0], centre, 18, 17) & (roi_hsv[:, :, 1] >= 50)
+                 & (roi_hsv[:, :, 1] <= 235)).astype(np.uint8)
     if cv2.countNonZero(cloth) <= 100:
         cloth = None
     # Exact median of 8-bit values from each channel's histogram (much faster
@@ -1356,6 +1511,11 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int):
     th, tw = roi.shape[:2]
     roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     felt_hue, felt_sat = felt_reference(roi_hsv)
+    # A grey or black cloth has no hue to compare; judge it by Lab colour.
+    grey = cloth_is_grey(roi_hsv, step=2)
+    roi_lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32) if grey else None
+    felt_lab = _felt_lab(roi, roi_hsv) if grey else None
+    lab_weights = np.array([.5, 1.0, 1.0], np.float32)
     distance = felt_distance_image(roi, roi_hsv, as_float=True)
     # Colour-distance edges of a blue ball on blue cloth are weaker than grey
     # edges of other balls, hence the lower Canny threshold for that image.
@@ -1378,6 +1538,25 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int):
             # The colour-distance proposal comes first and wins duplicates.
             if all((cx - px) ** 2 + (cy - py) ** 2 > (min_r * .6) ** 2 for px, py, _ in proposals):
                 proposals.append((cx, cy, r))
+    # A ball the same colour as the cloth (the black 8 on a black table) has
+    # no edge for circle finding, but its white number badge (a disc ~0.45
+    # radii) stands out. Propose a ball on each such disc; the checks below
+    # (and has_number_badge) decide whether it is one.
+    typical = float(np.median([p[2] for p in proposals])) if proposals else (min_r + max_r) / 2
+    from_badge: set[tuple[int, int]] = set()
+    white = ((roi_hsv[:, :, 1] < 90) & (roi_hsv[:, :, 2] > 150)).astype(np.uint8)
+    count, _, stats, centres = cv2.connectedComponentsWithStats(white, connectivity=8)
+    badge_area = np.pi * (typical * .45) ** 2
+    for i in range(1, count):
+        bx, by, bw, bh, area = stats[i]
+        if not (.45 * badge_area <= area <= 1.6 * badge_area):
+            continue
+        if not (.7 <= bw / max(1, bh) <= 1.43) or area < .55 * bw * bh:
+            continue
+        cx, cy = int(round(centres[i][0])), int(round(centres[i][1]))
+        if all((cx - px) ** 2 + (cy - py) ** 2 > (min_r * .6) ** 2 for px, py, _ in proposals):
+            proposals.append((cx, cy, int(round(typical))))
+            from_badge.add((cx, cy))
     # Pocket centres lie just outside the cushion noses (corners ~1 inset,
     # middles ~2 insets beyond the rail line).
     inset = POCKET_TO_CUSHION * tw
@@ -1414,8 +1593,23 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int):
                                 if len(ring_cloth) >= 12 else (felt_hue, felt_sat))
         cloth_inside = ((np.abs(hue_delta(inner[:, 0], local_hue)) <= 7) & (np.abs(inner[:, 1] - local_sat) <= 35)
                         & (inner[:, 2] >= 50))
+        if grey:
+            lab_patch = roi_lab[y0:y1, x0:x1]
+            ring_lab = lab_patch[(dist2 >= (r * 1.35) ** 2) & (dist2 <= (r * 1.8) ** 2)]
+            near_cloth = ring_lab[np.sqrt(((ring_lab - felt_lab) * lab_weights) ** 2).sum(axis=1) < 25]                 if len(ring_lab) else ring_lab
+            local = np.median(near_cloth, axis=0) if len(near_cloth) >= 12 else felt_lab
+            inner_lab = lab_patch[dist2 <= (r * .62) ** 2]
+            cloth_inside = np.sqrt((((inner_lab - local) * lab_weights) ** 2).sum(axis=1)) < 10
         cloth_fraction = float(np.mean(cloth_inside))
         centre = patch[dist2 <= (r * .4) ** 2]
+        # A badge-only proposal stands for a ball that looks like cloth; a
+        # light-centred disc that is not cloth-coloured (a metal joint on the
+        # cue stick) would have been found by circle finding if it were a ball.
+        if (cx, cy) in from_badge:
+            # Judge the ball's own colour around the badge (white excluded).
+            body = ~((inner[:, 1] < 90) & (inner[:, 2] > 150))
+            if not body.any() or float(np.mean(cloth_inside[body])) <= .25:
+                continue
         if cloth_fraction > .35:
             # A solid ball the same colour as the cloth (purple 4 on a purple
             # table, red 3 on red) looks like cloth inside, but its white
@@ -1448,6 +1642,101 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int):
     return [(cx, cy, r, *rest, rim_open_fraction(smooth, cx, cy, r)) for _, cx, cy, r, *rest in kept]
 
 
+# Power slider, measured on a real frame (table 1136x568 px): a grey-framed
+# slot 0.052 table widths wide and 0.79 table heights tall, centred 0.183
+# table widths left of the table and level with it. At rest the cue's shaft
+# (below the white tip and dark ferrule) starts SLIDER_REST of the slot
+# height from its top; the slot's inside ends at SLIDER_END.
+SLIDER_REST = .098
+SLIDER_END = .965
+
+
+def find_power_slider(frame: np.ndarray, table: tuple[int, int, int, int]) -> tuple[int, int, int, int] | None:
+    """Outer rectangle of Miniclip's power slider left of the table, or None."""
+    left, top, width, height = table
+    if left < width * .1:
+        return None
+    region = frame[:, :left]
+    hsv = cv2.cvtColor(region, cv2.COLOR_BGR2HSV)
+    # The slot's grey frame: unsaturated, mid-bright.
+    mask = ((hsv[:, :, 1] < 80) & (hsv[:, :, 2] >= 90) & (hsv[:, :, 2] <= 190)).astype(np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((9, 1), np.uint8))
+    count, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    candidates = []
+    for i in range(1, count):
+        x, y, w, h, area = stats[i]
+        if not (.55 * height <= h <= 1.05 * height and .025 * width <= w <= .09 * width and h >= 5 * w):
+            continue
+        # A framed slot, not a thin edge line (the real frame fills ~17% of
+        # its box, a rail edge ~5%).
+        if area < .1 * w * h:
+            continue
+        if abs(y + h / 2 - (top + height / 2)) > height * .2:
+            continue
+        candidates.append((int(x), int(y), int(w), int(h)))
+    # Closest to the table first (other tall icons sit further left); it must
+    # hold the cue, or be an empty dark slot (cue dragged all the way down).
+    for rect in sorted(candidates, key=lambda r: -r[0]):
+        if _slider_shaft_top(frame, rect) is not None or _slider_empty(frame, rect):
+            return rect
+    return None
+
+
+def _slider_empty(frame: np.ndarray, slider: tuple[int, int, int, int]) -> bool:
+    """True when the slot's middle is dark from top to bottom (no cue showing)."""
+    x, y, w, h = slider
+    centre = x + w / 2
+    half = max(2, int(round(w * .06)))
+    strip = frame[int(y + h * .06):int(y + h * .94), int(centre - half):int(centre + half) + 1]
+    if strip.size == 0:
+        return False
+    value = np.median(cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)[:, :, 2], axis=1)
+    return bool(np.mean(value < 110) > .95)
+
+
+def _slider_shaft_top(frame: np.ndarray, slider: tuple[int, int, int, int]) -> float | None:
+    """Row (fraction of the slot height from its top) where the cue's shaft starts."""
+    x, y, w, h = slider
+    centre = x + w / 2
+    half = max(2, int(round(w * .06)))
+    strip = frame[y:y + h, int(centre - half):int(centre + half) + 1]
+    if strip.size == 0:
+        return None
+    hsv = cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)
+    row = np.median(hsv, axis=1)
+    shaft = (row[:, 0] >= 5) & (row[:, 0] <= 25) & (row[:, 1] >= 70) & (row[:, 1] <= 190) & (row[:, 2] >= 170)
+    # The shaft runs down to the slot's bottom (clipped there); take the run
+    # that reaches lowest, allowing a few odd rows (segment marks).
+    ys = np.nonzero(shaft)[0]
+    if ys.size < h * .03:
+        return None
+    bottom = ys[-1]
+    if bottom < h * .8:
+        return None
+    filled = shaft.copy()
+    gap_ok = max(2, int(round(h * .01)))
+    top_row = bottom
+    misses = 0
+    for r in range(bottom, -1, -1):
+        if filled[r]:
+            top_row, misses = r, 0
+        else:
+            misses += 1
+            if misses > gap_ok:
+                break
+    return top_row / h
+
+
+def read_power_slider(frame: np.ndarray, slider: tuple[int, int, int, int] | None) -> float | None:
+    """Power set on the slider in percent: 0 at rest, 100 at the bottom."""
+    if slider is None:
+        return None
+    shaft = _slider_shaft_top(frame, slider)
+    if shaft is None:
+        return 100.0 if _slider_empty(frame, slider) else None
+    return float(np.clip((shaft - SLIDER_REST) / (SLIDER_END - SLIDER_REST), 0.0, 1.0)) * 100
+
+
 def detect(frame: np.ndarray) -> Detection:
     """Find the Miniclip felt, ball centers, and current game aim ray."""
     h, w = frame.shape[:2]
@@ -1455,6 +1744,7 @@ def detect(frame: np.ndarray) -> Detection:
     if table is None:
         return Detection(note="Table not found — adjust the overlay to include the full felt.")
 
+    slider = find_power_slider(frame, table)
     x, y, tw, th = table
     roi = frame[y:y + th, x:x + tw]
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -1573,9 +1863,11 @@ def detect(frame: np.ndarray) -> Detection:
                 balls = cleaned
                 shot = predict_shot(roi, table, balls, cue[:3])
         return Detection(table=table, balls=balls, cue=cue[:3], aim_segments=shot["aim"],
+                         power_slider=slider, power_percent=read_power_slider(frame, slider),
                          cue_segments=shot["cue"], object_segments=shot["object"],
                          target=shot["target"], ghost=shot["ghost"], blockers=shot["blockers"],
                          aim_dir=shot["aim_dir"], object_dir=shot["object_dir"], cue_dir=shot["cue_dir"],
-                         pot=shot["pot"], pot_pocket=shot["pot_pocket"],
+                         pot=shot["pot"], pot_pocket=shot["pot_pocket"], stick_pull=shot["stick_pull"],
                          note=f"{shot['note']} · {len(balls)} ball candidates")
-    return Detection(table=table, balls=balls, note="Table found · cue ball not confidently identified")
+    return Detection(table=table, balls=balls, power_slider=slider, power_percent=read_power_slider(frame, slider),
+                     note="Table found · cue ball not confidently identified")

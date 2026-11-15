@@ -263,6 +263,110 @@ class PotTests(unittest.TestCase):
         self.assertLessEqual(wrong, 1)
 
 
+class StickPullTests(unittest.TestCase):
+    def test_stick_pull_matches_the_truth(self):
+        errors, missing = [], 0
+        for seed in range(9000, 9040):
+            scene = fg.random_scene(seed)
+            frame, _ = fg.render(scene)
+            d = main.detect(frame)
+            if d.cue is None or d.aim_dir is None:
+                continue
+            if d.stick_pull is None:
+                missing += 1
+                continue
+            errors.append(abs(d.stick_pull - (scene.stick_pull + fg.STICK_REST)))
+        self.assertLessEqual(missing, 6)
+        self.assertLessEqual(np.median(errors), .12)
+        self.assertLessEqual(np.percentile(errors, 90), .4)
+
+    def test_no_stick_reads_none(self):
+        from dataclasses import replace
+
+        quiet = 0
+        for seed in range(9000, 9010):
+            frame, _ = fg.render(replace(fg.random_scene(seed), show_stick=False))
+            d = main.detect(frame)
+            quiet += d.stick_pull is None
+        self.assertGreaterEqual(quiet, 9)
+
+    def test_pull_grows_with_power(self):
+        from dataclasses import replace
+
+        scene = fg.random_scene(9004)
+        readings = []
+        for pull in (0.5, 1.5, 2.5, 3.5):
+            frame, _ = fg.render(replace(scene, stick_pull=pull))
+            readings.append(main.detect(frame).stick_pull)
+        self.assertTrue(all(v is not None for v in readings), readings)
+        self.assertTrue(all(b > a for a, b in zip(readings, readings[1:])), readings)
+
+
+class PowerSliderTests(unittest.TestCase):
+    def test_slider_level_matches_the_truth(self):
+        from dataclasses import replace
+
+        good = total = 0
+        for seed in range(9000, 9016):
+            base = fg.random_scene(seed)
+            for power in (0.0, .3, .6, .9):
+                frame, _ = fg.render(replace(base, power=power))
+                percent = main.detect(frame).power_percent
+                total += 1
+                good += percent is not None and abs(percent - power * 100) <= 2
+        # A shot whose cue stick runs across the slider can spoil a reading.
+        self.assertGreaterEqual(good, total - 4)
+
+    def test_no_slider_reads_none(self):
+        for seed in range(9000, 9010):
+            frame, _ = fg.render(fg.random_scene(seed))
+            d = main.detect(frame)
+            self.assertIsNone(d.power_slider)
+            self.assertIsNone(d.power_percent)
+
+    @unittest.skipUnless((Path(__file__).resolve().parents[1] / "outputs/bad/stick-and-cushion/snip.png").exists(),
+                         "real screenshot not present")
+    def test_real_slider_at_rest(self):
+        import cv2
+
+        frame = cv2.imread(str(Path(__file__).resolve().parents[1] / "outputs/bad/stick-and-cushion/snip.png"))
+        d = main.detect(frame)
+        self.assertIsNotNone(d.power_slider)
+        self.assertLess(d.power_percent, 3)
+
+
+class BlackClothTests(unittest.TestCase):
+    """Colourless near-black cloth (Miniclip's Lucky Shot table): the table
+    used to be "not found" because pockets and cloth were judged by hue and
+    a darkness limit the cloth itself was under."""
+
+    def test_black_table_and_aim_are_found(self):
+        results = [st.evaluate(seed, None, "black") for seed in range(9000, 9016)]
+        tables = [stats.get("table", 99.0) for *_, stats in results]
+        self.assertLessEqual(sorted(tables)[-2], 2.0, tables)
+        aims = [stats["aim"] for *_, stats in results if "aim" in stats]
+        self.assertGreaterEqual(len(aims), 14)
+        self.assertLessEqual(np.median(aims), .3)
+        passed = sum(1 for *_, problems, _ in results if not problems)
+        # The black 8 ball on black cloth is the weak spot (only its white
+        # badge shows).
+        self.assertGreaterEqual(passed, 7)
+
+    @unittest.skipUnless((Path(__file__).resolve().parents[1] / "outputs/bad/lucky-shot/window.png").exists(),
+                         "real screenshot not present")
+    def test_real_lucky_shot_table(self):
+        import cv2
+
+        frame = cv2.imread(str(Path(__file__).resolve().parents[1] / "outputs/bad/lucky-shot/window.png"))
+        d = main.detect(frame)
+        self.assertIsNotNone(d.table)
+        for got, want in zip(d.table, (369, 231, 1070, 535)):
+            self.assertLessEqual(abs(got - want), 4, d.table)
+        self.assertIsNotNone(d.cue)
+        self.assertIsNotNone(d.target)
+        self.assertIsNotNone(d.ghost)
+
+
 class GameLineReaderTests(unittest.TestCase):
     def test_one_pixel_guide_thread_is_not_read_as_the_game_line(self):
         # Real frame: only a short stub of Miniclip's thick object line shows

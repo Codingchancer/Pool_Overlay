@@ -51,6 +51,9 @@ class Scene:
     aim_degrees: float
     show_guide: bool = True
     stick_pull: float = 0.0                           # extra stick gap (in radii)
+    show_stick: bool = True                           # False: opponent's turn, no stick
+    power: float | None = None                        # power slider left of the table (0..1), None: not drawn
+    cloth_black: bool = False                         # colourless near-black cloth (Lucky Shot table)
     jpeg_quality: int | None = None
     blur: float = 0.0
     letterbox: float = .07
@@ -87,6 +90,10 @@ POT_DROP_RADII = .4
 POT_JAW_RADII = .5
 # How far past the end of a leg (where it meets the cushion) a pocket counts.
 POT_REACH_RADII = 6.0
+
+
+# Gap from the cue ball's rim to the stick tip at zero pull, in radii.
+STICK_REST = 1.25 - .16 - 1.0
 
 
 def pocket_holes(table):
@@ -381,6 +388,40 @@ def draw_pocket(canvas, px, py, pr):
     fill_disc(canvas, px, py, pr * .86, (2, 2, 4))
 
 
+# Power slider as on a real frame: slot size and place relative to the table,
+# and where the cue's shaft starts at rest / where the slot's inside ends.
+SLIDER_W, SLIDER_H, SLIDER_LEFT = .052, .794, .183
+SLIDER_REST, SLIDER_END = .098, .965
+
+
+def slider_rect(table):
+    x, y, w, h = table
+    sw, sh = w * SLIDER_W, h * SLIDER_H
+    return (x - w * SLIDER_LEFT - sw / 2, y + h / 2 - sh / 2, sw, sh)
+
+
+def draw_power_slider(canvas, table, power):
+    """Grey-framed slot with a cue that slides down by ``power`` of its travel."""
+    sx, sy, sw, sh = slider_rect(table)
+    x0, y0, x1, y1 = int(round(sx)), int(round(sy)), int(round(sx + sw)), int(round(sy + sh))
+    cv2.rectangle(canvas, (x0, y0), (x1, y1), (126, 107, 108), -1)
+    border = max(2, int(round(sw * .2)))
+    inner_top, inner_bottom = y0 + border, int(round(sy + sh * SLIDER_END))
+    for row in range(inner_top, inner_bottom):
+        k = (row - inner_top) / max(1, inner_bottom - inner_top)
+        canvas[row, x0 + border:x1 - border + 1] = (20 * (1 - k) + 15 * k, 45 * (1 - k) + 15 * k, 50 * (1 - k) + 60 * k)
+    shift = power * (SLIDER_END - SLIDER_REST) * sh
+    cx, half = sx + sw / 2, sw * .09
+    parts = [(.042, .062, (227, 227, 227)), (.062, SLIDER_REST, (40, 40, 40)), (SLIDER_REST, 2.0, (113, 180, 250))]
+    for start, end, colour in parts:
+        a = sy + sh * start + shift
+        b = min(sy + sh * end + shift, sy + sh * SLIDER_END)
+        if b <= a:
+            continue
+        ya, yb = int(round(a)), int(round(b))
+        canvas[max(ya, inner_top):yb, int(round(cx - half)):int(round(cx + half)) + 1] = colour
+
+
 def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     """Draw the scene; return (BGR uint8 frame, truth)."""
     rng = np.random.default_rng(scene.seed)
@@ -398,6 +439,8 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     bar = int(H * scene.letterbox)
     canvas[:bar] = 0                                      # letterbox bars
     canvas[H - bar:] = 0
+    if scene.power is not None and slider_rect(scene.table)[0] > 0:
+        draw_power_slider(canvas, scene.table, scene.power)
     # Wooden rail.
     rail = span * .062
     rail_rect = (int(x - rail), int(y - rail), int(x + w + rail), int(y + h + rail))
@@ -412,7 +455,8 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     cushion = span * .02
     cv2.rectangle(canvas, (int(round(x - cushion)), int(round(y - cushion))),
                   (int(round(x + w + cushion)), int(round(y + h + cushion))),
-                  tuple(float(v) for v in _hsv_bgr(tint(1), 175, 205)), -1)
+                  tuple(float(v) for v in (_hsv_bgr(0, 0, 90) if scene.cloth_black
+                                           else _hsv_bgr(tint(1), 175, 205))), -1)
     for i, (px, py) in enumerate(pockets):
         pr = middle_r if i in (1, 4) else corner_r
         draw_pocket(canvas, px, py, pr)
@@ -422,6 +466,11 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     radial = np.hypot((xx - w / 2) / (w / 2), (yy - h / 2) / (h / 2))
     value = (188 - 46 * np.clip(radial, 0, 1.4) + rng.normal(0, 2.2, radial.shape)).clip(0, 255)
     saturation = (134 + 14 * np.clip(radial, 0, 1.4)).clip(0, 255)
+    if scene.cloth_black:
+        # Measured on the real Lucky Shot frame: no colour, brightness ~58 in
+        # the middle down to ~12 at the rails.
+        value = (58 - 46 * np.clip(radial, 0, 1.0) + rng.normal(0, 1.2, radial.shape)).clip(10, 255)
+        saturation = np.zeros_like(value)
     cloth = np.dstack([np.full_like(value, tint(0)), saturation, value]).astype(np.uint8)
     cloth = cv2.cvtColor(cloth, cv2.COLOR_HSV2BGR).astype(np.float32)
     x0i, y0i = int(np.floor(x)), int(np.floor(y))
@@ -436,7 +485,8 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     # Bright cushion-nose highlight just outside the cloth.
     for p0, p1 in (((x, y - 1.2), (x + w, y - 1.2)), ((x, y + h + 1.2), (x + w, y + h + 1.2)),
                    ((x - 1.2, y), (x - 1.2, y + h)), ((x + w + 1.2, y), (x + w + 1.2, y + h))):
-        stroke_line(canvas, p0, p1, 1.6, tuple(float(v) for v in _hsv_bgr(tint(0), 150, 245)))
+        stroke_line(canvas, p0, p1, 1.6, tuple(float(v) for v in (_hsv_bgr(0, 0, 120) if scene.cloth_black
+                                                                   else _hsv_bgr(tint(0), 150, 245))))
     # Re-open the pocket mouths over cushion and highlight.
     for i, (px, py) in enumerate(pockets):
         pr = middle_r if i in (1, 4) else corner_r
@@ -453,8 +503,9 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     # Faint table decorations that must not become balls or aim lines:
     # a head-string line and a large watermark ring with lettering.
     stroke_line(canvas, (x + w / 4, y + 2), (x + w / 4, y + h - 2), 1.4,
-                tuple(float(v) for v in _hsv_bgr(tint(0), 120, 215)), alpha=.7)
-    darker = tuple(float(v) for v in _hsv_bgr(tint(3), 165, 140))
+                tuple(float(v) for v in (_hsv_bgr(0, 0, 70) if scene.cloth_black
+                                         else _hsv_bgr(tint(0), 120, 215))), alpha=.7)
+    darker = tuple(float(v) for v in (_hsv_bgr(0, 0, 32) if scene.cloth_black else _hsv_bgr(tint(3), 165, 140)))
     stroke_ring(canvas, x + w * .55, y + h * .52, r * 3.2, r * .45, darker)
     cv2.putText(canvas, "PRACTICE", (int(x + w * .36), int(y + h * .6)), cv2.FONT_HERSHEY_DUPLEX,
                 r / 9, darker, max(2, int(r / 3)), cv2.LINE_AA)
@@ -466,27 +517,30 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
     truth = solve_truth(scene)
     a = np.radians(scene.aim_degrees)
     ux, uy = float(np.cos(a)), float(np.sin(a))
-    # Cue stick behind the cue ball, with decorative rings and joints.
-    start = r * (1.25 + scene.stick_pull)
-    length = span * .52
-    steps = 48
-    for k in range(steps):
-        t0 = start + length * k / steps
-        t1 = start + length * (k + 1) / steps
-        width = r * (.32 + .45 * k / steps)
-        colour = (235, 235, 230) if k == 0 else ((70, 80, 40) if k % 9 < 6 else (160, 90, 30))
-        stroke_line(canvas, (cx - ux * t0, cy - uy * t0), (cx - ux * t1, cy - uy * t1), width, colour)
-    for frac in (.18, .31, .62, .78):
-        t = start + length * frac
-        stroke_ring(canvas, cx - ux * t, cy - uy * t, r * .42, r * .12, (200, 205, 200))
-    # Round metal joints on the shaft, about 0.8 ball radii, like the real
-    # stick's decorations (the real frame has one the detector saw as a ball).
-    for frac in (.1, .45):
-        t = start + length * frac
-        jx, jy = cx - ux * t, cy - uy * t
-        fill_disc(canvas, jx, jy, r * .8, (95, 100, 95))
-        stroke_ring(canvas, jx, jy, r * .62, r * .14, (40, 45, 40))
-        fill_disc(canvas, jx, jy, r * .3, (190, 195, 190))
+    # Cue stick behind the cue ball, with decorative rings and joints. Its
+    # tip (round cap, half its 0.32 r width) is STICK_REST + stick_pull radii
+    # from the cue ball's rim.
+    if scene.show_stick:
+        start = r * (1.25 + scene.stick_pull)
+        length = span * .52
+        steps = 48
+        for k in range(steps):
+            t0 = start + length * k / steps
+            t1 = start + length * (k + 1) / steps
+            width = r * (.32 + .45 * k / steps)
+            colour = (235, 235, 230) if k == 0 else ((70, 80, 40) if k % 9 < 6 else (160, 90, 30))
+            stroke_line(canvas, (cx - ux * t0, cy - uy * t0), (cx - ux * t1, cy - uy * t1), width, colour)
+        for frac in (.18, .31, .62, .78):
+            t = start + length * frac
+            stroke_ring(canvas, cx - ux * t, cy - uy * t, r * .42, r * .12, (200, 205, 200))
+        # Round metal joints on the shaft, about 0.8 ball radii, like the real
+        # stick's decorations (the real frame has one the detector saw as a ball).
+        for frac in (.1, .45):
+            t = start + length * frac
+            jx, jy = cx - ux * t, cy - uy * t
+            fill_disc(canvas, jx, jy, r * .8, (95, 100, 95))
+            stroke_ring(canvas, jx, jy, r * .62, r * .14, (40, 45, 40))
+            fill_disc(canvas, jx, jy, r * .3, (190, 195, 190))
     if scene.show_guide:
         stroke = max(2.0, r * .17)
         gx, gy = truth.ghost
@@ -529,8 +583,11 @@ CLOTH_HUES = {"blue": 98, "green": 60, "red": 176, "purple": 140, "brown": 12, "
 
 
 def random_scene(seed: int, kind: str | None = None, cloth: str | int = "blue") -> Scene:
-    """Random scene; ``cloth`` is a CLOTH_HUES name or an OpenCV hue.
-    The same seed gives the same layout whatever the cloth colour."""
+    """Random scene; ``cloth`` is a CLOTH_HUES name, "black" (colourless
+    Lucky Shot cloth) or an OpenCV hue. The same seed gives the same layout
+    whatever the cloth colour."""
+    if cloth == "black":
+        return replace(_random_scene(seed, kind), cloth_black=True)
     hue = CLOTH_HUES[cloth] if isinstance(cloth, str) else int(cloth)
     return replace(_random_scene(seed, kind), cloth_hue=hue)
 
