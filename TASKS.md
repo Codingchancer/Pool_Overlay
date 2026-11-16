@@ -21,6 +21,7 @@ Border rules:
 | Task | Area | Who | Branch |
 |---|---|---|---|
 | White table cue ball + balls in tight racks | detector | Jartartarta | `jartartarta/white-and-racks` |
+| Headless 8-ball test game (`sim_game.py`, `play_test.py`) | detector tests | Jartartarta | `jartartarta/play-test` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Fast aim reader** (IDEAS.md idea 2, handed over by Codingchancer 15 Nov): read only the aim change per frame (angles within ~±2° of the last aim, ghost ball in a small box) in ~3-5 ms, with the full `predict_shot` every few frames to correct drift. Reading the aim is now the limit (16-18 updates/s). You may edit Codingchancer's `tracking.py` and `tests/test_realtime.py` for this task; keep the results within the `GuideStabilizer` tolerances and check `live_check.py`.
