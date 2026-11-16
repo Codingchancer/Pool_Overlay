@@ -11,6 +11,10 @@ For each shot:
     physics actually sent the balls;
   * rolling: the frames while the balls move go through the live path too
     (a guide drawn then would be stale: the game shows none).
+
+The cue ball's direction after contact is reported but not judged: the
+overlay draws the game's own tangent line, while the physics rolls the cue
+ball off it (follow, draw and natural roll).
 """
 from __future__ import annotations
 
@@ -55,7 +59,8 @@ def play_game(job):
     log = []
     while not game.over and len(game.shots) < max_shots:
         plan = game.plan_shot()
-        entry = {"seed": seed, "cloth": cloth, "shot": len(game.shots) + 1, "kind": plan.kind, "problems": [],
+        entry = {"seed": seed, "cloth": cloth, "shot": len(game.shots) + 1, "kind": plan.kind, "power": plan.power,
+                 "problems": [],
                  "live_errors": [], "stale_guide_frames": 0, "motion_frames": 0}
         if plan.kind != "break":
             # Aiming: the stick turns onto the shot.
@@ -144,6 +149,13 @@ def summarize(games):
         v = np.array(v)
         out.append(f"cue ball's direction after contact vs physics ({k} hit): median {np.median(v):.1f} deg, "
                    f"p90 {np.percentile(v, 90):.1f} (n={len(v)})")
+    for name, low, high in (("normal power (<= 80%)", 0, .8), ("break power (> 80%)", .8, 1.01)):
+        part = np.array([s["object_err"] for s in hit if "object_err" in s and low <= s["power"] < high])
+        called = [s for s in hit if s.get("target_found") and low <= s["power"] < high and s["pot_said"] == "pot"]
+        if len(part):
+            out.append(f"  {name}: direction within 2 deg {np.mean(part <= 2) * 100:.0f}% (n={len(part)}); "
+                       f"called pots that dropped {sum(s['pot_real'] for s in called)}/{len(called)}"
+                       + (" (the physics' steps are coarse at break speed)" if low else ""))
     pots = [s for s in hit if s.get("target_found")]
     agree = sum((s["pot_said"] == "pot") == s["pot_real"] for s in pots)
     said_pot = [s for s in pots if s["pot_said"] == "pot"]
