@@ -81,6 +81,18 @@ class SliderUnderStickTests(unittest.TestCase):
                 game.shoot(plan)
         self.assertGreater(found, 40)
 
+    def test_stick_just_below_the_slider_is_not_part_of_it(self):
+        # The stick crossed the slider's columns just below its end; the box
+        # grew over it and 93% read as 79%.
+        game = sg.SimGame(5)
+        x0, y0, w, h = game.table
+        game.balls = {3: (x0 + w * .6, y0 + h * .3)}
+        game.cue = (482.0, 770.0)
+        frame, _ = game.render_aim(sg.ShotPlan(-12.806, .9288, (0.0, 0.0), 3, None, "pot"))
+        d = detector.detect(frame)
+        self.assertIsNotNone(d.power_percent)
+        self.assertLessEqual(abs(d.power_percent - 93), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

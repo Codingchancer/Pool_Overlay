@@ -1,3 +1,4 @@
+import math
 import unittest
 
 from pool_physics import Ball, simulate_shot
@@ -94,6 +95,32 @@ class PoolPhysicsTests(unittest.TestCase):
         result = simulate_shot([Ball(0, 250, 100, 12)], (0, 0, 500, 500), -90, 1.0)
         self.assertIn(0, result.pocketed)
         self.assertTrue(result.frames[-1][0].pocketed)
+
+    def test_ball_along_the_rail_drops_into_the_corner(self):
+        # Shallow off the top rail into the top-left corner: it used to bounce
+        # off the left rail beside the mouth and stop in the jaws.
+        result = simulate_shot([Ball(0, 400, 60, 12)], (0, 0, 800, 400), -171.5, .5)
+        self.assertIn(0, result.pocketed)
+        # Rolled straight down the top rail.
+        result = simulate_shot([Ball(0, 300, 12, 12)], (0, 0, 800, 400), 180, .6)
+        self.assertIn(0, result.pocketed)
+
+    def test_rail_hit_away_from_the_pockets_still_bounces(self):
+        result = simulate_shot([Ball(0, 200, 200, 12)], (0, 0, 800, 400), -90, .5)
+        self.assertNotIn(0, result.pocketed)
+        self.assertGreaterEqual(result.cushion_collisions, 1)
+
+    def test_struck_ball_direction_is_exact_at_any_power(self):
+        # Contacts are resolved at the moment the balls touch, in sub-steps at
+        # speed: at break power the struck ball was 13 degrees off.
+        for power in (.5, .9, 1.0):
+            for offset in (-15.0, -6.5, 0.0, 4.0, 11.5):
+                balls = [Ball(0, 100, 250, 12), Ball(1, 300, 250 + offset, 12)]
+                result = simulate_shot(balls, (0, 0, 3000, 500), 0, power, max_seconds=2)
+                end = next(f[1] for f in result.frames if math.hypot(f[1].x - 300, f[1].y - 250 - offset) > 24)
+                got = math.degrees(math.atan2(end.y - 250 - offset, end.x - 300))
+                want = math.degrees(math.asin(offset / 24))
+                self.assertAlmostEqual(got, want, delta=.3, msg=f"power {power} offset {offset}")
 
     def test_simulation_is_deterministic_and_does_not_mutate_inputs(self):
         balls = [Ball(0, 100, 250, 12), Ball(1, 300, 250, 12)]

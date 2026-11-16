@@ -69,6 +69,8 @@ def simulate_shot(
     cushion_friction: float = 0.2,
     break_speed: float = 2200.0,
     collision_passes: int = 4,
+    pocket_reach: float = 2.0,
+    max_step_radii: float = .25,
 ) -> SimulationResult:
     """Simulate a shot and return 60 Hz frames and trails for visualization.
 
@@ -84,6 +86,13 @@ def simulate_shot(
     and full power hits about four times harder, enough to scatter a rack.
     ``collision_passes`` resolves ball contacts several times per step, so
     energy runs through a packed rack instead of stopping at the first ball.
+
+    A ball drops when it reaches a cushion within ``pocket_reach`` radii of a
+    pocket's mouth point (where the cushion nose meets the pocket, one radius
+    in from each wall), so balls that roll along the rail or come in at a
+    shallow angle go in, as on the drawn table (``fake_game.truth_path``).
+    While balls move fast, each ``dt`` step is split so no ball moves more
+    than ``max_step_radii`` of its radius per sub-step (break shots).
     """
     if not balls:
         return SimulationResult((), (), frozenset(), 0, 0, 0.0)
@@ -156,126 +165,173 @@ def simulate_shot(
         for px, py in candidates:
             if hypot(x - px, y - py) <= pocket_capture:
                 return True
+        # Mouth points: where the ball's centre line along each cushion meets a pocket.
+        reach = pocket_reach * r
+        for mx, my in ((left + r, top + r), ((left + right) / 2, top + r), (right - r, top + r),
+                       (left + r, bottom - r), ((left + right) / 2, bottom - r), (right - r, bottom - r)):
+            if hypot(x - mx, y - my) <= reach:
+                return True
         if crossed_x and (y < top + mouth_half_width or y > bottom - mouth_half_width):
             return True
         if crossed_y and min(abs(x - left), abs(x - (left + right) / 2), abs(x - right)) <= mouth_half_width:
             return True
         return False
 
+    def hit(i: int, j: int, nx: float, ny: float) -> bool:
+        """Impulse along the contact normal; False if the balls are separating."""
+        nonlocal first_contact, ball_hits
+        relative_normal = ((velocities[j][0] - velocities[i][0]) * nx
+                           + (velocities[j][1] - velocities[i][1]) * ny)
+        if relative_normal >= 0:
+            return False
+        if first_contact is None and i == 0:
+            first_contact = balls[j].number
+        impulse = -(1 + ball_restitution) * relative_normal * 0.5
+        velocities[i][0] -= impulse * nx
+        velocities[i][1] -= impulse * ny
+        velocities[j][0] += impulse * nx
+        velocities[j][1] += impulse * ny
+        pair = (min(balls[i].number, balls[j].number), max(balls[i].number, balls[j].number))
+        if pair not in counted_pairs:
+            counted_pairs.add(pair)
+            ball_hits += 1
+        return True
+
+    def pair_at_contact(i: int, j: int, dx: float, dy: float, distance: float, minimum: float,
+                        window: float) -> bool:
+        """An approaching pair that overlapped during the last sub-step: wind
+        both back to the moment they touched, collide them along that normal
+        and move them on for the rest of the sub-step. The normal at the
+        overlapped positions is off by up to the overlap, which bent the
+        struck ball's direction by degrees at speed."""
+        rvx = velocities[j][0] - velocities[i][0]
+        rvy = velocities[j][1] - velocities[i][1]
+        approach = dx * rvx + dy * rvy
+        speed2 = rvx * rvx + rvy * rvy
+        if approach >= 0 or speed2 < 1e-12:
+            return False
+        back = (approach + ((approach * approach - speed2 * (distance * distance - minimum * minimum)) ** .5)) / speed2
+        if not 0 <= back <= window * 1.01:
+            return False
+        ci = [positions[i][0] - velocities[i][0] * back, positions[i][1] - velocities[i][1] * back]
+        cj = [positions[j][0] - velocities[j][0] * back, positions[j][1] - velocities[j][1] * back]
+        nx, ny = cj[0] - ci[0], cj[1] - ci[1]
+        length = hypot(nx, ny)
+        if length < 1e-9 or not hit(i, j, nx / length, ny / length):
+            return False
+        for k, c in ((i, ci), (j, cj)):
+            positions[k][0] = c[0] + velocities[k][0] * back
+            positions[k][1] = c[1] + velocities[k][1] * back
+        return True
+
     for step in range(steps):
         elapsed = (step + 1) * dt
         moving = False
-        for i in range(n):
-            if pocketed[i]:
-                continue
-            vx, vy = velocities[i]
-            rx, ry = rolls[i]
-            slip_x, slip_y = vx - rx, vy - ry
-            slip = hypot(slip_x, slip_y)
-            if slip > 1e-6:
-                # Sliding: friction slows the ball along the slip and turns the
-                # slip into roll (2/7 of the slip leaves the velocity, 5/7 the spin).
-                moving = True
-                change = min(sliding_deceleration * dt, slip * 2 / 7)
-                ux, uy = slip_x / slip, slip_y / slip
-                vx -= change * ux
-                vy -= change * uy
-                if change >= slip * 2 / 7:
-                    rx, ry = vx, vy
-                else:
-                    rx += 2.5 * change * ux
-                    ry += 2.5 * change * uy
-            else:
-                speed_now = hypot(vx, vy)
-                if speed_now > 0:
-                    moving = True
-                    next_speed = max(0.0, speed_now - cloth_deceleration * dt)
-                    scale = next_speed / speed_now
-                    vx *= scale
-                    vy *= scale
-                rx, ry = vx, vy
-            velocities[i] = [vx, vy]
-            rolls[i] = [rx, ry]
-            if sides[i]:
-                sides[i] = max(0.0, abs(sides[i]) - side_spin_decay * dt) * (1 if sides[i] > 0 else -1)
-            positions[i][0] += vx * dt
-            positions[i][1] += vy * dt
-
-            x, y = positions[i]
-            r = radii[i]
-            low_x, high_x = left + r, right - r
-            low_y, high_y = top + r, bottom - r
-            crossed_x = x < low_x or x > high_x
-            crossed_y = y < low_y or y > high_y
-            if (crossed_x or crossed_y) and pocket_at_edge(i, crossed_x, crossed_y):
-                pocketed[i] = True
-                pocket_order.append(balls[i].number)
-                velocities[i] = [0.0, 0.0]
-                rolls[i] = [0.0, 0.0]
-                sides[i] = 0.0
-                continue
-            # The roll reverses with the ball at a cushion, so a rolling ball
-            # leaves it rolling. Left/right walls slip along y, top/bottom walls
-            # along x; ``sign`` is which side of the ball touches the cushion.
-            if x < low_x or x > high_x:
-                sign = 1.0 if x > high_x else -1.0
-                normal_speed = abs(velocities[i][0])
-                positions[i][0] = high_x if x > high_x else low_x
-                velocities[i][0] = -sign * normal_speed * cushion_restitution
-                rolls[i][0] = -rolls[i][0] * cushion_restitution
-                cushion_english(i, 1, sign, normal_speed)
-                rail_hits += 1
-                rail_after_contact = rail_after_contact or first_contact is not None
-            if y < low_y or y > high_y:
-                sign = -1.0 if y > high_y else 1.0
-                normal_speed = abs(velocities[i][1])
-                positions[i][1] = high_y if y > high_y else low_y
-                velocities[i][1] = sign * normal_speed * cushion_restitution
-                rolls[i][1] = -rolls[i][1] * cushion_restitution
-                cushion_english(i, 0, sign, normal_speed)
-                rail_hits += 1
-                rail_after_contact = rail_after_contact or first_contact is not None
-
-        for _ in range(max(1, collision_passes)):
-            resolved = False
+        fastest = max((hypot(*velocities[i]) / radii[i] for i in range(n) if not pocketed[i]), default=0.0)
+        substeps = max(1, min(32, int(fastest * dt / max_step_radii) + 1))
+        sub_dt = dt / substeps
+        for _sub in range(substeps):
             for i in range(n):
                 if pocketed[i]:
                     continue
-                for j in range(i + 1, n):
-                    if pocketed[j]:
-                        continue
-                    dx = positions[j][0] - positions[i][0]
-                    dy = positions[j][1] - positions[i][1]
-                    distance = hypot(dx, dy)
-                    minimum = radii[i] + radii[j]
-                    if distance >= minimum:
-                        continue
-                    if distance < 1e-9:
-                        nx, ny, distance = 1.0, 0.0, 1e-9
+                vx, vy = velocities[i]
+                rx, ry = rolls[i]
+                slip_x, slip_y = vx - rx, vy - ry
+                slip = hypot(slip_x, slip_y)
+                if slip > 1e-6:
+                    # Sliding: friction slows the ball along the slip and turns the
+                    # slip into roll (2/7 of the slip leaves the velocity, 5/7 the spin).
+                    moving = True
+                    change = min(sliding_deceleration * sub_dt, slip * 2 / 7)
+                    ux, uy = slip_x / slip, slip_y / slip
+                    vx -= change * ux
+                    vy -= change * uy
+                    if change >= slip * 2 / 7:
+                        rx, ry = vx, vy
                     else:
-                        nx, ny = dx / distance, dy / distance
-                    overlap = minimum - distance
-                    positions[i][0] -= nx * overlap * 0.5
-                    positions[i][1] -= ny * overlap * 0.5
-                    positions[j][0] += nx * overlap * 0.5
-                    positions[j][1] += ny * overlap * 0.5
-                    relative_normal = ((velocities[j][0] - velocities[i][0]) * nx
-                                       + (velocities[j][1] - velocities[i][1]) * ny)
-                    if relative_normal < 0:
-                        resolved = True
-                        if first_contact is None and i == 0:
-                            first_contact = balls[j].number
-                        impulse = -(1 + ball_restitution) * relative_normal * 0.5
-                        velocities[i][0] -= impulse * nx
-                        velocities[i][1] -= impulse * ny
-                        velocities[j][0] += impulse * nx
-                        velocities[j][1] += impulse * ny
-                        pair = (min(balls[i].number, balls[j].number), max(balls[i].number, balls[j].number))
-                        if pair not in counted_pairs:
-                            counted_pairs.add(pair)
-                            ball_hits += 1
-            if not resolved:
-                break
+                        rx += 2.5 * change * ux
+                        ry += 2.5 * change * uy
+                else:
+                    speed_now = hypot(vx, vy)
+                    if speed_now > 0:
+                        moving = True
+                        next_speed = max(0.0, speed_now - cloth_deceleration * sub_dt)
+                        scale = next_speed / speed_now
+                        vx *= scale
+                        vy *= scale
+                    rx, ry = vx, vy
+                velocities[i] = [vx, vy]
+                rolls[i] = [rx, ry]
+                if sides[i]:
+                    sides[i] = max(0.0, abs(sides[i]) - side_spin_decay * sub_dt) * (1 if sides[i] > 0 else -1)
+                positions[i][0] += vx * sub_dt
+                positions[i][1] += vy * sub_dt
+
+                x, y = positions[i]
+                r = radii[i]
+                low_x, high_x = left + r, right - r
+                low_y, high_y = top + r, bottom - r
+                crossed_x = x < low_x or x > high_x
+                crossed_y = y < low_y or y > high_y
+                if (crossed_x or crossed_y) and pocket_at_edge(i, crossed_x, crossed_y):
+                    pocketed[i] = True
+                    pocket_order.append(balls[i].number)
+                    velocities[i] = [0.0, 0.0]
+                    rolls[i] = [0.0, 0.0]
+                    sides[i] = 0.0
+                    continue
+                # The roll reverses with the ball at a cushion, so a rolling ball
+                # leaves it rolling. Left/right walls slip along y, top/bottom walls
+                # along x; ``sign`` is which side of the ball touches the cushion.
+                if x < low_x or x > high_x:
+                    sign = 1.0 if x > high_x else -1.0
+                    normal_speed = abs(velocities[i][0])
+                    positions[i][0] = high_x if x > high_x else low_x
+                    velocities[i][0] = -sign * normal_speed * cushion_restitution
+                    rolls[i][0] = -rolls[i][0] * cushion_restitution
+                    cushion_english(i, 1, sign, normal_speed)
+                    rail_hits += 1
+                    rail_after_contact = rail_after_contact or first_contact is not None
+                if y < low_y or y > high_y:
+                    sign = -1.0 if y > high_y else 1.0
+                    normal_speed = abs(velocities[i][1])
+                    positions[i][1] = high_y if y > high_y else low_y
+                    velocities[i][1] = sign * normal_speed * cushion_restitution
+                    rolls[i][1] = -rolls[i][1] * cushion_restitution
+                    cushion_english(i, 0, sign, normal_speed)
+                    rail_hits += 1
+                    rail_after_contact = rail_after_contact or first_contact is not None
+
+            for _ in range(max(1, collision_passes)):
+                resolved = False
+                for i in range(n):
+                    if pocketed[i]:
+                        continue
+                    for j in range(i + 1, n):
+                        if pocketed[j]:
+                            continue
+                        dx = positions[j][0] - positions[i][0]
+                        dy = positions[j][1] - positions[i][1]
+                        distance = hypot(dx, dy)
+                        minimum = radii[i] + radii[j]
+                        if distance >= minimum:
+                            continue
+                        if pair_at_contact(i, j, dx, dy, distance, minimum, sub_dt):
+                            resolved = True
+                            continue
+                        if distance < 1e-9:
+                            nx, ny, distance = 1.0, 0.0, 1e-9
+                        else:
+                            nx, ny = dx / distance, dy / distance
+                        overlap = minimum - distance
+                        positions[i][0] -= nx * overlap * 0.5
+                        positions[i][1] -= ny * overlap * 0.5
+                        positions[j][0] += nx * overlap * 0.5
+                        positions[j][1] += ny * overlap * 0.5
+                        if hit(i, j, nx, ny):
+                            resolved = True
+                if not resolved:
+                    break
 
         if step % sample_every == 0 or step == steps - 1:
             frames.append(tuple(BallFrame(positions[i][0], positions[i][1], pocketed[i])
