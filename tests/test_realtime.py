@@ -18,7 +18,7 @@ from PySide6.QtWidgets import QApplication
 
 import fake_game
 from capture import DEFAULT_STYLE, composite_overlay, render_guide_layer, shown_layer
-from detector import Detection, detect
+from detector import Detection, detect, predict_shot
 from overlay import GrabPlan, grab_clean
 from tracking import ShotTracker
 
@@ -125,6 +125,38 @@ class ShotTrackerTests(unittest.TestCase):
         self.assertEqual(tracked.balls, tracker.base.balls)
         # Generous bound (CI machines vary); typically ~30 ms against ~200 ms.
         self.assertLess(tracked_seconds, .15)
+
+    def test_turning_aim_is_read_with_the_hint_like_without_it(self):
+        # After the first tracked frame, the aim is read near last frame's
+        # ghost (fast) and matches a reading without the hint.
+        tracker = ShotTracker()
+        tracker.detect(self.first, now=0)
+        fast = 0
+        for k in range(1, 7):
+            frame, _ = self.turned(.4 * k)
+            tracked = tracker.detect(frame, now=.03 * k)
+            self.assertFalse(tracker.last_was_full)
+            fast += tracker.last_was_fast
+            base = tracker.base
+            x, y, w, h = base.table
+            plain = predict_shot(frame[y:y + h, x:x + w], base.table, base.balls, base.cue)
+            self.assertAlmostEqual(np.degrees(np.arctan2(tracked.aim_dir[1], tracked.aim_dir[0])),
+                                   np.degrees(np.arctan2(plain["aim_dir"][1], plain["aim_dir"][0])), delta=.02)
+            self.assertEqual(tracked.ghost, plain["ghost"])
+            self.assertEqual(tracked.target, plain["target"])
+        self.assertGreaterEqual(fast, 5)
+
+    def test_a_read_without_the_hint_every_few_frames(self):
+        tracker = ShotTracker()
+        tracker.detect(self.first, now=0)
+        flags = []
+        for k in range(1, tracker.FULL_READ_EVERY + 3):
+            frame, _ = self.turned(.1 * k)
+            tracker.detect(frame, now=.01 * k)
+            flags.append(tracker.last_was_fast)
+        # Frame 1 has no hint yet; then FULL_READ_EVERY hinted reads, one plain.
+        self.assertEqual(flags[:tracker.FULL_READ_EVERY + 2],
+                         [False] + [True] * tracker.FULL_READ_EVERY + [False])
 
     def test_a_moved_ball_means_a_full_detection(self):
         tracker = ShotTracker()
