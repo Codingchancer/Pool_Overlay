@@ -20,7 +20,7 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| Physics pockets along the rails + finer steps at break speed (Codingchancer's `pool_physics.py`, with his brother's OK) | simulator | Jartartarta | `jartartarta/physics-pockets` |
+| Physics pockets along the rails + finer steps at break speed (Codingchancer's `pool_physics.py`, OK'd by Jartartarta) | simulator | Jartartarta | `jartartarta/physics-pockets` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Fast aim reader** (IDEAS.md idea 2, handed over by Codingchancer 15 Nov): read only the aim change per frame (angles within ~±2° of the last aim, ghost ball in a small box) in ~3-5 ms, with the full `predict_shot` every few frames to correct drift. Reading the aim is now the limit (16-18 updates/s). You may edit Codingchancer's `tracking.py` and `tests/test_realtime.py` for this task; keep the results within the `GuideStabilizer` tolerances and check `live_check.py`.
