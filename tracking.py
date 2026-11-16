@@ -5,7 +5,12 @@ the player is aiming, none of that changes: only the cue stick and the game's
 white aim graphics move. ``ShotTracker`` therefore keeps the table and balls
 from the last full detection and, on each new frame, only checks that the
 balls are still where they were (a few pixels per ball) and re-reads the aim
-graphics with ``predict_shot`` (20-35 ms). Anything else (a ball moved,
+graphics with ``predict_shot``. That read is handed last frame's aim and
+ghost ball (``hint``): while aiming the angle moves a little per frame, so the
+ghost ring is looked for near where it was instead of scanning every ray
+direction (~5 ms instead of ~15 on the synthetic table, same result). Every
+``FULL_READ_EVERY`` frames, and whenever the hint does not fit, the aim is
+read without it. Anything else (a ball moved,
 potted or covered, the overlay moved, no aim found for a few frames, or a
 few seconds passed) falls back to a full detection.
 """
@@ -38,6 +43,9 @@ class ShotTracker:
     # Frames in a row without an aim line before the balls are found again
     # (in case the cue ball was misidentified).
     MISSES_BEFORE_FULL = 3
+    # Hinted aim reads in a row before one without the hint (catches a hint
+    # that kept fitting something else than the game's ghost ball).
+    FULL_READ_EVERY = 8
 
     def __init__(self, full_detect=detect):
         self.full_detect = full_detect
@@ -49,6 +57,10 @@ class ShotTracker:
         self.detected_at = 0.0
         self.misses = 0
         self.last_was_full = True
+        self.hint: dict | None = None
+        self.hinted_reads = 0
+        # Whether the last tracked frame's aim was read with the hint.
+        self.last_was_fast = False
 
     def detect(self, frame: np.ndarray, now: float | None = None) -> Detection:
         now = time.monotonic() if now is None else now
@@ -63,7 +75,10 @@ class ShotTracker:
     def _full(self, frame: np.ndarray, now: float) -> Detection:
         detection = self.full_detect(frame)
         self.last_was_full = True
+        self.last_was_fast = False
         self.misses = 0
+        self.hint = None
+        self.hinted_reads = 0
         if detection.table is not None and detection.cue is not None and detection.balls:
             self.reference, self.base, self.detected_at = frame.copy(), detection, now
         else:
@@ -112,7 +127,11 @@ class ShotTracker:
         base = self.base
         x, y, w, h = base.table
         roi = frame[y:y + h, x:x + w]
-        shot = predict_shot(roi, base.table, base.balls, base.cue)
+        hint = self.hint if self.hinted_reads < self.FULL_READ_EVERY else None
+        shot = predict_shot(roi, base.table, base.balls, base.cue, hint=hint)
+        self.last_was_fast = bool(shot.get("fast"))
+        self.hinted_reads = self.hinted_reads + 1 if self.last_was_fast else 0
+        self.hint = shot.get("hint")
         return Detection(table=base.table, balls=base.balls, cue=base.cue, aim_segments=shot["aim"],
                          cue_segments=shot["cue"], object_segments=shot["object"],
                          target=shot["target"], ghost=shot["ghost"], blockers=shot["blockers"],

@@ -65,6 +65,14 @@ def white_guide_mask(roi: np.ndarray, balls: list[tuple[int, int, int, str]],
     cue-deflection line in near-white. Ball faces (cue ball, stripes, number
     badges) are white too, so they are masked out.
     """
+    mask = white_strokes(roi, hsv)
+    for bx, by, br, _ in balls:
+        cv2.circle(mask, (int(bx), int(by)), int(br * ball_scale), 0, thickness=-1)
+    return mask
+
+
+def white_strokes(roi: np.ndarray, hsv: np.ndarray | None = None) -> np.ndarray:
+    """``white_guide_mask`` before the ball faces are removed (a new array)."""
     if hsv is None:
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     # Measured on both bundled frames: guide strokes have saturation <= ~60,
@@ -92,8 +100,6 @@ def white_guide_mask(roi: np.ndarray, balls: list[tuple[int, int, int, str]],
             keep = stats[:, cv2.CC_STAT_AREA] >= 10
             keep[0] = False
             mask = np.where(keep[labels], 255, 0).astype(np.uint8)
-    for bx, by, br, _ in balls:
-        cv2.circle(mask, (int(bx), int(by)), int(br * ball_scale), 0, thickness=-1)
     return mask
 
 
@@ -139,7 +145,9 @@ def _ring_kernel_cached(radius: float) -> np.ndarray:
 
 
 def find_ghost_ball(white: np.ndarray, cue: tuple[int, int, int], direction: tuple[float, float] | None,
-                    radius: float, roi: np.ndarray | None = None) -> tuple[float, float, float, float] | None:
+                    radius: float, roi: np.ndarray | None = None,
+                    along_range: tuple[float, float] | None = None,
+                    spots: int = 3) -> tuple[float, float, float, float] | None:
     """Locate Miniclip's hollow ghost-ball reticle along the rough aim ray.
 
     The reticle centre is where the game places the cue ball at impact, so it
@@ -147,6 +155,11 @@ def find_ghost_ball(white: np.ndarray, cue: tuple[int, int, int], direction: tup
     far more precise than intersecting a slightly-off ray with a ball whose
     radius is only known to a pixel or two (3 px of error there turned the
     object-ball path by ~5°).
+
+    ``along_range`` (with a direction) limits the search to that stretch of
+    the ray, as distances from the cue-ball centre: the live tracker looks
+    near last frame's ghost first, where there is one ring, so ``spots``
+    (how many of the strongest coarse spots get every ring size) can be 1.
     """
     cx, cy, cr = cue
     h, w = white.shape[:2]
@@ -161,9 +174,10 @@ def find_ghost_ball(white: np.ndarray, cue: tuple[int, int, int], direction: tup
         ux, uy = direction
         # Restrict the search to a cone around the rough ray and to the
         # region in front of the cue ball.
-        far = float(np.hypot(w, h))
-        ends = [(cx + ux * t + s * uy * t * .07, cy + uy * t - s * ux * t * .07)
-                for t in (0, far) for s in (-1, 1)]
+        near, far = (0.0, float(np.hypot(w, h))) if along_range is None else along_range
+        spread = .07 if along_range is None else .09
+        ends = [(cx + ux * t + s * uy * max(t * spread, radius * .7), cy + uy * t - s * ux * max(t * spread, radius * .7))
+                for t in (near, far) for s in (-1, 1)]
         x0 = max(0, int(min(p[0] for p in ends)) - pad)
         x1 = min(w, int(max(p[0] for p in ends)) + pad)
         y0 = max(0, int(min(p[1] for p in ends)) - pad)
@@ -182,6 +196,12 @@ def find_ghost_ball(white: np.ndarray, cue: tuple[int, int, int], direction: tup
         # A ghost ball can sit closer than two radii when the target is
         # nearly touching the cue ball.
         corridor = (along > cr * 1.6) & (across <= np.maximum(4.0, along * .06))
+        if along_range is not None:
+            # Last frame's ray can be a few degrees off this frame's: near the
+            # cue ball the cone is only a few pixels wide and would clip the
+            # ring's peak (its centre then moved a pixel, half a degree).
+            corridor = ((along > cr * 1.6) & (along >= along_range[0]) & (along <= along_range[1])
+                        & (across <= np.maximum(radius * .6, along * .08)))
         threshold = .25
     if not corridor.any():
         return None
@@ -195,7 +215,7 @@ def find_ghost_ball(white: np.ndarray, cue: tuple[int, int, int], direction: tup
     windows = []
     half = int(np.ceil(radius * .5)) + 3
     margin = _ring_kernel(radius * 1.16 + .01).shape[0] // 2 + 1
-    for _ in range(3):
+    for _ in range(spots):
         index = int(np.argmax(coarse))
         if coarse.flat[index] <= -1:
             break
@@ -968,19 +988,35 @@ def stick_pull(roi: np.ndarray, cue_local: tuple[float, float], aim: tuple[float
 
 
 def predict_shot(roi: np.ndarray, table: tuple[int, int, int, int],
-                 balls: list[tuple[int, int, int, str]], cue: tuple[int, int, int]) -> dict:
+                 balls: list[tuple[int, int, int, str]], cue: tuple[int, int, int],
+                 hint: dict | None = None) -> dict:
     """Follow the game's aim graphics and estimate cue/object paths.
 
     Returns a dict with aim/cue/object segments, target, ghost, blockers,
     pot call, stick pull and a note. All coordinates are in frame pixels (the
     same frame ``table`` is in).
+
+    ``hint`` is last frame's ``shot["hint"]`` (the live tracker passes it):
+    while aiming the angle changes only a little per frame, so the ghost
+    ring is first looked for near where it was, along last frame's aim,
+    instead of scanning every ray direction (most of the time).
+    ``shot["fast"]`` says whether that worked.
     """
-    shot = _predict_paths(roi, table, balls, cue)
+    info: dict = {}
+    shot = _predict_paths(roi, table, balls, cue, hint, info)
     pull = None
     if shot.get("aim_dir") is not None:
         ball_r = float(np.median([br for _, _, br, _ in balls])) if balls else float(cue[2])
         pull = stick_pull(roi, (cue[0] - table[0], cue[1] - table[1]), shot["aim_dir"], ball_r)
-    return {**shot, "stick_pull": pull}
+    # Only a ring found on the ray is a hint (not one placed from the object
+    # line on top of the cue ball).
+    next_hint = None
+    if shot.get("ghost") is not None and shot.get("aim_dir") is not None and info.get("score"):
+        score = info["score"]
+        if info.get("fast") and hint is not None:
+            score = hint["score"] + (score - hint["score"]) * HINT_EASE
+        next_hint = {"aim_dir": shot["aim_dir"], "ghost": shot["ghost"][:2], "score": score}
+    return {**shot, "stick_pull": pull, "hint": next_hint, "fast": info.get("fast", False)}
 
 
 def ghost_from_object_line(white: np.ndarray, balls_local, cue_local, radius: float):
@@ -1016,8 +1052,50 @@ def ghost_from_object_line(white: np.ndarray, balls_local, cue_local, radius: fl
     return None if best is None else (best[1], best[2], best[3])
 
 
+# Live tracking: the ghost is first looked for within this many ball radii
+# (along the ray) of last frame's, and taken only with at least this share of
+# the reference ring score (the last full reading's, eased towards later
+# fast ones so a ring that slowly weakens is kept, a sudden drop is not).
+HINT_REACH = 2.5
+HINT_SCORE = .5
+HINT_EASE = .2
+# A ring found from the hint counts only if the game's ray leads to it: no
+# stretch without ray pixels longer than this many ball radii. (The real
+# ray is thin and broken into short pieces in the mask, ~70% covered.)
+RAY_GAP = 1.5
+
+
+def ray_reaches(white: np.ndarray, cue: tuple[float, float, float], ghost: tuple[float, float],
+                radius: float) -> bool:
+    """True when the white ray runs from the cue ball's edge to the ring.
+
+    Miniclip's ray stops at the ghost ball. A ring found near last frame's
+    ghost after the aim moved onto a nearer ball has no ray leading to it
+    (the ray now ends at the nearer ghost), so a long stretch is empty."""
+    cx, cy, cr = cue
+    gx, gy = ghost
+    length = float(np.hypot(gx - cx, gy - cy))
+    start, end = cr * 1.3, length - radius * 1.25
+    if end - start < 4:
+        return True
+    ux, uy = (gx - cx) / length, (gy - cy) / length
+    t = np.arange(start, end, 1.0)
+    h, w = white.shape[:2]
+    hit = np.zeros(t.shape, bool)
+    for s in (-2, -1, 0, 1, 2):
+        xs = np.clip(np.round(cx + ux * t - uy * s).astype(int), 0, w - 1)
+        ys = np.clip(np.round(cy + uy * t + ux * s).astype(int), 0, h - 1)
+        hit |= white[ys, xs] > 0
+    gap = longest = 0
+    for present in hit:
+        gap = 0 if present else gap + 1
+        longest = max(longest, gap)
+    return longest <= max(6.0, radius * RAY_GAP)
+
+
 def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
-                   balls: list[tuple[int, int, int, str]], cue: tuple[int, int, int]) -> dict:
+                   balls: list[tuple[int, int, int, str]], cue: tuple[int, int, int],
+                   hint: dict | None = None, info: dict | None = None) -> dict:
     """Follow the game's aim graphics and estimate cue/object paths.
 
     Returns a dict with aim/cue/object segments, target, ghost, blockers and a
@@ -1034,18 +1112,38 @@ def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
     # slightly noisy Hough radius.
     ball_r = float(np.median([br for _, _, br, _ in balls])) if balls else float(cr)
     roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-    white = white_guide_mask(roi, balls_local, hsv=roi_hsv)
+    strokes = white_strokes(roi, roi_hsv)
+    white = strokes.copy()
     # The reticle ring touches the struck ball, so mask only the ball faces
-    # here; the wider mask above would erase the ring's near side.
-    ghost_mask = white_guide_mask(roi, balls_local, ball_scale=.9, hsv=roi_hsv)
-    # Of the candidate ray directions, the real one ends in the ghost ball.
+    # there; the wider mask (1.18 radii) would erase the ring's near side.
+    ghost_mask = strokes
+    for bx, by, br, _ in balls_local:
+        cv2.circle(white, (int(bx), int(by)), int(br * 1.18), 0, thickness=-1)
+        cv2.circle(ghost_mask, (int(bx), int(by)), int(br * .9), 0, thickness=-1)
     direction, ghost = None, None
-    for candidate in aim_candidates(roi, cue_local, balls_local):
-        found = find_ghost_ball(ghost_mask, cue_local, candidate, ball_r, roi)
-        if direction is None:
-            direction = candidate
-        if found is not None and (ghost is None or found[3] > ghost[3]):
-            direction, ghost = candidate, found
+    fast = False
+    if hint is not None:
+        # Last frame's aim and ghost: look near the old ghost only. When the
+        # ghost jumped (the aim moved onto another ball), the full scan
+        # below finds it; a search along the whole old ray could lock onto
+        # something ring-like further on.
+        hux, huy = hint["aim_dir"]
+        hgx, hgy = hint["ghost"][0] - left, hint["ghost"][1] - top
+        g_along = (hgx - cue_local[0]) * hux + (hgy - cue_local[1]) * huy
+        reach = HINT_REACH * ball_r
+        found = find_ghost_ball(ghost_mask, cue_local, (hux, huy), ball_r, roi,
+                                along_range=(g_along - reach, g_along + reach), spots=1)
+        if (found is not None and found[3] >= hint["score"] * HINT_SCORE
+                and ray_reaches(white, cue_local, found[:2], ball_r)):
+            direction, ghost, fast = (hux, huy), found, True
+    if not fast:
+        # Of the candidate ray directions, the real one ends in the ghost ball.
+        for candidate in aim_candidates(roi, cue_local, balls_local):
+            found = find_ghost_ball(ghost_mask, cue_local, candidate, ball_r, roi)
+            if direction is None:
+                direction = candidate
+            if found is not None and (ghost is None or found[3] > ghost[3]):
+                direction, ghost = candidate, found
     if ghost is None:
         ghost = find_ghost_ball(ghost_mask, cue_local, None, ball_r, roi) if direction is None else None
     near_ghost = None
@@ -1067,6 +1165,9 @@ def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
             dx, dy = near_ghost[0] - cue_local[0], near_ghost[1] - cue_local[1]
             n = float(np.hypot(dx, dy))
             direction = (dx / n, dy / n)
+    if info is not None:
+        info["fast"] = fast
+        info["score"] = ghost[3] if ghost is not None and near_ghost is None else None
     if direction is None and ghost is None:
         return {**empty, "note": "Cue found · Miniclip aim line not detected"}
     if direction is None:
