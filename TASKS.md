@@ -20,7 +20,6 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| Struck ball nearly touching the cue ball (every cloth) | detector | Jartartarta | `jartartarta/touching-balls` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Power needed for a shot:** record ~20-30 real shots (slider % at release + where the balls stop) to fit Miniclip's friction and the %-to-speed scale per cue; then compute the minimum power to pot and add it to `Detection` for Codingchancer to mark on the slider. Also confirm the slider reading on a mid-drag and a full-power frame.
@@ -28,14 +27,15 @@ Border rules:
 - [ ] **Real-game tests:** turn the saved bad frames into tests that skip when the image is missing (like the existing screenshot tests), so fixes stay fixed.
 - [ ] Balls boxed in inside a rack can be off by ~0.5 radius (mostly fixed by the packing grid, #27; a few left in the wide sweep).
 - [ ] Raise the synthetic pass rate (`stress_test.py --count 300`) from 286/300 towards 297+/300 without making real-game results worse.
-- [ ] **Struck ball nearly touching the cue ball** (every cloth): the ghost ring lies on the cue ball and the detector misses the struck ball or names another cue ball. Synthetic 'near' shots pass 6/30 on blue, 1/30 on white, 3/30 on light grey; the shot recorder logs such shots' struck ball as unknown.
-- [ ] **Light grey cloth** (96/150 synthetic, white is now 105): the white-cloth fixes (#33) are gated to near-white cloth; check which apply.
+- [ ] **Near-shot aim** (struck ball nearly touching the cue ball): the ghost on the cue ball is exact now (#34), but the cue ball's centre is whole pixels and half under the ring, so the aim can be 1-2 px off at the ghost (degrees on these short shots; 15 synthetic near frames that passed before #34 fail on it). Keep the cue ball's sub-pixel centre (a new `Detection` field the tracker passes back), or take the aim from the stick's own direction.
+- [ ] **Light grey cloth** (96/150 synthetic, white is now 105): the white-cloth fixes (#33) are gated to near-white cloth; check which apply. Near shots on pale cloths are weak too (light grey 50, beige 56, sky 55, white 57 of 100): the cue ball's rim fit beside the ring.
 - [ ] White cloth leftovers: a ball lying on the table's watermark lettering keeps its circle-finding centre (the letters' edges read as a second rim); stripes packed in a rack; check on a live white table.
 
 ## Next — Codingchancer (overlay + simulator)
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
 
 ## Done
+- [x] Struck ball nearly touching the cue ball (Jartartarta, #34): the ghost ring is found on its own anywhere on the table (`find_ghost_ring`: a thin bright stroke between dark outlines, 0.04 px typical; 2847/2850 synthetic frames, no false ring), and with no ray to a ghost the ball under it is the cue ball; a cue ball that circle finding missed or fitted on the ring is found again with the ring painted out; a ghost on the cue ball is placed on the ring (also in the tracker). Synthetic near shots 570 -> 1510/1900 on 19 cloths (blue 31 -> 89, white 9 -> 57); other shots 2478/2850, the same frames; real screenshots 25/27 identical, the real near-cue frame now right; stress 286/300; live 12/12.
 - [x] White tables (Jartartarta, #33): cue ball and striped balls fitted on their lit-side rim dip (cue 1.4 -> 0.44 px typical, loose stripes 2.9 -> 0.65 px), the aim ray / object line / cue line read as thin ridges between their outlines (their white core is no brighter than white cloth), ghost found on ridges when the plain strokes show none, robust shadow direction. Synthetic white 75 -> 105/150; the 17 other cloths identical frame by frame; real frames identical; stress 286/300; live 12/12. White aim read 19 ms fast / 31 ms full (was 12 / 27, without reading the object line).
 - [x] Live check crash fixed (Jartartarta, #32): a stale capture.png (Fit table's whole-desktop dump that another program held open, so the analysis could not replace it) is skipped instead of compared. Live check 12/12 again; no change to the app.
 - [x] Shot recorder for the power fit (Jartartarta, #31): `shot_recorder.py` logs real shots from the mirror (slider % at release, cue/struck-ball tracks, where balls stopped, release/rest frames) to `outputs/shots/`. `recorder_check.py` on 18 synthetic cloths: 256/288 shots right in everything the fit uses, 19 more with the struck ball touching the cue ball logged as unknown. Also: slider read at full power with the stick across it; tracker finds a slider that was hidden. Not yet run on the real mirror.
