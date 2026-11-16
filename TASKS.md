@@ -20,10 +20,8 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| Fast aim reader (IDEAS.md idea 2; may edit `tracking.py`, `tests/test_realtime.py`) | detector + tracking | Jartartarta | `jartartarta/fast-aim` |
 
 ## Next — Jartartarta (detector / precision)
-- [ ] **Fast aim reader** (IDEAS.md idea 2, handed over by Codingchancer 15 Nov): read only the aim change per frame (angles within ~±2° of the last aim, ghost ball in a small box) in ~3-5 ms, with the full `predict_shot` every few frames to correct drift. Reading the aim is now the limit (16-18 updates/s). You may edit Codingchancer's `tracking.py` and `tests/test_realtime.py` for this task; keep the results within the `GuideStabilizer` tolerances and check `live_check.py`.
 - [ ] **Power needed for a shot:** record ~20-30 real shots (slider % at release + where the balls stop) to fit Miniclip's friction and the %-to-speed scale per cue; then compute the minimum power to pot and add it to `Detection` for Codingchancer to mark on the slider. Also confirm the slider reading on a mid-drag and a full-power frame.
 - [ ] **Real-game precision:** play with the guide on; wherever the guide's aim line, target ball or object/cue path does not sit exactly on the game's own white lines, save the frame (set `POOL_OVERLAY_DEBUG_DIR`, keep `capture.png`/`cleaned.png`) and have your Claude fix the detector. Keep real screenshots out of git (`outputs/` is ignored; the repo is public).
 - [ ] **Real-game tests:** turn the saved bad frames into tests that skip when the image is missing (like the existing screenshot tests), so fixes stay fixed.
@@ -35,6 +33,7 @@ Border rules:
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
 
 ## Done
+- [x] Fast aim reader (Jartartarta, #30, in Codingchancer's `tracking.py` as agreed): the tracker reads the aim near last frame's ghost ball, with a plain read every 8 frames and whenever the hint does not fit. Synthetic aiming sweeps: aim read ~5 ms instead of ~14 (white ~12 instead of ~27), tracked frame ~7 ms instead of ~14, same or better accuracy against the truth; real screenshots 8/8 the same; live check 12/12. Not yet measured on a live AirPlay mirror.
 - [x] Physics pockets + break speed (Jartartarta, #29, in Codingchancer's `pool_physics.py` with Jartartarta's OK): balls rolling along the rail into a pocket now drop (the drawn table's rule: rail contact within two radii of the mouth point); fast balls move in quarter-radius sub-steps and hits are resolved at the moment of contact, so the struck ball's direction is exact at every power (was 13 deg off at full power). Power slider: a stick just past the slot's end no longer stretches it (93% read as 79%); play_test max power error 8% -> 1%. Stress 286/300 unchanged.
 - [x] Headless 8-ball test game (Jartartarta, #28): `sim_game.py` plays whole games through the physics and 8-ball rules with rendered frames and exact truth; `play_test.py` checks the overlay on every shot. 60 games: aiming frame fully right blue 281/299, green 288, harsh 278, white 174; live aim error median 0.02 deg; struck ball within 2 deg of the physics on 90% of normal-power shots; power slider fixed with the stick across it (median 0.3%, max 8%). Physics pockets too tight along the rails (game uses the drawn table's pocket rule).
 - [x] White table cue ball + tight racks (Jartartarta, #27): white cue ball fitted on its lit side, packed rack balls found on the packing grid. Wide sweep 622 -> 647/760 (white 13 -> 20/40, racks 94 -> 112/152, missing balls 113 -> 43), hold-out 491 -> 515, harsh 561 -> 575, blue stress 286/300, real frames unchanged.
