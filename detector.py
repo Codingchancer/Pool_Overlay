@@ -1821,6 +1821,14 @@ def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
             # cue ball, so this gives the aim angle to a fraction of a degree.
             direction = (gdx / glen, gdy / glen)
             ghost_frame = (gx, gy, ghost[2])
+        if ghost_frame is not None and glen <= ball_r * RING_OVERLAP:
+            # The ghost on (or right by) the cue ball: from the cue ball's
+            # centre to it the aim turns by degrees per pixel, but the stick
+            # lies along it (synthetic near shots: aim more than 1 px off at
+            # the ghost in 127 of 988, 33 with the stick).
+            along_stick = stick_direction_near(roi, cue_local[:2], (ghost[0], ghost[1]), ball_r)
+            if along_stick is not None:
+                direction = along_stick
     ux, uy = direction
     obstacles = [(bx, by, br) for bx, by, br, kind in balls if kind != "cue"]
     angle = float(np.degrees(np.arctan2(uy, ux)))
@@ -2760,6 +2768,182 @@ def stick_direction(stick_lines, cue_xy: tuple[float, float], radius: float,
         elif ahead <= behind + .2:
             return None        # no clear ray side: do not guess
     return ux, uy
+
+
+def stick_direction_near(roi: np.ndarray, cue_xy: tuple[float, float], ghost_xy: tuple[float, float],
+                         radius: float) -> tuple[float, float] | None:
+    """The aim read from the cue stick (ROI px; pointing from the cue ball
+    towards the ghost), or None.
+
+    With the ghost on top of the cue ball the aim from the cue ball's centre
+    to it turns by degrees per pixel: the centre is known to about a pixel
+    (half its rim lies under the ring), the ghost only a few pixels from it.
+    The stick lies along the aim behind the cue ball. Its band of off-cloth
+    shade gives the direction best (``_stick_band_direction``); where that
+    is not found, its straight edges (``_stick_edge_direction``). The
+    ghost's direction from the cue ball says which side the stick is on and
+    roughly where (within 45 degrees). Synthetic near shots, 10 cloths: the
+    stick read in 77%, 0.16 degrees at the 95th percentile, never 1.2 off."""
+    cx, cy = cue_xy
+    rx, ry = ghost_xy[0] - cx, ghost_xy[1] - cy
+    norm = float(np.hypot(rx, ry))
+    if norm < 1e-6:
+        return None
+    rough = (rx / norm, ry / norm)
+    h, w = roi.shape[:2]
+    reach = int(radius * 16)
+    x0, x1 = max(0, int(cx) - reach), min(w, int(cx) + reach + 1)
+    y0, y1 = max(0, int(cy) - reach), min(h, int(cy) + reach + 1)
+    if x1 - x0 < 32 or y1 - y0 < 32:
+        return None
+    gray = cv2.cvtColor(roi[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY)
+    cue = (cx - x0, cy - y0)
+    return (_stick_band_direction(gray, cue, rough, radius)
+            or _stick_edge_direction(gray, cue, rough, radius))
+
+
+def _stick_band_direction(gray: np.ndarray, cue_xy, rough, radius: float) -> tuple[float, float] | None:
+    """The stick's axis from its band of off-cloth shade behind the cue ball.
+
+    Off cloth: at least ``STICK_SHADE`` from the cloth's own shade around
+    (the stick is far darker or lighter than the cloth; the table's
+    lettering is only a little darker). Of the directions within 45 degrees
+    of ``rough``, the one whose backward ray stays off cloth longest from
+    within 5 radii of the cue ball (the tip) is taken; short cloth-like gaps
+    (the stick's light rings and joints) are bridged, and the run must be at
+    least 7 radii long (the game's own lines are at most ~5.4). Then the
+    band's middle is measured across it every 1.5 px over 9 radii, and a
+    line fitted through those middles turns the axis onto the band (three
+    times). The axis must pass by the cue ball's centre: the stick points
+    at it."""
+    cx, cy = cue_xy
+    off = (np.abs(cv2.GaussianBlur(gray.astype(np.float32), (0, 0), 1.0)
+                  - cv2.medianBlur(gray, 31).astype(np.float32)) >= STICK_SHADE).astype(np.float32)
+
+    def sample(xs, ys):
+        return cv2.remap(off, np.asarray(xs, np.float32), np.asarray(ys, np.float32), cv2.INTER_LINEAR,
+                         borderMode=cv2.BORDER_CONSTANT, borderValue=0) > .5
+
+    a0 = float(np.arctan2(rough[1], rough[0]))
+    ts = np.arange(radius * 1.1, radius * 14, 1.0)
+    angles = a0 + np.radians(np.arange(-STICK_AIM_GATE, STICK_AIM_GATE + .01, .5))
+    on = sample(cx - np.outer(np.cos(angles), ts), cy - np.outer(np.sin(angles), ts))
+    gap = int(radius * .7)
+    latest_start = int(radius * (5 - 1.1))
+    runs = np.zeros(len(angles))
+    starts = np.zeros(len(angles), int)
+    for i, row in enumerate(on):
+        hits = np.nonzero(row)[0]
+        if not len(hits):
+            continue
+        # Runs of hits with gaps of at most ``gap`` samples between them.
+        breaks = np.nonzero(np.diff(hits) > gap + 1)[0]
+        firsts = np.concatenate(([hits[0]], hits[breaks + 1]))
+        lasts = np.concatenate((hits[breaks], [hits[-1]]))
+        ok = firsts <= latest_start
+        if ok.any():
+            lengths = (lasts - firsts + 1)[ok]
+            k = int(np.argmax(lengths))
+            runs[i], starts[i] = lengths[k], firsts[ok][k]
+    top = float(runs.max())
+    if top < radius * STICK_RUN:
+        return None
+    k = int(np.argmax(runs))
+    lo = hi = k
+    while lo > 0 and runs[lo - 1] >= top * .9:
+        lo -= 1
+    while hi < len(runs) - 1 and runs[hi + 1] >= top * .9:
+        hi += 1
+    a = float((angles[lo] + angles[hi]) / 2)
+    tip = float(ts[starts[k]])
+    across = np.arange(-radius * 1.3, radius * 1.3 + 1e-6, .5)
+    centre = len(across) // 2
+    tt = np.arange(tip + radius * .3, tip + radius * 9, 1.5)
+    icpt = 0.0
+    for _ in range(3):
+        ux, uy = np.cos(a), np.sin(a)
+        rows = sample(cx - np.outer(tt, np.full(len(across), ux)) - np.outer(np.ones(len(tt)), across) * uy,
+                      cy - np.outer(tt, np.full(len(across), uy)) + np.outer(np.ones(len(tt)), across) * ux)
+        mids, at = [], []
+        for t, row in zip(tt, rows):
+            hits = np.nonzero(row)[0]
+            if not len(hits):
+                continue
+            c = int(hits[np.argmin(np.abs(hits - centre))])
+            if abs(c - centre) > 4:          # 2 px
+                continue
+            left = right = c
+            while left > 0 and row[left - 1]:
+                left -= 1
+            while right < len(row) - 1 and row[right + 1]:
+                right += 1
+            if left == 0 or right == len(row) - 1:   # wider than the window: a ball under it
+                continue
+            mids.append((across[left] + across[right]) / 2)
+            at.append(t)
+        if len(mids) < 8:
+            return None
+        at, mids = np.array(at), np.array(mids)
+        use = np.ones(len(mids), bool)
+        for _ in range(3):
+            slope, icpt = np.polyfit(at[use], mids[use], 1)
+            res = np.abs(mids - (slope * at + icpt))
+            use = res <= max(1.0, 2.5 * float(np.median(res)))
+            if use.sum() < 8:
+                return None
+        # The middles drift sideways by ``slope`` per pixel backwards.
+        a -= float(np.arctan(slope))
+    if abs(icpt) > max(3.0, radius * .3):
+        return None
+    return float(np.cos(a)), float(np.sin(a))
+
+
+def _stick_edge_direction(gray: np.ndarray, cue_xy, rough, radius: float) -> tuple[float, float] | None:
+    """The stick's direction from its long straight edges: lines (the same
+    line search as for the stick in ``detect``) passing within 0.8 radii of
+    the cue ball's centre, starting behind its face (the tip is 1.25-3.75
+    radii out, an edge piece after a joint further) and pointing within 45
+    degrees of ``rough``. Edges parallel to the longest one are averaged
+    (the stick tapers; its two edges lean opposite ways)."""
+    cx, cy = cue_xy
+    rx, ry = rough
+    min_r = max(8, int(radius * .75))
+    lines = cv2.HoughLinesP(cv2.Canny(cv2.medianBlur(gray, 5), 50, 140), 1, np.pi / 180, threshold=16,
+                            minLineLength=max(45, min_r * 6), maxLineGap=max(12, int(min_r * 1.2)))
+    if lines is None:
+        return None
+    found = []
+    for ax, ay, bx, by in lines[:, 0, :].astype(float):
+        length = float(np.hypot(bx - ax, by - ay))
+        if length < radius * 6:
+            continue
+        ux, uy = (bx - ax) / length, (by - ay) / length
+        if ux * rx + uy * ry < 0:
+            ux, uy = -ux, -uy
+        if ux * rx + uy * ry < np.cos(np.radians(STICK_AIM_GATE)):
+            continue
+        if abs((cx - ax) * uy - (cy - ay) * ux) > radius * .8:
+            continue
+        near_end = max((ax - cx) * ux + (ay - cy) * uy, (bx - cx) * ux + (by - cy) * uy)
+        if not -radius * 9 <= near_end <= -radius * .5:
+            continue
+        found.append((length, ux, uy))
+    if not found:
+        return None
+    _, vx, vy = max(found)
+    parallel = [(l, ux, uy) for l, ux, uy in found if ux * vx + uy * vy >= np.cos(np.radians(2.5))]
+    sx, sy = sum(l * ux for l, ux, _ in parallel), sum(l * uy for l, _, uy in parallel)
+    norm = float(np.hypot(sx, sy))
+    return float(sx / norm), float(sy / norm)
+
+
+# How far (degrees) the stick may point from the ghost's direction when that
+# is read from a ghost on top of the cue ball.
+STICK_AIM_GATE = 45.0
+# Off-cloth shade (grey levels) of the stick against the cloth around it,
+# and the shortest run of it (ball radii) behind the cue ball.
+STICK_SHADE = 20.0
+STICK_RUN = 7.0
 
 
 def stick_axis(stick_lines, cue_xy: tuple[float, float], radius: float,

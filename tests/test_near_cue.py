@@ -127,5 +127,45 @@ class NearCueTests(unittest.TestCase):
             self.assertEqual(problems, [], f"{seed} {cloth}")
 
 
+class NearShotAimTests(unittest.TestCase):
+    """With the ghost on top of the cue ball, the aim from the cue ball's
+    centre to it turned by degrees per pixel; the stick gives it."""
+
+    def test_aim_from_the_stick(self):
+        # Each failed only on the aim before (1-2 px off at the ghost).
+        for seed, cloth in ((40033, "blue"), (40084, "blue"), (40054, "green"), (40021, "teal"),
+                            (40012, "white"), (40010, "light grey"), (40036, "beige"), (40052, "sky")):
+            *_, problems, stats = st.evaluate(seed, "near", cloth)
+            self.assertEqual(problems, [], f"{seed} {cloth}")
+
+    def test_stick_direction(self):
+        for seed, cloth in ((40010, "green"), (40002, "white"), (40030, "navy")):
+            scene = fg.random_scene(seed, "near", cloth)
+            for shown in (True, False):
+                frame, truth = fg.render(dataclasses.replace(scene, show_stick=shown))
+                roi, (x, y) = table_roi(frame)
+                u = detector.stick_direction_near(roi, (truth.cue[0] - x, truth.cue[1] - y),
+                                                  (truth.ghost[0] - x, truth.ghost[1] - y), float(round(truth.radius)))
+                if not shown:
+                    self.assertIsNone(u, f"{seed} {cloth}: a stick without one")
+                    continue
+                a = np.radians(truth.aim_degrees)
+                self.assertLess(np.degrees(np.arccos(np.clip(u[0] * np.cos(a) + u[1] * np.sin(a), -1, 1))), .3,
+                                f"{seed} {cloth}")
+
+    def test_stick_found_from_a_rough_direction(self):
+        # The ghost's direction from the cue ball is rough here (20 degrees
+        # off is common): the stick is still found and read exactly.
+        frame, truth = fg.render(fg.random_scene(40030, "near", "navy"))
+        roi, (x, y) = table_roi(frame)
+        cx, cy = truth.cue[0] - x, truth.cue[1] - y
+        a = np.radians(truth.aim_degrees)
+        for turn in (-25, 25):
+            b = a + np.radians(turn)
+            u = detector.stick_direction_near(roi, (cx, cy), (cx + 8 * np.cos(b), cy + 8 * np.sin(b)),
+                                              float(round(truth.radius)))
+            self.assertLess(np.degrees(np.arccos(np.clip(u[0] * np.cos(a) + u[1] * np.sin(a), -1, 1))), .3, turn)
+
+
 if __name__ == "__main__":
     unittest.main()
