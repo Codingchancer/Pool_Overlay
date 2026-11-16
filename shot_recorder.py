@@ -461,6 +461,7 @@ class ShotRecorder:
         self.recent: deque = deque(maxlen=12)     # (t, frame, detection) of the last aiming frames
         self.shots = 0
         self.cue_retry_at = -1e9
+        self.t0: float | None = None
         self.notes: list[str] = []
         self._reset_rest()
         self.state = "aiming"
@@ -535,7 +536,14 @@ class ShotRecorder:
     def _has_ball_at(detection: Detection, xy) -> bool:
         return any(np.hypot(bx - xy[0], by - xy[1]) <= br * .6 for bx, by, br, _ in detection.balls)
 
+    def _when(self, t: float) -> str:
+        """Time since the first frame, for notes."""
+        seconds = int(t - self.t0)
+        return f"{seconds // 60:02d}:{seconds % 60:02d}"
+
     def feed(self, frame: np.ndarray, t: float) -> ShotLog | None:
+        if self.t0 is None:
+            self.t0 = t
         if self.state == "aiming":
             return self._aiming(frame, t)
         return self._moving(frame, t)
@@ -835,12 +843,24 @@ class ShotRecorder:
             near = [(np.hypot(b["x"] - tx, b["y"] - ty), i) for i, b in enumerate(before_balls)]
             if near and min(near)[0] < r:
                 aimed_at = min(near)[1]
+        if shot["power"] is None and len(shot["cue_track"]) <= 2 and not cue_potted:
+            # No power, and the cue ball could not be followed at all: the
+            # whole table changed at once (a new rack, another screen), not a
+            # shot.
+            self.notes.append(f"{self._when(shot['t_start'])}: the table changed at once (new rack or another screen?)")
+            self.state = "aiming"
+            self.history.clear()
+            self.recent.clear()
+            self.tracker.reset()
+            self._set_still(frame, after)
+            self.shot = None
+            return None
         if shot["power"] is None and not any(
                 m is None or np.hypot(after_balls[m]["x"] - b["x"], after_balls[m]["y"] - b["y"]) > r * .5
                 for b, m in zip(before_balls, matched)):
             # Only the cue ball moved and no power was set: it was moved by
             # hand (ball in hand). Not a shot.
-            self.notes.append(f"{shot['t_start']:.2f}s: cue ball moved without a shot (ball in hand?)")
+            self.notes.append(f"{self._when(shot['t_start'])}: cue ball moved without a shot (ball in hand?)")
             self.state = "aiming"
             self.history.clear()
             self.recent.clear()

@@ -104,12 +104,14 @@ Each shot gets a JSON log and two PNGs (the release and the rest frame) in `outp
 
 The opponent's shots are logged with power `null`. Moving the cue ball by hand (ball in hand) is not logged. Spin is not read.
 
-`python recorder_check.py --all-cloths` checks the recorder on whole synthetic games against the exact truth. With the slider snapping back over two frames and every 5th shot without a slider, at 30 fps, 225 of 288 shots on 18 cloths were logged right in every check, including the power at release (within 0.4%).
-- **Tracks:** on most cloths the cue ball's movement is within 1 px.
-- **What fails:**
-  - the struck ball when it nearly touches the cue ball (the detector misses it);
+`python recorder_check.py --all-cloths` checks the recorder on whole synthetic games against the exact truth. The test: 18 cloths, 30 fps, the slider snapping back over two frames, and every 5th shot without a slider.
+- **Every check:** 227 of 288 shots were logged right.
+- **What the power fit uses:** 256 were right in the power at release (within 0.4%), the cue ball's and the struck ball's tracks, and where they stopped or went in. On most cloths the cue ball's movement is within 1 px.
+- **The struck ball touching the cue ball:** 19 shots. The detector misses that ball, so the log says the struck ball is unknown rather than guessing.
+- **The rest:**
+  - the cue ball's position on white, sky and beige cloth, 3–5 px off;
   - end spots of balls close to the cloth's colour;
-  - on white cloth, positions 3–5 px off.
+  - a few balls not followed by the recorder, matched by colour to the wrong ball afterwards.
 
 ## Tests
 
