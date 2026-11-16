@@ -2031,6 +2031,172 @@ def stick_direction(stick_lines, cue_xy: tuple[float, float], radius: float,
     return ux, uy
 
 
+def shadow_direction(lightness: np.ndarray, cloth: np.ndarray, balls, radius: float) -> tuple[float, float] | None:
+    """Unit direction in which the balls' drop shadows fall, measured as the
+    darkest side of a ring just outside each object ball (None when too few
+    balls show one). All shadows fall the same way."""
+    vectors = []
+    for bx, by, _, kind in balls:
+        if kind == "cue":
+            continue
+        xs = (bx + radius * 1.2 * np.cos(_RIM_ANGLES))[None].astype(np.float32)
+        ys = (by + radius * 1.2 * np.sin(_RIM_ANGLES))[None].astype(np.float32)
+        value = cv2.remap(lightness, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
+        around = cv2.remap(cloth, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
+        dark = np.clip(around - value, 0, 60)
+        # A ring mostly dark is packed among other balls: no shadow to read.
+        if dark.sum() < 1 or (dark > 25).mean() > .6:
+            continue
+        v = np.array([np.sum(dark * np.cos(_RIM_ANGLES)), np.sum(dark * np.sin(_RIM_ANGLES))])
+        vectors.append(v / (np.linalg.norm(v) + 1e-9))
+    if len(vectors) < 2:
+        return None
+    mean = np.mean(vectors, axis=0)
+    norm = float(np.linalg.norm(mean))
+    return None if norm < .5 else (float(mean[0] / norm), float(mean[1] / norm))
+
+
+def white_cloth_cue_centre(roi: np.ndarray, cue_xy: tuple[float, float], balls,
+                           offset: tuple[int, int]) -> tuple[float, float] | None:
+    """Cue-ball centre on a white or light grey cloth, or None elsewhere.
+
+    There the ball's shaded rim and its drop shadow are equally dark, so on
+    the shadow side its edge cannot be seen and a full-circle fit slides
+    towards the shadow (3-7 px). The rim is fitted on the lit half only (away
+    from the shadow, whose direction the object balls show), on the
+    brightness step at the edge, leaving out the guide's strokes and the
+    stick (very bright or dark pixels) that cross the rim.
+    """
+    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
+    lightness = lab[:, :, 0].astype(np.float32)
+    cloth = local_lightness(lightness)
+    cx, cy = cue_xy
+    h, w = lightness.shape
+    # Only a near-white cloth: on a light grey one the cue ball is far
+    # brighter than the cloth and the usual fit finds its whole rim.
+    # (Judged on the table's brightest cloth: the lighting falls off
+    # towards the rails, where white cloth is as dark as light grey.)
+    if (not (0 <= int(cy) < h and 0 <= int(cx) < w) or cloth[int(cy), int(cx)] < LIGHT_CLOTH_L
+            or float(np.percentile(cloth[::8, ::8], 95)) < WHITE_CLOTH_L):
+        return None
+    # Colourless cloth only (white, light grey): on a coloured one the
+    # colour difference finds the whole rim.
+    ring = (np.hypot(*np.ogrid[-int(cy):h - int(cy), -int(cx):w - int(cx)]) < 60)
+    if np.hypot(float(np.median(lab[:, :, 1][ring])) - 128, float(np.median(lab[:, :, 2][ring])) - 128) >= 8:
+        return None
+    local = [(bx - offset[0], by - offset[1], br, kind) for bx, by, br, kind in balls]
+    radius = float(np.median([b[2] for b in local]))
+    sdir = shadow_direction(lightness, cloth, local, radius)
+    if sdir is None:
+        return None
+    strokes = ((lightness > cloth + 15) | (lightness < 110)).astype(np.uint8)
+    strokes = cv2.dilate(strokes, np.ones((3, 3), np.uint8), iterations=2).astype(bool)
+    angles = _RIM_ANGLES[np.cos(_RIM_ANGLES - np.arctan2(sdir[1], sdir[0])) < WHITE_CUE_LIT]
+    cos, sin = np.cos(angles), np.sin(angles)
+    best, best_score = (float(cx), float(cy)), None
+    for step, span in ((1.0, WHITE_CUE_REACH), (.25, 1.0)):
+        offsets = np.arange(-span, span + 1e-6, step)
+        found = None
+        for px in best[0] + offsets:
+            for py in best[1] + offsets:
+                for r in np.arange(radius * .92, radius * 1.08 + 1e-6, .25):
+                    inner = (px + (r - 1) * cos, py + (r - 1) * sin)
+                    outer = (px + (r + 1) * cos, py + (r + 1) * sin)
+                    a = cv2.remap(lightness, inner[0][None].astype(np.float32), inner[1][None].astype(np.float32),
+                                  cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
+                    b = cv2.remap(lightness, outer[0][None].astype(np.float32), outer[1][None].astype(np.float32),
+                                  cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
+                    ok = np.ones(len(angles), bool)
+                    for xs, ys in (inner, outer):
+                        ok &= ~strokes[np.clip(ys.astype(int), 0, h - 1), np.clip(xs.astype(int), 0, w - 1)]
+                    if ok.mean() < .4:
+                        continue
+                    value = float(np.abs(b - a)[ok].mean())
+                    if found is None or value > found[0]:
+                        found = (value, (float(px), float(py)))
+        if found is None:
+            return None
+        best_score, best = found
+    return best
+
+
+# Cloth lightness (Lab L, 8-bit) from which the cue ball is fitted on its
+# lit side, as the table's brightest cloth (white ~225-231; light grey ~182).
+WHITE_CLOTH_L = 205.0
+# How far (px) the white-cloth cue fit may move the circle-finding centre.
+WHITE_CUE_REACH = 4.0
+# Rim arc used: cos(angle from the shadow) below this (the lit side, with
+# margin for an error in the measured shadow direction).
+WHITE_CUE_LIT = -.4
+
+
+def grid_spot(points, index: int, radius: float, need: int = 2) -> tuple[float, float] | None:
+    """Where touching neighbours on a hexagonal grid put ball ``index``: the
+    mean of the spots each touching pair predicts within half a radius of
+    it, when at least ``need`` pairs do."""
+    px, py = points[index]
+    pts = np.array(points, np.float32)
+    near = [j for j in range(len(points)) if j != index
+            and 1.7 * radius <= float(np.hypot(pts[j, 0] - px, pts[j, 1] - py)) <= 2.4 * radius]
+    guesses = []
+    for a in near:
+        for b in range(len(points)):
+            if b in (a, index):
+                continue
+            d = float(np.hypot(pts[b, 0] - pts[a, 0], pts[b, 1] - pts[a, 1]))
+            if not (1.85 * radius <= d <= 2.3 * radius):
+                continue
+            base = np.arctan2(pts[b, 1] - pts[a, 1], pts[b, 0] - pts[a, 0])
+            for k in (1, 5):
+                gx = pts[a, 0] + d * np.cos(base + k * np.pi / 3)
+                gy = pts[a, 1] + d * np.sin(base + k * np.pi / 3)
+                if np.hypot(gx - px, gy - py) <= radius * .5:
+                    guesses.append((gx, gy))
+    if len(guesses) < need:
+        return None
+    return float(np.mean([g[0] for g in guesses])), float(np.mean([g[1] for g in guesses]))
+
+
+def rack_gaps(points, radius: float, width: float, height: float, pockets) -> list[tuple[float, float, float]]:
+    """Grid spots next to touching balls with no ball found there: each one
+    a diameter from two or more balls (in a rack every ball has neighbours
+    all round), inside the cushions and clear of the pockets."""
+    if len(points) < 3:
+        return []
+    pts = np.array(points, np.float32)
+    spots = []
+    for i, (ax, ay) in enumerate(pts):
+        for j, (bx, by) in enumerate(pts):
+            if i == j:
+                continue
+            d = float(np.hypot(bx - ax, by - ay))
+            if not (1.85 * radius <= d <= 2.3 * radius):
+                continue
+            base = np.arctan2(by - ay, bx - ax)
+            for k in range(1, 6):
+                angle = base + k * np.pi / 3
+                sx, sy = ax + d * np.cos(angle), ay + d * np.sin(angle)
+                if min(sx, sy, width - sx, height - sy) < radius * .9:
+                    continue
+                if min(np.hypot(sx - px, sy - py) for px, py in pockets) < radius * 1.6:
+                    continue
+                gaps = np.hypot(pts[:, 0] - sx, pts[:, 1] - sy)
+                if gaps.min() < radius * 1.6 or int(np.sum(gaps <= radius * 2.35)) < 2:
+                    continue
+                spots.append((float(sx), float(sy)))
+    # Every touching pair beside a spot predicts it: average them.
+    merged: list[list[tuple[float, float]]] = []
+    for sx, sy in spots:
+        for group in merged:
+            if np.hypot(sx - group[0][0], sy - group[0][1]) <= radius * .6:
+                group.append((sx, sy))
+                break
+        else:
+            merged.append([(sx, sy)])
+    return [(float(np.mean([g[0] for g in group])), float(np.mean([g[1] for g in group])), float(radius))
+            for group in merged][:40]
+
+
 # All pool balls are the same size. A fitted radius further than this share
 # from the typical one has grown onto the ball's drop shadow (or shrunk
 # against a neighbour); its centre is fitted again at the typical radius.
@@ -2062,7 +2228,8 @@ def has_number_badge(patch_hsv: np.ndarray, xx, yy, cx: float, cy: float, r: flo
     return float(middle.mean()) >= .5 and float(outside.mean()) <= .08
 
 
-def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared: dict | None = None):
+def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared: dict | None = None,
+               sites: list[tuple[float, float, float]] | None = None):
     """Ball circles in the table ROI: (x, y, r, sat, val, white_fraction, red_spot).
 
     Candidates come from circle finding on grey levels and on colour distance
@@ -2084,7 +2251,11 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
     lab_weights = np.array([.5, 1.0, 1.0], np.float32)
     roi_light = None
     letter_shade = False   # not measured yet
-    distance = felt_distance_image(roi, roi_hsv, as_float=True)
+    roi_bright = None
+    if sites is not None and shared is not None and shared.get("distance") is not None:
+        distance = shared["distance"]
+    else:
+        distance = felt_distance_image(roi, roi_hsv, as_float=True)
     if shared is not None:
         # detect() needs the same image again for the cue-stick filter.
         shared["distance"] = distance
@@ -2093,41 +2264,49 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
     sources = ((cv2.medianBlur(np.clip(distance * 3, 0, 255).astype(np.uint8), 5), 60), (gray, 100))
     smooth = cv2.GaussianBlur(distance, (0, 0), 1.0)
     proposals: list[tuple[int, int, int]] = []
-    for image, edge_threshold in sources:
-        circles = cv2.HoughCircles(image, cv2.HOUGH_GRADIENT, dp=1.25,
-                                   minDist=max(12, min_r * 1.8), param1=edge_threshold,
-                                   param2=20, minRadius=min_r, maxRadius=max_r)
-        if circles is None:
-            continue
-        for hx, hy, hr in circles[0]:
-            # Snap the proposal onto the ball's edge before judging it: Hough
-            # centres can be a few pixels off, enough to fail the cloth test.
-            fx, fy, fr = refine_circle(smooth, float(hx), float(hy), float(hr))
-            if np.hypot(fx - hx, fy - hy) > hr * .5:
-                fx, fy, fr = float(hx), float(hy), float(hr)
-            cx, cy, r = int(round(fx)), int(round(fy)), int(round(fr))
-            # The colour-distance proposal comes first and wins duplicates.
-            if all((cx - px) ** 2 + (cy - py) ** 2 > (min_r * .6) ** 2 for px, py, _ in proposals):
-                proposals.append((cx, cy, r))
-    # A ball the same colour as the cloth (the black 8 on a black table) has
-    # no edge for circle finding, but its white number badge (a disc ~0.45
-    # radii) stands out. Propose a ball on each such disc; the checks below
-    # (and has_number_badge) decide whether it is one.
-    typical = float(np.median([p[2] for p in proposals])) if proposals else (min_r + max_r) / 2
     from_badge: set[tuple[int, int]] = set()
-    white = ((roi_hsv[:, :, 1] < 90) & (roi_hsv[:, :, 2] > 150)).astype(np.uint8)
-    count, _, stats, centres = cv2.connectedComponentsWithStats(white, connectivity=8)
-    badge_area = np.pi * (typical * .45) ** 2
-    for i in range(1, count):
-        bx, by, bw, bh, area = stats[i]
-        if not (.45 * badge_area <= area <= 1.6 * badge_area):
-            continue
-        if not (.7 <= bw / max(1, bh) <= 1.43) or area < .55 * bw * bh:
-            continue
-        cx, cy = int(round(centres[i][0])), int(round(centres[i][1]))
-        if all((cx - px) ** 2 + (cy - py) ** 2 > (min_r * .6) ** 2 for px, py, _ in proposals):
-            proposals.append((cx, cy, int(round(typical))))
-            from_badge.add((cx, cy))
+    if sites is not None:
+        # Second pass: spots where a packed ball must be (see the end), each
+        # snapped onto a rim nearby and then judged like any proposal.
+        for sx, sy, sr in sites:
+            fx, fy = refit_centre(smooth, float(sx), float(sy), float(sr), reach=float(sr) * .2)
+            proposals.append((int(round(fx)), int(round(fy)), int(round(sr))))
+        typical = float(np.median([site[2] for site in sites])) if sites else (min_r + max_r) / 2
+    else:
+        for image, edge_threshold in sources:
+            circles = cv2.HoughCircles(image, cv2.HOUGH_GRADIENT, dp=1.25,
+                                       minDist=max(12, min_r * 1.8), param1=edge_threshold,
+                                       param2=20, minRadius=min_r, maxRadius=max_r)
+            if circles is None:
+                continue
+            for hx, hy, hr in circles[0]:
+                # Snap the proposal onto the ball's edge before judging it: Hough
+                # centres can be a few pixels off, enough to fail the cloth test.
+                fx, fy, fr = refine_circle(smooth, float(hx), float(hy), float(hr))
+                if np.hypot(fx - hx, fy - hy) > hr * .5:
+                    fx, fy, fr = float(hx), float(hy), float(hr)
+                cx, cy, r = int(round(fx)), int(round(fy)), int(round(fr))
+                # The colour-distance proposal comes first and wins duplicates.
+                if all((cx - px) ** 2 + (cy - py) ** 2 > (min_r * .6) ** 2 for px, py, _ in proposals):
+                    proposals.append((cx, cy, r))
+        # A ball the same colour as the cloth (the black 8 on a black table) has
+        # no edge for circle finding, but its white number badge (a disc ~0.45
+        # radii) stands out. Propose a ball on each such disc; the checks below
+        # (and has_number_badge) decide whether it is one.
+        typical = float(np.median([p[2] for p in proposals])) if proposals else (min_r + max_r) / 2
+        white = ((roi_hsv[:, :, 1] < 90) & (roi_hsv[:, :, 2] > 150)).astype(np.uint8)
+        count, _, stats, centres = cv2.connectedComponentsWithStats(white, connectivity=8)
+        badge_area = np.pi * (typical * .45) ** 2
+        for i in range(1, count):
+            bx, by, bw, bh, area = stats[i]
+            if not (.45 * badge_area <= area <= 1.6 * badge_area):
+                continue
+            if not (.7 <= bw / max(1, bh) <= 1.43) or area < .55 * bw * bh:
+                continue
+            cx, cy = int(round(centres[i][0])), int(round(centres[i][1]))
+            if all((cx - px) ** 2 + (cy - py) ** 2 > (min_r * .6) ** 2 for px, py, _ in proposals):
+                proposals.append((cx, cy, int(round(typical))))
+                from_badge.add((cx, cy))
     # Pocket centres lie just outside the cushion noses (corners ~1 inset,
     # middles ~2 insets beyond the rail line).
     inset = POCKET_TO_CUSHION * tw
@@ -2196,7 +2375,14 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
                 dab = np.hypot(inner_lab[:, 1] - local[1], inner_lab[:, 2] - local[2])
                 cloth_inside |= (dab < 10) & (np.abs(dl) < 6)
                 if letter_shade is not None:
-                    cloth_inside |= (dab < 10) & (np.abs(dl - letter_shade) < 10)
+                    # Lettering borders only cloth. The same shade right next
+                    # to something brighter than the cloth is the blurred
+                    # edge of a ball's white badge or stripe.
+                    if roi_bright is None:
+                        roi_bright = cv2.dilate(((roi_lab[:, :, 0] > roi_light + 12) * 255).astype(np.uint8),
+                                                np.ones((5, 5), np.uint8)) > 0
+                    near_bright = roi_bright[y0:y1, x0:x1][dist2 <= (r * .62) ** 2]
+                    cloth_inside |= (dab < 10) & (np.abs(dl - letter_shade) < 10) & ~near_bright
                 # A white ball on near-white cloth is only a little brighter
                 # than it on its lit side, and its shaded side looks like a
                 # darker shade of the cloth. Lettering has nothing brighter.
@@ -2268,7 +2454,10 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
     # pull its centre towards the shadow.
     typical = float(np.median([item[3] for item in kept]))
     result = []
+    badge_found: list[int] = []
     for _, cx, cy, r, *rest in kept:
+        if (cx, cy) in from_badge:
+            badge_found.append(len(result))
         # Smaller circles keep their size: the cue-stick filter tells stick
         # rings from balls by it. Every ball is drawn at one size in the end
         # (``uniform_ball_size``).
@@ -2288,6 +2477,28 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
             fx, fy = refit_centre(smooth, float(cx), float(cy), typical)
             cx, cy = int(round(fx)), int(round(fy))
         result.append((cx, cy, r, *rest, rim_open_fraction(smooth, cx, cy, r)))
+    if sites is None and len(result) >= 3:
+        # Packed balls (a rack) sit on a hexagonal grid one diameter apart.
+        # A spot with two or more touching neighbours and no ball found is
+        # proposed again; the same checks decide.
+        spots = rack_gaps([(b[0], b[1]) for b in result], typical, tw, th, pockets_local)
+        if spots:
+            extra = find_balls(roi, gray, min_r, max_r, {"distance": distance}, sites=spots)
+            for item in extra:
+                if all(np.hypot(item[0] - b[0], item[1] - b[1]) >= typical * 1.5 for b in result):
+                    result.append(item)
+    if sites is None and len(result) >= 3:
+        # A ball found only by its badge sits where the badge is printed, and
+        # a packed one shows too little rim to fit; among touching balls the
+        # grid they form places it better.
+        points = [(b[0], b[1]) for b in result]
+        weak = set(badge_found) | {k for k, b in enumerate(result) if b[-1] < .5}
+        for i in range(len(result)):
+            # A well-fitted ball moves only when the grid is firm about it.
+            spot = grid_spot(points, i, typical, need=2 if i in weak else 4)
+            if spot is not None:
+                result[i] = (int(round(spot[0])), int(round(spot[1])), *result[i][2:])
+                points[i] = result[i][:2]
     return result
 
 
@@ -2499,10 +2710,14 @@ def detect(frame: np.ndarray) -> Detection:
                     and whitest[5] >= cue[5] + .15 and whitest[3] <= cue[3] - 10):
                 cue = whitest
         if cue:
-            cue_position = cue[:3]
             cue_index = min(range(len(balls)), key=lambda i: np.hypot(balls[i][0]-cue[0], balls[i][1]-cue[1]))
+            moved = white_cloth_cue_centre(roi, (cue[0] - x, cue[1] - y), balls, (x, y))
+            if moved is not None:
+                # (The candidate tuple carries the colour measurements on.)
+                cue = (int(round(moved[0] + x)), int(round(moved[1] + y)), *cue[2:])
+            cue_position = cue[:3]
             bx, by, br, _ = balls[cue_index]
-            balls[cue_index] = (bx, by, br, "cue")
+            balls[cue_index] = (cue[0], cue[1], br, "cue")
             balls = separate_cue_overlap_detections(balls, cue_position)
             local_balls = [(bx-x, by-y, br, kind) for bx, by, br, kind in balls]
             aim = aim_direction(roi, (cue_position[0]-x, cue_position[1]-y, cue_position[2]), local_balls)
