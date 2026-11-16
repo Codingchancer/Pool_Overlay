@@ -63,7 +63,10 @@ LOST_FRAMES = 3
 # ball itself: 0.07 against 0.006 for a maroon stripe and the maroon solid),
 # with this floor for a ball whose own matches are near perfect.
 SCORE_RATIO = 5.0
-SCORE_FLOOR = .03
+SCORE_FLOOR = .01
+# A match must also correlate with the ball's own pattern (zero-mean,
+# normalised) at least this well.
+PATTERN_MIN = .6
 # When a ball is not near where it should be, a window this many radii
 # around is searched (a break moves the cue ball ~3 radii a frame at 60 fps).
 WIDE_REACH = 8.0
@@ -71,6 +74,16 @@ WIDE_REACH = 8.0
 # half), and at most this much less than the whitest ball on the table.
 CUE_WHITE = .6
 CUE_WHITE_MARGIN = .15
+# While no white ball is on the still table, detect the whole table this often.
+CUE_RETRY_SECONDS = .5
+# A ball has left its spot when most of its inner disc changed by more than
+# this (less for a ball close to the cloth's colour: ``_change_level``).
+BALL_CHANGE = 40.0
+# The struck ball leaves its spot next to the cue ball: within this many
+# radii of the cue ball's position then (plus its travel in two frames).
+STRUCK_NEAR = 3.5
+# ... and the cue ball's path so far passed within this many radii of it.
+STRUCK_PATH = 2.4
 # Slider readings at or below this (percent) are the slider at rest.
 SLIDER_REST = 1.5
 # On release the slider snaps back, possibly over a few frames: consecutive
@@ -103,7 +116,7 @@ class BallFollower:
     rolls, its blurred colour does not. Only the ball's disc is compared,
     so the cloth around it (any colour) does not count."""
 
-    def __init__(self, frame: np.ndarray, x: float, y: float, r: float):
+    def __init__(self, frame: np.ndarray, x: float, y: float, r: float, exclude=()):
         self.r = float(r)
         self.sigma = max(1.0, self.r * .25)
         self.half = int(np.ceil(self.r * 1.1))
@@ -119,9 +132,24 @@ class BallFollower:
         size = 2 * self.half + 1
         yy, xx = np.mgrid[:size, :size]
         offset_x, offset_y = x - round(x), y - round(y)
-        self.mask = ((xx - self.half - offset_x) ** 2 + (yy - self.half - offset_y) ** 2
-                     <= (self.r * .9) ** 2).astype(np.float32)
+        self.dx, self.dy = xx - self.half - offset_x, yy - self.half - offset_y
+        mask = self.dx ** 2 + self.dy ** 2 <= (self.r * .9) ** 2
+        # The game draws a white line from this ball's centre (the aim ray
+        # from the cue ball, the object line from the struck ball): leave
+        # that strip out, since the ball has no line on it once it moves.
+        self.mask = (mask & ~self._strips(exclude)).astype(np.float32)
         self.mask3 = np.dstack([self.mask] * 3)
+
+    def _strips(self, directions) -> np.ndarray:
+        """Template pixels on a line drawn from the ball's centre along each
+        of ``directions``."""
+        out = np.zeros(self.dx.shape, bool)
+        width = max(2.5, self.r * .18) + self.sigma
+        for ux, uy in directions:
+            along = self.dx * ux + self.dy * uy
+            across = np.abs(self.dx * uy - self.dy * ux)
+            out |= (along >= -width) & (across <= width)
+        return out
 
     def _blurred(self, frame, cx, cy, half):
         h, w = frame.shape[:2]
@@ -134,7 +162,7 @@ class BallFollower:
         return patch[margin:-margin, margin:-margin]
 
     def locate(self, frame: np.ndarray, t: float, reach: float | None = None,
-               centre: tuple[float, float] | None = None):
+               centre: tuple[float, float] | None = None, exclude=()):
         """Best match near where the ball should be now (or near ``centre``):
         (x, y, score) or None."""
         if self.template is None:
@@ -156,8 +184,19 @@ class BallFollower:
             return None
         window = cv2.GaussianBlur(frame[y0:y1, x0:x1].astype(np.float32), (0, 0), self.sigma)
         window = window[margin:-margin, margin:-margin]
-        score = cv2.matchTemplate(window, self.template, cv2.TM_SQDIFF_NORMED, mask=self.mask3)
+        mask3 = self.mask3
+        if exclude:
+            # Lines drawn over the ball in this frame (the aim ray while aiming).
+            mask = self.mask * ~self._strips(exclude)
+            mask3 = np.dstack([mask.astype(np.float32)] * 3)
+        score = cv2.matchTemplate(window, self.template, cv2.TM_SQDIFF_NORMED, mask=mask3)
         score = np.nan_to_num(score, nan=1.0, posinf=1.0)
+        # The ball's own pattern (its shading) must be there too: on a white
+        # or pale cloth a white ball's colour differs too little from the
+        # cloth's for the squared difference alone.
+        pattern = cv2.matchTemplate(window, self.template, cv2.TM_CCOEFF_NORMED, mask=mask3)
+        pattern = np.nan_to_num(pattern, nan=0.0, posinf=0.0, neginf=0.0)
+        score = np.where(pattern >= PATTERN_MIN, score, 1.0)
         iy, ix = divmod(int(np.argmin(score)), score.shape[1])
         if not (0 < iy < score.shape[0] - 1 and 0 < ix < score.shape[1] - 1):
             # Best at the window's edge: the ball is (partly) outside it, and
@@ -179,12 +218,15 @@ class BallFollower:
     def start(self, t: float):
         self.t = t
 
-    def update(self, frame: np.ndarray, t: float, heading: tuple[float, float] | None = None):
+    def update(self, frame: np.ndarray, t: float, heading: tuple[float, float] | None = None,
+               max_speed: float | None = None):
         """Follow the ball into ``frame``; returns (x, y) or None once lost.
 
         When it is not near where it should be (struck hard, or a hit
         changed its speed), a wide window is searched, centred ahead along
-        ``heading`` while its speed is not known yet."""
+        ``heading`` while its speed is not known yet. With ``max_speed``
+        (px/s), a match further than the ball could have gone is another
+        ball (one of a similar colour, after this one was potted)."""
         if self.lost:
             return None
         found = self.locate(frame, t)
@@ -197,6 +239,10 @@ class BallFollower:
                 0.0 if self.t is None else max(0.0, t - self.t)), centre=centre)
             if wide is not None and (found is None or wide[2] < found[2]):
                 found = wide
+        if found is not None and max_speed is not None and self.t is not None:
+            dt = max(0.0, t - self.t)
+            if np.hypot(found[0] - self.pos[0], found[1] - self.pos[1]) > max_speed * dt * 1.3 + self.r:
+                found = None
         if found is None or found[2] > self.limit():
             self.misses += 1
             if self.misses >= LOST_FRAMES:
@@ -414,6 +460,7 @@ class ShotRecorder:
         self.history: deque = deque()
         self.recent: deque = deque(maxlen=12)     # (t, frame, detection) of the last aiming frames
         self.shots = 0
+        self.cue_retry_at = -1e9
         self.notes: list[str] = []
         self._reset_rest()
         self.state = "aiming"
@@ -435,6 +482,14 @@ class ShotRecorder:
         detection = refined(frame, detection)
         self.rest_frame, self.rest = frame, detection
         self.signatures = [ball_signature(frame, bx, by, br) for bx, by, br, _ in detection.balls]
+        # The game's lines drawn over balls in this frame (if its aim showed):
+        # the aim ray from the cue ball, the object line from the struck ball.
+        self.still_lines = {}
+        if detection.aim_dir is not None and detection.cue is not None:
+            self.still_lines["cue"] = (detection.cue[:2], tuple(detection.aim_dir))
+            if detection.object_dir is not None and detection.target is not None:
+                self.still_lines["object"] = (detection.target[:2], tuple(detection.object_dir))
+        self.change_levels = [self._change_level(frame, bx, by, br) for bx, by, br, _ in detection.balls]
         self._choose_cue(cue_hint if cue_hint is not None else detection.cue)
 
     def _choose_cue(self, hint):
@@ -451,13 +506,30 @@ class ShotRecorder:
             if (np.hypot(balls[near][0] - hint[0], balls[near][1] - hint[1]) <= balls[near][2] * .6
                     and whiteness[near] >= CUE_WHITE and whiteness[near] >= whiteness[best] - CUE_WHITE_MARGIN):
                 pick = near
+        if whiteness[pick] < CUE_WHITE:
+            # No white ball on this still table (the cue ball was potted and
+            # not put back yet): the cue ball is unknown for now.
+            self.cue = None
+            self.cue_follower = None
+            return
         bx, by, br, _ = balls[pick]
         if self.cue is not None and np.hypot(self.cue[0] - bx, self.cue[1] - by) < br * .5:
             return
         self.cue = (float(bx), float(by), float(br))
-        follower = BallFollower(self.rest_frame, bx, by, br)
+        follower = BallFollower(self.rest_frame, bx, by, br, exclude=self._lines_at(bx, by, br))
         follower.calibrate(self.rest_frame, bx, by)
         self.cue_follower = follower if follower.template is not None else None
+
+    def _cue_level(self) -> float:
+        balls = self.rest.balls
+        i = min(range(len(balls)), key=lambda k: np.hypot(balls[k][0] - self.cue[0], balls[k][1] - self.cue[1]))
+        return self.change_levels[i]
+
+    def _lines_at(self, x: float, y: float, r: float):
+        """Directions of the game's lines drawn from the ball at (x, y) in the
+        still frame."""
+        return [direction for (lx, ly), direction in getattr(self, "still_lines", {}).values()
+                if np.hypot(lx - x, ly - y) < r * .6]
 
     @staticmethod
     def _has_ball_at(detection: Detection, xy) -> bool:
@@ -468,46 +540,90 @@ class ShotRecorder:
             return self._aiming(frame, t)
         return self._moving(frame, t)
 
-    def _ball_left(self, frame: np.ndarray) -> bool:
-        """True when a ball other than the cue ball left its spot: most of its
-        inner disc changed (a stick across it changes a thin stripe)."""
+    @staticmethod
+    def _change_level(frame: np.ndarray, x: float, y: float, r: float) -> float:
+        """How much a pixel inside the ball must change for the ball to have
+        left: half its typical difference from the cloth around it (a blue
+        ball on a blue table differs by less than the usual 40 levels)."""
         h, w = frame.shape[:2]
-        for bx, by, br, _ in self.rest.balls:
+        reach = int(np.ceil(r * 1.9))
+        x0, x1 = max(0, int(x) - reach), min(w, int(x) + reach + 1)
+        y0, y1 = max(0, int(y) - reach), min(h, int(y) + reach + 1)
+        patch = frame[y0:y1, x0:x1].astype(np.int16)
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        d = np.hypot(xx - x, yy - y)
+        ring = (d >= r * 1.4) & (d <= r * 1.8)
+        inner = d <= r * .7
+        if ring.sum() < 10 or inner.sum() < 10:
+            return BALL_CHANGE
+        cloth = np.median(patch[ring], axis=0)
+        diff = np.abs(patch[inner] - cloth).max(axis=1)
+        return float(np.clip(.5 * np.median(diff), 12, BALL_CHANGE))
+
+    def _ball_left(self, frame: np.ndarray) -> int | None:
+        """The still table's ball (index) other than the cue ball that left its
+        spot: most of its inner disc changed (a stick across it changes a thin
+        stripe; the cue ball rolling by cannot reach it). None if none did."""
+        for index, (bx, by, br, _) in enumerate(self.rest.balls):
             if self.cue is not None and np.hypot(bx - self.cue[0], by - self.cue[1]) < br * .5:
                 continue
-            inner = max(2, int(br * .7))
-            x, y = int(bx), int(by)
-            x0, x1, y0, y1 = max(0, x - inner), min(w, x + inner + 1), max(0, y - inner), min(h, y + inner + 1)
-            if x1 <= x0 or y1 <= y0:
-                continue
-            now = frame[y0:y1, x0:x1].astype(np.int16)
-            then = self.rest_frame[y0:y1, x0:x1].astype(np.int16)
-            yy, xx = np.mgrid[y0:y1, x0:x1]
-            disc = (xx - x) ** 2 + (yy - y) ** 2 <= inner * inner
-            changed = (np.abs(now - then).max(axis=2) > 40) & disc
-            if changed.sum() >= .8 * disc.sum():
-                return True
-        return False
+            if self._spot_left(frame, bx, by, br, self.change_levels[index]):
+                return index
+        return None
+
+    def _spot_left(self, frame: np.ndarray, bx: float, by: float, br: float, level: float) -> bool:
+        """True when the ball is gone from its spot: most of the pixels where
+        it looked unlike the cloth (in the still frame) changed by more than
+        ``level``. (A striped ball's white half on a white cloth does not
+        change when it leaves; a stick across the ball changes a stripe.)"""
+        h, w = frame.shape[:2]
+        reach = int(np.ceil(br * 1.9))
+        x, y = int(bx), int(by)
+        x0, x1, y0, y1 = max(0, x - reach), min(w, x + reach + 1), max(0, y - reach), min(h, y + reach + 1)
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            return False
+        then = self.rest_frame[y0:y1, x0:x1].astype(np.int16)
+        now = frame[y0:y1, x0:x1].astype(np.int16)
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        d = np.hypot(xx - bx, yy - by)
+        disc = d <= br * .7
+        ring = (d >= br * 1.4) & (d <= br * 1.8)
+        if disc.sum() < 10:
+            return False
+        own = disc
+        if ring.sum() >= 10:
+            cloth = np.median(then[ring], axis=0)
+            unlike = (np.abs(then - cloth).max(axis=2) > max(level, 12)) & disc
+            if unlike.sum() >= .15 * disc.sum():
+                own = unlike
+        changed = (np.abs(now - then).max(axis=2) > level) & own
+        return bool(changed.sum() >= .8 * own.sum())
 
     def _aiming(self, frame: np.ndarray, t: float):
         # The shot starts when the cue ball moves (checked before the
         # tracker, which falls back to a slow full detection once balls
         # move), or, in case the cue ball was misnamed, any ball leaves its
-        # spot.
-        if self.rest is not None:
+        # spot. Without a known cue ball no shot can be logged.
+        if self.rest is not None and self.cue is not None:
             if self.cue_follower is not None:
-                found = self.cue_follower.locate(frame, t, reach=self.cue[2] * 1.5)
+                aim_now = self.recent[-1][2].aim_dir if self.recent else None
+                found = self.cue_follower.locate(frame, t, reach=self.cue[2] * 1.5,
+                                                 exclude=[aim_now] if aim_now is not None else ())
                 if found is not None and found[2] <= self.cue_follower.limit():
                     if np.hypot(found[0] - self.cue[0], found[1] - self.cue[1]) > START_MOVE * self.cue[2]:
                         return self._start(frame, t)
-                elif found is not None:
+                elif found is not None and self._spot_left(frame, *self.cue, self._cue_level()):
                     # Gone from its spot at once (a hard shot moves it further
                     # than the search reach in one frame).
                     return self._start(frame, t)
-            if self._ball_left(frame):
+            if self._ball_left(frame) is not None:
                 return self._start(frame, t)
+        if self.rest is not None and self.cue is None and t - self.cue_retry_at >= CUE_RETRY_SECONDS:
+            # Look at the whole table again until the cue ball is back.
+            self.cue_retry_at = t
+            self.tracker.reset()
         d = self.tracker.detect(frame, now=t)
-        if self.rest is None and self.tracker.last_was_full and self.tracker.base is not None:
+        if (self.rest is None or self.cue is None) and self.tracker.last_was_full and self.tracker.base is not None:
             self._set_still(self.tracker.reference, self.tracker.base)
         if d.aim_dir is not None and d.cue is not None:
             self.last_aim = d
@@ -534,25 +650,17 @@ class ShotRecorder:
 
     def _start(self, frame: np.ndarray, t: float):
         power = release_power(self.history, t)
-        if power is None and not any(p is not None for _, p in self.history):
-            note = "no power slider seen (opponent's turn?)"
-        elif power is None:
-            # The slider showed but was never pulled: the cue ball was moved
-            # by hand (ball in hand). Not a shot.
-            self.notes.append(f"{t:.2f}s: cue ball moved without a shot (ball in hand?)")
-            self.tracker.reset()
-            self._reset_rest()
-            self.history.clear()
-            return None
-        else:
-            note = ""
+        # No power set: the opponent's shot (no slider), or the cue ball
+        # moved by hand (ball in hand), which is told apart at the end: then
+        # no other ball moves.
+        note = "" if power is not None else "no power slider reading (opponent's turn?)"
         rest = self.rest
         r = float(np.median([b[2] for b in rest.balls]))
         self.shot = {
             "t_start": t, "power": power, "power_note": note,
             "power_history": [[round(ht - t, 4), None if p is None else round(float(p), 2)]
                               for ht, p in self.history],
-            "rest": rest, "rest_frame": self.rest_frame, "aim": self.last_aim,
+            "rest": rest, "rest_frame": self.rest_frame, "aim": None,
             "release_frame": self.recent[-1][1] if self.recent else self.rest_frame,
             "radius": r, "cue_track": [], "object_track": [],
             "cue_lost_at": None, "object_lost_at": None, "frames": 0,
@@ -562,29 +670,75 @@ class ShotRecorder:
         if self.cue_follower is not None:
             self.cue_follower.start(self.recent[-1][0] if self.recent else t)
         self.shot["cue_track"].append([0.0, round(float(cue[0]), 2), round(float(cue[1]), 2)])
-        self.object_follower = None
+        # The aim the game showed, if it was read from this cue ball (with the
+        # struck ball nearly touching the cue ball, the aiming frame's
+        # detection can read a ray from another ball).
         aim = self.last_aim
-        if aim is not None and aim.target is not None:
-            tx, ty = aim.target[:2]
-            # The still table's ball there (its rim-fitted centre).
-            near = min(rest.balls, key=lambda b: np.hypot(b[0] - tx, b[1] - ty))
-            if np.hypot(near[0] - tx, near[1] - ty) < r:
-                tx, ty = near[0], near[1]
-            follower = BallFollower(self.rest_frame, tx, ty, r)
-            follower.calibrate(self.rest_frame, tx, ty)
-            if follower.template is not None:
-                follower.start(t)
-                self.object_follower = follower
-                self.shot["object_track"].append([0.0, round(float(tx), 2), round(float(ty), 2)])
+        if aim is not None and np.hypot(aim.cue[0] - cue[0], aim.cue[1] - cue[1]) > cue[2] * .6:
+            aim = None
+            self.shot["power_note"] = (self.shot["power_note"] + "; " if self.shot["power_note"] else "") +                 "aim not read from the cue ball"
+        self.shot["aim"] = aim
+        # The struck ball is found from the motion (the first other ball to
+        # leave its spot), then followed.
+        self.object_follower = None
+        self.struck = None
+        # The fastest the cue ball has moved this shot (px/s): no ball it
+        # hits can go faster.
+        self.cue_top_speed = 0.0
+        self.prev_t = self.recent[-1][0] if self.recent else t
         self.headings = {}
         if aim is not None and aim.aim_dir is not None:
             self.headings["cue"] = tuple(aim.aim_dir)
-            if aim.object_dir is not None:
-                self.headings["object"] = tuple(aim.object_dir)
         self.last_thumb = None
         self.still_since = None
         self.state = "moving"
         return self._moving(frame, t)
+
+    def _cue_step_speed(self, t: float) -> float:
+        """The cue ball's speed over its last tracked step (px/s)."""
+        track = self.shot["cue_track"]
+        if len(track) < 2 or track[-1][0] <= track[-2][0]:
+            return 0.0
+        return float(np.hypot(track[-1][1] - track[-2][1], track[-1][2] - track[-2][2]) / (track[-1][0] - track[-2][0]))
+
+    def _could_be_struck(self, bx: float, by: float, t: float) -> bool:
+        """Whether the ball at (bx, by) that just left its spot can be the one
+        the cue ball hit first: the cue ball is next to it now, its path came
+        within reach of it, and it was not deflected before somewhere else
+        than at a cushion (then it hit a ball the detection missed)."""
+        shot = self.shot
+        r = shot["radius"]
+        cf = self.cue_follower
+        cx, cy = cf.pos if cf is not None else shot["cue"][:2]
+        speed = float(np.hypot(*cf.vel)) if cf is not None else 0.0
+        if np.hypot(bx - cx, by - cy) > STRUCK_NEAR * r + 2 * speed * max(0.0, t - self.prev_t):
+            return False
+        path = np.array([p[1:] for p in shot["cue_track"]] + [[cx, cy]], np.float64)
+        if len(path) >= 2:
+            a, b = path[:-1], path[1:]
+            ab = b - a
+            length2 = np.maximum((ab ** 2).sum(axis=1), 1e-9)
+            u = np.clip(((np.array([bx, by]) - a) * ab).sum(axis=1) / length2, 0, 1)
+            closest = a + ab * u[:, None]
+            if float(np.min(np.hypot(closest[:, 0] - bx, closest[:, 1] - by))) > STRUCK_PATH * r:
+                return False
+            # The first clear turn of the path (a collision).
+            steps = np.diff(path, axis=0)
+            moving = np.hypot(steps[:, 0], steps[:, 1]) > .5
+            heading = None
+            tx, ty, tw, th = shot["rest"].table
+            for k in range(len(steps)):
+                if not moving[k]:
+                    continue
+                v = steps[k] / np.hypot(*steps[k])
+                if heading is not None and float(v @ heading) < np.cos(np.radians(15)):
+                    px, py = path[k]
+                    at_cushion = min(px - tx, tx + tw - px, py - ty, ty + th - py) < 1.6 * r
+                    if not at_cushion and np.hypot(px - bx, py - by) > STRUCK_NEAR * r:
+                        return False
+                    break
+                heading = v
+        return True
 
     def _table_thumb(self, frame):
         x, y, w, h = self.shot["rest"].table
@@ -597,11 +751,43 @@ class ShotRecorder:
         for name, follower in (("cue", self.cue_follower), ("object", getattr(self, "object_follower", None))):
             if follower is None or follower.lost:
                 continue
-            pos = follower.update(frame, t, heading=self.headings.get(name))
+            limit = None if name == "cue" else self.cue_top_speed
+            pos = follower.update(frame, t, heading=self.headings.get(name), max_speed=limit)
+            if name == "cue" and pos is not None:
+                self.cue_top_speed = max(self.cue_top_speed, float(np.hypot(*follower.vel)), self._cue_step_speed(t))
             if pos is not None:
                 shot[f"{name}_track"].append([rel, round(pos[0], 2), round(pos[1], 2)])
             elif follower.lost and shot[f"{name}_lost_at"] is None:
                 shot[f"{name}_lost_at"] = rel
+        if self.struck is None:
+            index = self._ball_left(frame)
+            if index is not None:
+                bx, by, br, _ = shot["rest"].balls[index]
+                if not self._could_be_struck(bx, by, t):
+                    # A ball moving far from the cue ball was not struck by it
+                    # (the struck one was missed by the detection, e.g. one
+                    # touching the cue ball). The struck ball stays unknown.
+                    self.struck = (float("nan"), float("nan"))
+                    index = None
+            if index is not None:
+                follower = BallFollower(self.rest_frame, bx, by, shot["radius"],
+                                        exclude=self._lines_at(bx, by, shot["radius"]))
+                follower.calibrate(self.rest_frame, bx, by)
+                self.struck = (bx, by)
+                if follower.template is not None:
+                    follower.start(self.prev_t)
+                    self.object_follower = follower
+                    shot["object_track"].append([round(self.prev_t - shot["t_start"], 4), round(bx, 2), round(by, 2)])
+                    # It leaves roughly along the line from the cue ball.
+                    cx, cy = self.cue_follower.pos if self.cue_follower is not None else shot["cue"][:2]
+                    n = float(np.hypot(bx - cx, by - cy))
+                    if n > 1e-6:
+                        self.headings["object"] = ((bx - cx) / n, (by - cy) / n)
+                    found_at = follower.update(frame, t, heading=self.headings.get("object"),
+                                               max_speed=self.cue_top_speed)
+                    if found_at is not None:
+                        shot["object_track"].append([rel, round(found_at[0], 2), round(found_at[1], 2)])
+        self.prev_t = t
         thumb = self._table_thumb(frame)
         if self.last_thumb is not None and not screen_changed(thumb, self.last_thumb):
             if self.still_since is None:
@@ -639,11 +825,29 @@ class ShotRecorder:
         for b, m in zip(before_balls, matched):
             b["after"] = m
         object_index = None
+        if self.struck is not None:
+            near = [(np.hypot(b["x"] - self.struck[0], b["y"] - self.struck[1]), i) for i, b in enumerate(before_balls)]
+            if near and min(near)[0] < r:
+                object_index = min(near)[1]
+        aimed_at = None
         if aim is not None and aim.target is not None:
             tx, ty = aim.target[:2]
             near = [(np.hypot(b["x"] - tx, b["y"] - ty), i) for i, b in enumerate(before_balls)]
             if near and min(near)[0] < r:
-                object_index = min(near)[1]
+                aimed_at = min(near)[1]
+        if shot["power"] is None and not any(
+                m is None or np.hypot(after_balls[m]["x"] - b["x"], after_balls[m]["y"] - b["y"]) > r * .5
+                for b, m in zip(before_balls, matched)):
+            # Only the cue ball moved and no power was set: it was moved by
+            # hand (ball in hand). Not a shot.
+            self.notes.append(f"{shot['t_start']:.2f}s: cue ball moved without a shot (ball in hand?)")
+            self.state = "aiming"
+            self.history.clear()
+            self.recent.clear()
+            self.tracker.reset()
+            self._set_still(frame, after, cue_hint=cue_after)
+            self.shot = None
+            return None
         objf = getattr(self, "object_follower", None)
         object_potted = None if objf is None else bool(objf.lost and near_pocket(*objf.pos, rest.table, r))
         self.shots += 1
@@ -661,6 +865,7 @@ class ShotRecorder:
                 "aim_degrees": None if aim is None else _angle(aim.aim_dir),
                 "ghost": None if aim is None or aim.ghost is None else list(aim.ghost[:2]),
                 "object_ball": object_index,
+                "aimed_at_ball": aimed_at,
                 "object_dir_degrees": None if aim is None else _angle(aim.object_dir),
                 "cue_dir_degrees": None if aim is None else _angle(aim.cue_dir),
                 "pot_call": None if aim is None else aim.pot,

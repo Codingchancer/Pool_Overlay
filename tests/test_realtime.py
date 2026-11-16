@@ -158,6 +158,21 @@ class ShotTrackerTests(unittest.TestCase):
         self.assertEqual(flags[:tracker.FULL_READ_EVERY + 2],
                          [False] + [True] * tracker.FULL_READ_EVERY + [False])
 
+    def test_slider_found_again_after_it_was_hidden(self):
+        # The last full detection had no slider (hidden then, e.g. on the
+        # opponent's turn): tracked frames kept reading no power at all.
+        hidden = dataclasses.replace(self.scene, power=None)
+        shown = dataclasses.replace(self.scene, power=.6)
+        frame_hidden, _ = fake_game.render(hidden)
+        frame_shown, _ = fake_game.render(shown)
+        tracker = ShotTracker()
+        tracker.detect(frame_hidden, now=0)
+        self.assertIsNone(tracker.base.power_slider)
+        tracked = tracker.detect(frame_shown, now=tracker.SLIDER_RETRY_SECONDS + .01)
+        self.assertFalse(tracker.last_was_full)
+        self.assertIsNotNone(tracked.power_percent)
+        self.assertAlmostEqual(tracked.power_percent, 60, delta=2)
+
     def test_a_moved_ball_means_a_full_detection(self):
         tracker = ShotTracker()
         tracker.detect(self.first, now=0)

@@ -165,7 +165,7 @@ def score_shot(plan, record, start_cue, start_balls, logs, truth_at, game, slide
         if np.hypot(a["x"] - final_balls[n][0], a["y"] - final_balls[n][1]) > END_TOL:
             wrong_end += 1
     if wrong_end:
-        out["problems"].append(f"{wrong_end} balls matched to the wrong end spot")
+        out["problems"].append(f"{wrong_end} balls' end spot off by more than {END_TOL}px")
     return out
 
 
