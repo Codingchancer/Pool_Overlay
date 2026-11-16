@@ -20,7 +20,6 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| White tables: ghost ball, cue-ball centre, stripes, aim speed | detector | Jartartarta | `jartartarta/white-tables` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Power needed for a shot:** record ~20-30 real shots (slider % at release + where the balls stop) to fit Miniclip's friction and the %-to-speed scale per cue; then compute the minimum power to pot and add it to `Detection` for Codingchancer to mark on the slider. Also confirm the slider reading on a mid-drag and a full-power frame.
@@ -28,12 +27,15 @@ Border rules:
 - [ ] **Real-game tests:** turn the saved bad frames into tests that skip when the image is missing (like the existing screenshot tests), so fixes stay fixed.
 - [ ] Balls boxed in inside a rack can be off by ~0.5 radius (mostly fixed by the packing grid, #27; a few left in the wide sweep).
 - [ ] Raise the synthetic pass rate (`stress_test.py --count 300`) from 286/300 towards 297+/300 without making real-game results worse.
-- [ ] White cloth precision: cue-ball centre (3-7 px off; outline, rise and shadow-free fits all tried and lost to the drop shadow's edge) and striped balls on pure white tables; check on a live white table.
+- [ ] **Struck ball nearly touching the cue ball** (every cloth): the ghost ring lies on the cue ball and the detector misses the struck ball or names another cue ball. Synthetic 'near' shots pass 6/30 on blue, 1/30 on white, 3/30 on light grey; the shot recorder logs such shots' struck ball as unknown.
+- [ ] **Light grey cloth** (96/150 synthetic, white is now 105): the white-cloth fixes (#33) are gated to near-white cloth; check which apply.
+- [ ] White cloth leftovers: a ball lying on the table's watermark lettering keeps its circle-finding centre (the letters' edges read as a second rim); stripes packed in a rack; check on a live white table.
 
 ## Next — Codingchancer (overlay + simulator)
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
 
 ## Done
+- [x] White tables (Jartartarta, #33): cue ball and striped balls fitted on their lit-side rim dip (cue 1.4 -> 0.44 px typical, loose stripes 2.9 -> 0.65 px), the aim ray / object line / cue line read as thin ridges between their outlines (their white core is no brighter than white cloth), ghost found on ridges when the plain strokes show none, robust shadow direction. Synthetic white 75 -> 105/150; the 17 other cloths identical frame by frame; real frames identical; stress 286/300; live 12/12. White aim read 19 ms fast / 31 ms full (was 12 / 27, without reading the object line).
 - [x] Live check crash fixed (Jartartarta, #32): a stale capture.png (Fit table's whole-desktop dump that another program held open, so the analysis could not replace it) is skipped instead of compared. Live check 12/12 again; no change to the app.
 - [x] Shot recorder for the power fit (Jartartarta, #31): `shot_recorder.py` logs real shots from the mirror (slider % at release, cue/struck-ball tracks, where balls stopped, release/rest frames) to `outputs/shots/`. `recorder_check.py` on 18 synthetic cloths: 256/288 shots right in everything the fit uses, 19 more with the struck ball touching the cue ball logged as unknown. Also: slider read at full power with the stick across it; tracker finds a slider that was hidden. Not yet run on the real mirror.
 - [x] Fast aim reader (Jartartarta, #30, in Codingchancer's `tracking.py` as agreed): the tracker reads the aim near last frame's ghost ball, with a plain read every 8 frames and whenever the hint does not fit. Synthetic aiming sweeps: aim read ~5 ms instead of ~14 (white ~12 instead of ~27), tracked frame ~7 ms instead of ~14, same or better accuracy against the truth; real screenshots 8/8 the same; live check 12/12. Not yet measured on a live AirPlay mirror.
