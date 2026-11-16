@@ -108,6 +108,12 @@ def main_cli():
             layer = cv2.imread(str(work / "layer.png"), cv2.IMREAD_UNCHANGED)
             if cleaned is None or capture is None or layer is None or cleaned.shape[:2] != (oh, ow):
                 continue
+            if capture.shape != cleaned.shape:
+                # A stale capture.png: Fit table's whole-desktop grab, which
+                # another program (a virus scanner reading the fresh 6 MB file)
+                # held open while the analysis tried to replace it. Wait for
+                # the next analysed frame.
+                continue
             # Which scene does this analysed frame show? Only judge exact matches.
             match = None
             for seed in (info["seed"], info["seed"] - 1):
