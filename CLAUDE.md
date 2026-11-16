@@ -38,6 +38,7 @@ It is a **visual practice aid only**. Never add code that clicks, aims, moves th
 - Balls: Hough circles on a cloth-difference image and a grey image, refined to sub-pixel on the rim, rejected when the inside is mostly cloth.
 - Cue ball = the white ball whose aim ray ends in Miniclip's hollow ghost-ball reticle. Aim = polar ray scan + sub-pixel ghost.
 - Target = ball touching the ghost; object/cue lines are fitted on the game's own short white lines when visible.
+- White cloth: lines read as thin ridges between their dark outlines (`white_stroke_masks`); cue ball and stripes fitted on the lit-side rim dip (`_WhiteCloth`), away from the shadow direction the balls show.
 
 ## Capture feedback (important)
 The guide is visible in screenshots/screen shares (`WDA_NONE`). To stop it feeding back into detection, every stroke is drawn at ≤60% alpha and the exact rendered layer is un-blended from each capture (`remove_overlay`); the control panel is greyed out in captures; right after a repaint the screen may still show an older drawing, so the overlay keeps its recent drawings and `shown_layer` picks the one the capture really shows (no fixed wait). With window capture (the default when a mirror window is under the guide) the guide is not in the frames at all; screen capture + removal is the fallback. Any change to drawing must keep these working — test the detect → draw → capture loop, not just window visibility (`tests/test_aim_alignment_and_capture.py`). `POOL_OVERLAY_DEBUG_DIR` dumps capture/layer/cleaned frames.
