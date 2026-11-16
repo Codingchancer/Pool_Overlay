@@ -58,21 +58,26 @@ class Detection:
 
 
 def white_guide_mask(roi: np.ndarray, balls: list[tuple[int, int, int, str]],
-                     ball_scale: float = 1.18, hsv: np.ndarray | None = None) -> np.ndarray:
+                     ball_scale: float = 1.18, hsv: np.ndarray | None = None, ridges: bool = False) -> np.ndarray:
     """Pixels of Miniclip's white guide graphics, with ball faces removed.
 
     Miniclip draws its aim ray, ghost-ball reticle, object-ball line and
     cue-deflection line in near-white. Ball faces (cue ball, stripes, number
     badges) are white too, so they are masked out.
     """
-    mask = white_strokes(roi, hsv)
+    mask = white_strokes(roi, hsv, ridges=ridges)
     for bx, by, br, _ in balls:
         cv2.circle(mask, (int(bx), int(by)), int(br * ball_scale), 0, thickness=-1)
     return mask
 
 
-def white_strokes(roi: np.ndarray, hsv: np.ndarray | None = None) -> np.ndarray:
-    """``white_guide_mask`` before the ball faces are removed (a new array)."""
+def white_strokes(roi: np.ndarray, hsv: np.ndarray | None = None, ridges: bool = False) -> np.ndarray:
+    """``white_guide_mask`` before the ball faces are removed (a new array).
+
+    ``ridges`` (for finding the aim ray's direction): on a white cloth also
+    thin bright ridges between dark outlines. Not for the ghost ring: where
+    two strokes meet inside it, the cloth between their outlines reads as a
+    ridge too and fills the hollow ring."""
     if hsv is None:
         hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
     # Measured on both bundled frames: guide strokes have saturation <= ~60,
@@ -92,7 +97,13 @@ def white_strokes(roi: np.ndarray, hsv: np.ndarray | None = None) -> np.ndarray:
         # compression ringing beside their dark outlines is not brighter).
         v = hsv[:, :, 2]
         around = local_lightness(v)
-        mask &= ((v.astype(np.float32) - around) >= LIGHT_CLOTH_STROKE).astype(np.uint8) * 255
+        brighter = (v.astype(np.float32) - around) >= LIGHT_CLOTH_STROKE
+        if ridges:
+            # On a white cloth the stroke's white core is no brighter than the
+            # cloth itself (both ~190 where the lighting falls off): it shows
+            # as a thin ridge between its dark outlines (~125).
+            brighter |= thin_ridges(v, LIGHT_CLOTH_RIDGE)
+        mask &= brighter.astype(np.uint8) * 255
         # Compression speckles next to dark edges pass that too; the guide's
         # strokes are long connected lines and rings.
         count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
@@ -109,8 +120,32 @@ LIGHT_CLOTH_L = 150.0
 # shadows) counts in the cloth-distance image; a lighter one counts in full.
 DARKER_SHADE_WEIGHT = .25
 # On a light cloth a guide stroke is at least this much brighter than the
-# cloth around it.
+# cloth around it,
 LIGHT_CLOTH_STROKE = 10
+# or a thin ridge at least this much brighter than both sides.
+LIGHT_CLOTH_RIDGE = 40
+
+
+def thin_ridges(v: np.ndarray, rise: float) -> np.ndarray:
+    """Pixels at least ``rise`` brighter than the darkest pixel 1-3 px away
+    on *both* sides, in one of four directions: the core of a thin bright
+    line between dark outlines. (Cloth beside a single dark line is darker
+    on one side only; a wide bright area has no dark sides.)"""
+    f = v.astype(np.float32)
+    padded = cv2.copyMakeBorder(f, 3, 3, 3, 3, cv2.BORDER_REPLICATE)
+    h, w = f.shape
+    out = np.zeros(f.shape, bool)
+    for dx, dy in ((1, 0), (0, 1), (1, 1), (1, -1)):
+        sides = []
+        for sign in (1, -1):
+            darkest = None
+            for k in (1, 2, 3):
+                ox, oy = 3 + sign * k * dx, 3 + sign * k * dy
+                shifted = padded[oy:oy + h, ox:ox + w]
+                darkest = shifted if darkest is None else np.minimum(darkest, shifted)
+            sides.append(darkest)
+        out |= f - np.maximum(sides[0], sides[1]) >= rise
+    return out
 
 
 def _cloth_saturation(hsv: np.ndarray) -> float:
@@ -456,7 +491,7 @@ def aim_candidates(roi: np.ndarray, cue: tuple[int, int, int],
     in a wrong direction. The caller keeps the one that ends in a ghost ball.
     """
     cx, cy, cr = cue
-    mask = cv2.dilate(white_guide_mask(roi, balls), np.ones((3, 3), np.uint8))
+    mask = cv2.dilate(white_guide_mask(roi, balls, ridges=True), np.ones((3, 3), np.uint8))
     h, w = mask.shape[:2]
     start = cr * 1.3
     steps = np.arange(start, start + max(6 * cr, 40), 1.0)
@@ -2135,38 +2170,84 @@ def stick_direction(stick_lines, cue_xy: tuple[float, float], radius: float,
 def shadow_direction(lightness: np.ndarray, cloth: np.ndarray, balls, radius: float) -> tuple[float, float] | None:
     """Unit direction in which the balls' drop shadows fall, measured as the
     darkest side of a ring just outside each object ball (None when too few
-    balls show one). All shadows fall the same way."""
-    vectors = []
-    for bx, by, _, kind in balls:
+    balls show one). All shadows fall the same way.
+
+    Directions towards a neighbouring ball are left out of its ring (in a
+    rack every ring touched others, so no ball counted), and the darkness is
+    taken against the free arc's own average (a partial arc has a direction
+    of its own). Only clearly one-sided rings count, and the direction most
+    of them agree on wins: a false ball candidate (a ring of the stick or
+    the guide, with its dark outlines) reads some other side, and a plain
+    average fell apart (white cloth, synthetic seed 40001: 11 balls at ~51
+    deg, 5 candidates at about -125 deg). Synthetic white racks: found on
+    28/30 within 13 deg (was 26/30, up to 42 deg off)."""
+    angles, weights = [], []
+    points = [(b[0], b[1]) for b in balls]
+    for i, (bx, by, _, kind) in enumerate(balls):
         if kind == "cue":
+            continue
+        free = np.ones(len(_RIM_ANGLES), bool)
+        for j, (ox, oy) in enumerate(points):
+            dist = float(np.hypot(ox - bx, oy - by))
+            if j == i or dist < 1e-6 or dist > 2.8 * radius:
+                continue
+            free &= np.cos(_RIM_ANGLES - np.arctan2(oy - by, ox - bx)) < np.cos(np.radians(40))
+        if free.mean() < .4:
             continue
         xs = (bx + radius * 1.2 * np.cos(_RIM_ANGLES))[None].astype(np.float32)
         ys = (by + radius * 1.2 * np.sin(_RIM_ANGLES))[None].astype(np.float32)
         value = cv2.remap(lightness, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
         around = cv2.remap(cloth, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
-        dark = np.clip(around - value, 0, 60)
-        # A ring mostly dark is packed among other balls: no shadow to read.
-        if dark.sum() < 1 or (dark > 25).mean() > .6:
+        dark = np.clip(around - value, 0, 60)[free]
+        if dark.sum() < 1:
             continue
-        v = np.array([np.sum(dark * np.cos(_RIM_ANGLES)), np.sum(dark * np.sin(_RIM_ANGLES))])
-        vectors.append(v / (np.linalg.norm(v) + 1e-9))
-    if len(vectors) < 2:
+        arc = _RIM_ANGLES[free]
+        excess = dark - dark.mean()
+        v = np.array([np.sum(excess * np.cos(arc)), np.sum(excess * np.sin(arc))])
+        one_sided = float(np.linalg.norm(v) / dark.sum())
+        if one_sided < SHADOW_ONE_SIDED * free.mean():
+            continue
+        angles.append(float(np.arctan2(v[1], v[0])))
+        weights.append(one_sided)
+    if len(angles) < 2:
         return None
-    mean = np.mean(vectors, axis=0)
+    angles, weights = np.array(angles), np.array(weights)
+    agree = np.cos(angles[:, None] - angles[None, :])
+    support = (np.clip(agree, 0, None) * weights[None, :]).sum(axis=1)
+    inliers = agree[int(np.argmax(support))] >= np.cos(np.radians(40))
+    if inliers.sum() < 2 or weights[inliers].sum() < .5 * weights.sum():
+        return None
+    mean = np.array([np.sum(weights[inliers] * np.cos(angles[inliers])),
+                     np.sum(weights[inliers] * np.sin(angles[inliers]))])
     norm = float(np.linalg.norm(mean))
-    return None if norm < .5 else (float(mean[0] / norm), float(mean[1] / norm))
+    return (float(mean[0] / norm), float(mean[1] / norm))
+
+
+# A ball's ring counts for the shadow direction when its darkness is at
+# least this one-sided (|sum of dark * direction| / sum of dark; a real
+# shadow reads ~0.7-0.85, a ring among strokes or packed balls ~0.1-0.5).
+SHADOW_ONE_SIDED = .45
 
 
 def white_cloth_cue_centre(roi: np.ndarray, cue_xy: tuple[float, float], balls,
                            offset: tuple[int, int]) -> tuple[float, float] | None:
-    """Cue-ball centre on a white or light grey cloth, or None elsewhere.
+    """Cue-ball centre on a white cloth, or None elsewhere (or when unsure).
 
-    There the ball's shaded rim and its drop shadow are equally dark, so on
-    the shadow side its edge cannot be seen and a full-circle fit slides
-    towards the shadow (3-7 px). The rim is fitted on the lit half only (away
-    from the shadow, whose direction the object balls show), on the
-    brightness step at the edge, leaving out the guide's strokes and the
-    stick (very bright or dark pixels) that cross the rim.
+    There the ball's rim is shaded darker than the cloth, and on the shadow
+    side its drop shadow continues that darkness, so circle finding slides
+    towards the shadow (3-8 px). The steepest brightness step is inside the
+    ball (its lit middle falling off into the shaded rim), so fitting the
+    step slid the same way. What marks the rim on the lit side is the dip:
+    darker than the ball inside and the cloth outside. On each ray of the
+    lit half the outermost clear dip is taken, and a circle is fitted to
+    those points by consensus (a stroke crossing the rim, the cue ball's
+    dots or the aim line inside it fall out), first from the rough centre
+    over a wide band, then again from that fit. Synthetic white tables:
+    0.22 px typical, against 1.1 px (7 px at the 90th percentile) before.
+
+    A ghost ring lying on top of the cue ball (the struck ball right beside
+    it) is a crisp circle too: a fit with a thin bright stroke along most of
+    it is that ring, and None is returned.
     """
     lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
     lightness = lab[:, :, 0].astype(np.float32)
@@ -2190,45 +2271,147 @@ def white_cloth_cue_centre(roi: np.ndarray, cue_xy: tuple[float, float], balls,
     sdir = shadow_direction(lightness, cloth, local, radius)
     if sdir is None:
         return None
-    strokes = ((lightness > cloth + 15) | (lightness < 110)).astype(np.uint8)
-    strokes = cv2.dilate(strokes, np.ones((3, 3), np.uint8), iterations=2).astype(bool)
-    angles = _RIM_ANGLES[np.cos(_RIM_ANGLES - np.arctan2(sdir[1], sdir[0])) < WHITE_CUE_LIT]
-    cos, sin = np.cos(angles), np.sin(angles)
-    best, best_score = (float(cx), float(cy)), None
-    for step, span in ((1.0, WHITE_CUE_REACH), (.25, 1.0)):
-        offsets = np.arange(-span, span + 1e-6, step)
-        found = None
-        for px in best[0] + offsets:
-            for py in best[1] + offsets:
-                for r in np.arange(radius * .92, radius * 1.08 + 1e-6, .25):
-                    inner = (px + (r - 1) * cos, py + (r - 1) * sin)
-                    outer = (px + (r + 1) * cos, py + (r + 1) * sin)
-                    a = cv2.remap(lightness, inner[0][None].astype(np.float32), inner[1][None].astype(np.float32),
-                                  cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
-                    b = cv2.remap(lightness, outer[0][None].astype(np.float32), outer[1][None].astype(np.float32),
-                                  cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
-                    ok = np.ones(len(angles), bool)
-                    for xs, ys in (inner, outer):
-                        ok &= ~strokes[np.clip(ys.astype(int), 0, h - 1), np.clip(xs.astype(int), 0, w - 1)]
-                    if ok.mean() < .4:
-                        continue
-                    value = float(np.abs(b - a)[ok].mean())
-                    if found is None or value > found[0]:
-                        found = (value, (float(px), float(py)))
-        if found is None:
-            return None
-        best_score, best = found
-    return best
+    x0, y0 = float(cx), float(cy)
+    others = [(bx, by) for bx, by, _, _ in local if np.hypot(bx - x0, by - y0) > radius * .6]
+    fit = None
+    for inner, outer in ((.4, 1.9), (.55, 1.35)):
+        points = _lit_rim_dips(lightness, cx, cy, radius, sdir, inner, outer, others)
+        found = _consensus_circle(points, cx, cy, radius) if len(points) >= WHITE_RIM_MIN_POINTS else None
+        if found is None or np.hypot(found[0] - x0, found[1] - y0) > .8 * radius:
+            # The narrow pass from a good first fit can be short of points
+            # (stroke crossings): keep the first fit then.
+            if fit is None:
+                return None
+            break
+        fit = found
+        cx, cy = fit[0], fit[1]
+    if _thin_stroke_share(lightness, *fit) > WHITE_RING_STROKE:
+        return None
+    return fit[0], fit[1]
 
 
+def _lit_rim_dips(lightness: np.ndarray, cx: float, cy: float, radius: float, sdir, inner: float,
+                  outer: float, others=()) -> np.ndarray:
+    """Rim points on the lit side (rays more than ~100 deg from the shadow):
+    on each ray from (cx, cy) between ``inner`` and ``outer`` radii, the
+    outermost dip at least ``WHITE_RIM_DIP`` below the cloth's level (the
+    ray's outer quarter), with that level coming back right after it. (Not
+    the deepest dip: the cue ball's dots and the aim line inside the ball
+    are darker than its rim.) Rays where
+    a stroke or the stick runs on beyond the dip are left out, and so are
+    rays towards ``others`` (balls) within 3.2 radii: their near rim is a
+    dip too (a rack: a second circle at 1.3-1.5 radii)."""
+    shadow = np.arctan2(sdir[1], sdir[0])
+    keep = np.cos(_WHITE_RIM_ANGLES - shadow) < -.2
+    for ox, oy in others:
+        dist = float(np.hypot(ox - cx, oy - cy))
+        if dist <= 3.2 * radius:
+            half = np.arcsin(min(1.0, 1.2 * radius / dist)) + np.radians(5)
+            keep &= np.cos(_WHITE_RIM_ANGLES - np.arctan2(oy - cy, ox - cx)) < np.cos(half)
+    angles = _WHITE_RIM_ANGLES[keep]
+    steps = np.arange(inner * radius, outer * radius, .25)
+    xs = (cx + np.outer(np.cos(angles), steps)).astype(np.float32)
+    ys = (cy + np.outer(np.sin(angles), steps)).astype(np.float32)
+    profiles = cv2.remap(lightness, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    back = int(round(.35 * radius / .25))
+    points = []
+    for angle, p in zip(angles, profiles):
+        level = float(np.median(p[-max(4, len(p) // 4):]))
+        minima = np.nonzero((p[1:-1] <= p[:-2]) & (p[1:-1] <= p[2:]))[0] + 1
+        if not len(minima):
+            continue
+        depth = level - p[minima]
+        chosen = None
+        for j, dj in zip(minima[::-1], depth[::-1]):
+            if dj < WHITE_RIM_DIP or p[:j].max() - p[j] < 6:
+                continue
+            after = p[j + 1:j + 1 + back]
+            if len(after) == 0 or after.max() < level - 6:
+                continue
+            chosen = int(j)
+            break
+        if chosen is None:
+            continue
+        j = chosen
+        beyond = p[j + back:]
+        if len(beyond) and ((beyond < level - 15).mean() > .3 or (beyond > level + 25).any()):
+            continue
+        a, b, c = p[j - 1], p[j], p[j + 1]
+        den = a - 2 * b + c
+        shift = float(np.clip(.5 * (a - c) / den, -.5, .5)) if den > 1e-6 else 0.0
+        t = steps[j] + shift * .25
+        points.append((cx + t * np.cos(angle), cy + t * np.sin(angle)))
+    return np.array(points) if points else np.zeros((0, 2))
+
+
+def _circle_through(points: np.ndarray) -> tuple[float, float, float]:
+    a = np.column_stack([points[:, 0], points[:, 1], np.ones(len(points))])
+    sol, *_ = np.linalg.lstsq(a, points[:, 0] ** 2 + points[:, 1] ** 2, rcond=None)
+    fx, fy = sol[0] / 2, sol[1] / 2
+    return float(fx), float(fy), float(np.sqrt(max(1e-9, sol[2] + fx ** 2 + fy ** 2)))
+
+
+def _consensus_circle(points: np.ndarray, cx: float, cy: float, radius: float):
+    """The circle most rim points agree on (within 0.75 px): (x, y, r), or
+    None when too few agree or they cover less than 90 deg of the rim.
+    Circles through three points at a time (a fixed random sequence, so the
+    result is repeatable), radius 0.8-1.05 of the ball's."""
+    rng = np.random.default_rng(0)
+    n = len(points)
+    best = best_circle = None
+    for _ in range(200):
+        fx, fy, fr = _circle_through(points[rng.choice(n, 3, replace=False)])
+        if not (.8 * radius <= fr <= 1.05 * radius) or np.hypot(fx - cx, fy - cy) > .8 * radius:
+            continue
+        inliers = np.abs(np.hypot(points[:, 0] - fx, points[:, 1] - fy) - fr) < .75
+        if best is None or inliers.sum() > best.sum():
+            best, best_circle = inliers, (fx, fy, fr)
+    if best is None or best.sum() < WHITE_RIM_MIN_POINTS or best.mean() < .5:
+        return None
+    chosen = points[best]
+    angles = np.sort(np.arctan2(chosen[:, 1] - cy, chosen[:, 0] - cx))
+    gaps = np.diff(np.concatenate([angles, [angles[0] + 2 * np.pi]]))
+    if 2 * np.pi - gaps.max() < np.radians(90):
+        return None
+    fx, fy, fr = _circle_through(chosen)
+    # A short arc can make the free fit wander; then keep the consensus circle.
+    if not (.8 * radius <= fr <= 1.05 * radius) or np.hypot(fx - best_circle[0], fy - best_circle[1]) > 1.5:
+        fx, fy, fr = best_circle
+    return fx, fy, fr
+
+
+def _thin_stroke_share(lightness: np.ndarray, fx: float, fy: float, fr: float) -> float:
+    """Share of angles with a thin bright stroke within 2.5 px of the circle
+    (a peak at least 15 brighter than pixels within 3 px on both sides): a
+    ghost ring's white line between its dark outlines. A ball's rim has its
+    bright middle further in and no such peak (at most 0.47 on synthetic
+    white tables; a ring 0.97 or more)."""
+    offsets = np.arange(-5.0, 5.01, .5)
+    xs = (fx + np.outer(np.cos(_WHITE_RIM_ANGLES), fr + offsets)).astype(np.float32)
+    ys = (fy + np.outer(np.sin(_WHITE_RIM_ANGLES), fr + offsets)).astype(np.float32)
+    profiles = cv2.remap(lightness, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    near = np.nonzero(np.abs(offsets) <= 2.5)[0]
+    hits = 0
+    for p in profiles:
+        for k in near:
+            below, above = p[max(0, k - 6):k], p[k + 1:k + 7]
+            if len(below) and len(above) and p[k] - below.min() >= 15 and p[k] - above.min() >= 15:
+                hits += 1
+                break
+    return hits / len(profiles)
+
+
+_WHITE_RIM_ANGLES = np.linspace(0, 2 * np.pi, 96, endpoint=False)
 # Cloth lightness (Lab L, 8-bit) from which the cue ball is fitted on its
 # lit side, as the table's brightest cloth (white ~225-231; light grey ~182).
 WHITE_CLOTH_L = 205.0
-# How far (px) the white-cloth cue fit may move the circle-finding centre.
-WHITE_CUE_REACH = 4.0
-# Rim arc used: cos(angle from the shadow) below this (the lit side, with
-# margin for an error in the measured shadow direction).
-WHITE_CUE_LIT = -.4
+# A rim dip is at least this much darker than the cloth on its ray.
+WHITE_RIM_DIP = 8.0
+# A white-cloth rim fit needs at least this many agreeing rim points.
+WHITE_RIM_MIN_POINTS = 12
+# Above this share of thin bright strokes along it, a fitted circle is a
+# ghost ring, not the cue ball.
+WHITE_RING_STROKE = .7
 
 
 def grid_spot(points, index: int, radius: float, need: int = 2) -> tuple[float, float] | None:
@@ -2895,9 +3078,14 @@ def detect(frame: np.ndarray) -> Detection:
             # line can pass for a ray ending in a "ghost". The cue ball is
             # the purest white ball: a much whiter, less saturated candidate
             # wins over a striped one.
+            # (On a colourless light cloth a striped ball's white half is as
+            # unsaturated as the cue ball, 4 against 4 on synthetic seed
+            # 40003: there the whiteness alone decides.)
             whitest = max(cue_candidates, key=lambda c: c[5])
+            roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+            colourless = _light_cloth(roi_hsv) and _cloth_saturation(roi_hsv) < 40
             if (cue is not None and whitest is not cue and whitest[5] >= .75
-                    and whitest[5] >= cue[5] + .15 and whitest[3] <= cue[3] - 10):
+                    and whitest[5] >= cue[5] + .15 and (colourless or whitest[3] <= cue[3] - 10)):
                 cue = whitest
         if cue:
             cue_index = min(range(len(balls)), key=lambda i: np.hypot(balls[i][0]-cue[0], balls[i][1]-cue[1]))
