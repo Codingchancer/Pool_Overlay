@@ -236,6 +236,59 @@ class SimGame:
         """A frame while the balls roll: no stick, no guide."""
         return fg.render(self.scene(balls=balls, cue=cue if cue is not None else (-100.0, -100.0)))
 
+    def shot_stream(self, plan: ShotPlan, fps: float = 60.0, t0: float = 0.0, aim: float = .4,
+                    drag: float = .5, hold: float = .3, rest: float = 1.0, snap_frames: int = 0,
+                    slider: bool = True):
+        """Frames of one whole shot as the mirror shows them: aiming, dragging
+        the power slider down to ``plan.power``, holding, the release (the
+        slider snaps back over ``snap_frames`` frames while the stick strikes),
+        the balls rolling, and the table at rest. Yields (time, frame, phase);
+        the shot is played (``shoot``) between the aiming and the rolling
+        frames, so ``self.shots[-1]`` is its record afterwards. ``slider``
+        False hides the slider (as on the opponent's turn)."""
+        step = 1.0 / fps
+        t = t0
+        power = min(1.0, plan.power)
+
+        def aim_frame(p, pull):
+            return fg.render(self.scene(aim_degrees=plan.aim_degrees, guide=True, stick=True,
+                                        power=p if slider else None, pull=pull))[0]
+
+        for _ in range(int(round(aim * fps))):
+            yield t, aim_frame(0.0, .3), "aim"
+            t += step
+        n = max(1, int(round(drag * fps)))
+        for k in range(1, n + 1):
+            p = power * k / n
+            yield t, aim_frame(p, .3 + 2.2 * p), "drag"
+            t += step
+        for _ in range(int(round(hold * fps))):
+            yield t, aim_frame(power, .3 + 2.2 * power), "hold"
+            t += step
+        # The release: the slider snaps back while the stick strikes.
+        snaps = max(1, snap_frames)
+        for k in range(1, snaps + 1):
+            p = power * (1 - k / snaps)
+            pull = (.3 + 2.2 * power) * (1 - k / snaps)
+            yield t, aim_frame(p, pull), "release"
+            t += step
+        record = self.shoot(plan, every=1)
+        # The physics runs at 60 Hz; at a lower frame rate frames are skipped.
+        ratio = 60.0 / fps
+        k = 0.0
+        while int(k) < len(record.positions):
+            cue, balls = record.positions[int(k)]
+            yield t, fg.render(self.scene(balls=balls, cue=cue if cue is not None else (-100.0, -100.0),
+                                          power=0.0 if slider else None))[0], "roll"
+            t += step
+            k += ratio
+        cue, balls = record.positions[-1] if record.positions else (self.cue, self.balls)
+        still = fg.render(self.scene(balls=balls, cue=cue if cue is not None else (-100.0, -100.0),
+                                     power=0.0 if slider else None))[0]
+        for _ in range(int(round(rest * fps))):
+            yield t, still, "rest"
+            t += step
+
     # --- shooting ------------------------------------------------------------
 
     def _simulate(self, plan: ShotPlan):

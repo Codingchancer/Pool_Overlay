@@ -2634,13 +2634,14 @@ def find_power_slider(frame: np.ndarray, table: tuple[int, int, int, int]) -> tu
     candidates = []
     for i in range(1, count):
         x, y, w, h, area = stats[i]
-        if not (.55 * height <= h <= 1.05 * height and .025 * width <= w <= .09 * width and h >= 5 * w):
+        # A piece of the frame is enough to start from: a stick lying across
+        # the slot can cut it into two (at full power on a break, 24% and
+        # 55% of the table's height). The whole box is checked below.
+        if not (.3 * height <= h <= 1.05 * height and .025 * width <= w <= .09 * width and h >= 3 * w):
             continue
         # A framed slot, not a thin edge line (the real frame fills ~17% of
         # its box, a rail edge ~5%).
         if area < .1 * w * h:
-            continue
-        if abs(y + h / 2 - (top + height / 2)) > height * .2:
             continue
         # The cue stick can lie across the slot and cut its frame in two:
         # carry on over a short gap in the same columns.
@@ -2676,7 +2677,12 @@ def find_power_slider(frame: np.ndarray, table: tuple[int, int, int, int]) -> tu
             if reach - top_row > 1.05 * height or not framed(max(bottom_row + 1, reach + 1 - run * 4), reach + 1):
                 break
             bottom_row = reach
-        candidates.append((int(x), top_row, int(w), bottom_row - top_row + 1))
+        full = bottom_row - top_row + 1
+        if not (.55 * height <= full and full >= 5 * w):
+            continue
+        if abs((top_row + bottom_row) / 2 - (top + height / 2)) > height * .2:
+            continue
+        candidates.append((int(x), top_row, int(w), full))
     # Closest to the table first (other tall icons sit further left); it must
     # hold the cue, or be an empty dark slot (cue dragged all the way down).
     for rect in sorted(candidates, key=lambda r: -r[0]):
@@ -2694,7 +2700,18 @@ def _slider_empty(frame: np.ndarray, slider: tuple[int, int, int, int]) -> bool:
     if strip.size == 0:
         return False
     value = np.median(cv2.cvtColor(strip, cv2.COLOR_BGR2HSV)[:, :, 2], axis=1)
-    return bool(np.mean(value < 110) > .95)
+    # Rows where a stick lies across the slot cover its grey frame too: those
+    # rows do not count (at full power on a break the stick crosses it).
+    rows = slice(int(y + h * .06), int(y + h * .94))
+    edge = max(2, int(round(w * .12)))
+    sides = cv2.cvtColor(np.hstack([frame[rows, x:x + edge], frame[rows, x + w - edge:x + w]]), cv2.COLOR_BGR2HSV)
+    grey = (sides[:, :, 1] < 80) & (sides[:, :, 2] >= 90) & (sides[:, :, 2] <= 190)
+    framed = grey.mean(axis=1) >= .5
+    n = min(len(value), len(framed))
+    value, framed = value[:n], framed[:n]
+    if framed.sum() < n * .7:
+        return False
+    return bool(np.mean(value[framed] < 110) > .95)
 
 
 def _slider_centre(frame: np.ndarray, slider: tuple[int, int, int, int]) -> float:
