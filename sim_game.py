@@ -26,10 +26,6 @@ from pool_rules import CUE, EIGHT, EightBallGame, ShotFacts
 # The physics' speeds suit a table about this wide (px); shots are simulated
 # at this scale and mapped back to the frame.
 PHYSICS_WIDTH = 800.0
-# A ball drops when it touches a rail within this many ball radii of where
-# the cushion nose meets a pocket (the renderer's own pot rule), or its
-# centre reaches a hole.
-POCKET_MOUTH_RADII = 2.0
 # Standard 8-ball rack order (apex first, row by row): the 8 in the middle of
 # the third row, a solid and a stripe in the back corners.
 RACK_ORDER = (1, 9, 2, 10, 8, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15)
@@ -257,21 +253,6 @@ class SimGame:
         def back(fx, fy):
             return (x0 + fx / scale, y0 + fy / scale)
 
-        # Pockets as the rendered table has them (the physics' walls run
-        # straight past the mouths, so a ball would bounce off there).
-        holes = fg.pocket_holes(self.table)
-        r = self.r
-        # The renderer's own rule (fake_game.truth_path): a rail contact
-        # within two radii of where the cushion nose meets a pocket.
-        mouths = [(x0 + r, y0 + r), (x0 + w / 2, y0 + r), (x0 + w - r, y0 + r),
-                  (x0 + r, y0 + h - r), (x0 + w / 2, y0 + h - r), (x0 + w - r, y0 + h - r)]
-
-        def drops(x, y):
-            on_rail = min(x - x0 - r, x0 + w - r - x, y - y0 - r, y0 + h - r - y) <= .25 * r
-            if on_rail and any(np.hypot(x - mx, y - my) <= POCKET_MOUTH_RADII * r for mx, my in mouths):
-                return True
-            return any(np.hypot(x - hx, y - hy) <= hr for hx, hy, hr in holes)
-
         dropped: set[int] = set()
         order_dropped: list[int] = []
         positions = []
@@ -279,8 +260,9 @@ class SimGame:
             for n, f in zip(order, frame):
                 if n in dropped:
                     continue
-                x, y = back(f.x, f.y)
-                if f.pocketed or drops(x, y):
+                # The physics drops a ball at a rail within two radii of a
+                # pocket's mouth, the drawn table's own rule.
+                if f.pocketed:
                     dropped.add(n)
                     order_dropped.append(n)
             cue = None if CUE in dropped else back(frame[0].x, frame[0].y)

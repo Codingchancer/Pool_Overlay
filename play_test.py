@@ -154,8 +154,7 @@ def summarize(games):
         called = [s for s in hit if s.get("target_found") and low <= s["power"] < high and s["pot_said"] == "pot"]
         if len(part):
             out.append(f"  {name}: direction within 2 deg {np.mean(part <= 2) * 100:.0f}% (n={len(part)}); "
-                       f"called pots that dropped {sum(s['pot_real'] for s in called)}/{len(called)}"
-                       + (" (the physics' steps are coarse at break speed)" if low else ""))
+                       f"called pots that dropped {sum(s['pot_real'] for s in called)}/{len(called)}")
     pots = [s for s in hit if s.get("target_found")]
     agree = sum((s["pot_said"] == "pot") == s["pot_real"] for s in pots)
     said_pot = [s for s in pots if s["pot_said"] == "pot"]
