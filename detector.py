@@ -2543,19 +2543,38 @@ def find_power_slider(frame: np.ndarray, table: tuple[int, int, int, int]) -> tu
             continue
         # The cue stick can lie across the slot and cut its frame in two:
         # carry on over a short gap in the same columns.
+        # Only a piece that is the frame again counts (both side edges for a
+        # stretch); a stick passing just past the slot's end is not.
         rows = mask[:, x:x + w].sum(axis=1) >= max(2, w * .2)
+        edge = max(2, int(round(w * .2)))
+        sides = (mask[:, x:x + edge].any(axis=1) & mask[:, x + w - edge:x + w].any(axis=1))
+        run = max(3, int(round(height * .03)))
         gap = int(round(height * .08))
+
+        def framed(a: int, b: int) -> bool:
+            longest = current = 0
+            for s in sides[a:b]:
+                current = current + 1 if s else 0
+                longest = max(longest, current)
+            return longest >= run
+
         top_row, bottom_row = int(y), int(y + h - 1)
         while True:
             above = np.nonzero(rows[max(0, top_row - gap):top_row])[0]
-            if above.size == 0 or bottom_row - (max(0, top_row - gap) + int(above[0])) > 1.05 * height:
+            if above.size == 0:
                 break
-            top_row = max(0, top_row - gap) + int(above[0])
+            reach = max(0, top_row - gap) + int(above[0])
+            if bottom_row - reach > 1.05 * height or not framed(reach, reach + run * 4):
+                break
+            top_row = reach
         while True:
             below = np.nonzero(rows[bottom_row + 1:bottom_row + 1 + gap])[0]
-            if below.size == 0 or bottom_row + 1 + int(below[-1]) - top_row > 1.05 * height:
+            if below.size == 0:
                 break
-            bottom_row = bottom_row + 1 + int(below[-1])
+            reach = bottom_row + 1 + int(below[-1])
+            if reach - top_row > 1.05 * height or not framed(max(bottom_row + 1, reach + 1 - run * 4), reach + 1):
+                break
+            bottom_row = reach
         candidates.append((int(x), top_row, int(w), bottom_row - top_row + 1))
     # Closest to the table first (other tall icons sit further left); it must
     # hold the cue, or be an empty dark slot (cue dragged all the way down).
