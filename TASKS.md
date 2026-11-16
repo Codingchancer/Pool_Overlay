@@ -20,7 +20,6 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| Physics pockets along the rails + finer steps at break speed (Codingchancer's `pool_physics.py`, OK'd by Jartartarta) | simulator | Jartartarta | `jartartarta/physics-pockets` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Fast aim reader** (IDEAS.md idea 2, handed over by Codingchancer 15 Nov): read only the aim change per frame (angles within ~±2° of the last aim, ghost ball in a small box) in ~3-5 ms, with the full `predict_shot` every few frames to correct drift. Reading the aim is now the limit (16-18 updates/s). You may edit Codingchancer's `tracking.py` and `tests/test_realtime.py` for this task; keep the results within the `GuideStabilizer` tolerances and check `live_check.py`.
@@ -35,6 +34,7 @@ Border rules:
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
 
 ## Done
+- [x] Physics pockets + break speed (Jartartarta, #29, in Codingchancer's `pool_physics.py` with Jartartarta's OK): balls rolling along the rail into a pocket now drop (the drawn table's rule: rail contact within two radii of the mouth point); fast balls move in quarter-radius sub-steps and hits are resolved at the moment of contact, so the struck ball's direction is exact at every power (was 13 deg off at full power). Power slider: a stick just past the slot's end no longer stretches it (93% read as 79%); play_test max power error 8% -> 1%. Stress 286/300 unchanged.
 - [x] Headless 8-ball test game (Jartartarta, #28): `sim_game.py` plays whole games through the physics and 8-ball rules with rendered frames and exact truth; `play_test.py` checks the overlay on every shot. 60 games: aiming frame fully right blue 281/299, green 288, harsh 278, white 174; live aim error median 0.02 deg; struck ball within 2 deg of the physics on 90% of normal-power shots; power slider fixed with the stick across it (median 0.3%, max 8%). Physics pockets too tight along the rails (game uses the drawn table's pocket rule).
 - [x] White table cue ball + tight racks (Jartartarta, #27): white cue ball fitted on its lit side, packed rack balls found on the packing grid. Wide sweep 622 -> 647/760 (white 13 -> 20/40, racks 94 -> 112/152, missing balls 113 -> 43), hold-out 491 -> 515, harsh 561 -> 575, blue stress 286/300, real frames unchanged.
 - [x] Stress test everything (Jartartarta, #26): wide sweep (19 cloths x 5 shot kinds), near-cue, harsh mirror and hold-out seeds. Hold-out 473 -> 491/684, harsh mirror 366 -> 398/570, near-cue cue ball 86 -> 121/152, no aim invented on the opponent's turn (11 -> 0/100), blue stress 286/300 unchanged. New `fake_game.harsh()` / `stress_test.py --harsh` (stream scale, 4:2:0 colour, display tone).
