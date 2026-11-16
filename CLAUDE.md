@@ -28,6 +28,8 @@ It is a **visual practice aid only**. Never add code that clicks, aims, moves th
 - `fake_game.py` — synthetic table renderer with exact truth (a test fixture, not a game).
 - `stress_test.py` — random synthetic shots vs truth (`--count 300`, `--save-failures DIR`).
 - `live_check.py` — runs the real app against the synthetic table window through UI Automation.
+- `sim_game.py` / `play_test.py` — area **detector** (tests): headless 8-ball test game (physics + rules + synthetic frames with truth; `shot_stream` gives a whole shot as the mirror shows it) and the overlay checked on whole games.
+- `shot_recorder.py` / `recorder_check.py` — area **detector**: logs real shots from the mirror window (slider % at release, cue/struck-ball tracks, where balls stopped; reads the picture only) to `outputs/shots/`, and its check on synthetic games.
 - `tests/` — unit tests. Screenshot-based tests skip when `outputs/*.png` is missing. The real screenshots are deliberately NOT in git (public repo: Miniclip's image + a player profile) — never commit images from `outputs/`.
 - `setup.bat` / `run.bat` — build `.venv` with the newest Python 3.15…3.11 and start the app. `.venv` is never committed.
 

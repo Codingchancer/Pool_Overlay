@@ -88,6 +88,31 @@ Known limits found this way:
 
 The synthetic table approximates the real game's look. It cannot replace a check on the real AirPlay mirror.
 
+## Recording shots (for fitting the game's power)
+
+`shot_recorder.py` logs real shots so the game's power and friction can be fitted. It only reads the mirror window's picture: it never clicks, aims or sends input.
+
+1. Start the AirPlay receiver and the game as usual. The overlay may run at the same time.
+2. Run `.venv\Scripts\python shot_recorder.py` (add `--title "part of the window title"` if it does not find the mirror window).
+3. Play normal shots, about 20–30, at many different powers. Hold the slider still for a moment before letting go. Ctrl+C stops.
+
+Each shot gets a JSON log and two PNGs (the release and the rest frame) in `outputs/shots/<date-time>/`. That folder is not in git, because the frames show the game and a player's profile. A log has:
+- the slider reading at release;
+- every ball before the shot, and the aim the game showed;
+- the cue ball's and the struck ball's positions frame by frame;
+- where everything stopped, and which balls were potted.
+
+The opponent's shots are logged with power `null`. Moving the cue ball by hand (ball in hand) is not logged. Spin is not read.
+
+`python recorder_check.py --all-cloths` checks the recorder on whole synthetic games against the exact truth. The test: 18 cloths, 30 fps, the slider snapping back over two frames, and every 5th shot without a slider.
+- **Every check:** 227 of 288 shots were logged right.
+- **What the power fit uses:** 256 were right in the power at release (within 0.4%), the cue ball's and the struck ball's tracks, and where they stopped or went in. On most cloths the cue ball's movement is within 1 px.
+- **The struck ball touching the cue ball:** 19 shots. The detector misses that ball, so the log says the struck ball is unknown rather than guessing.
+- **The rest:**
+  - the cue ball's position on white, sky and beige cloth, 3–5 px off;
+  - end spots of balls close to the cloth's colour;
+  - a few balls not followed by the recorder, matched by colour to the wrong ball afterwards.
+
 ## Tests
 
 The real game screenshots (`outputs/example_pool_screenshot.png` and `outputs/miniclip_example_aiming.png`) are not in this public repository: one is Miniclip's image and the other shows a player's profile. Without them the 19 screenshot tests are skipped and the two sample buttons in the screenshot tester say the sample is missing. To run those tests, put your own 8 Ball Pool screenshots under those names in `outputs/` (the exact expected positions in the tests only match the original frames). The synthetic-table tests need no screenshots.

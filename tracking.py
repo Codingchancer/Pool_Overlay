@@ -16,12 +16,13 @@ few seconds passed) falls back to a full detection.
 """
 from __future__ import annotations
 
+import dataclasses
 import time
 
 import cv2
 import numpy as np
 
-from detector import Detection, detect, predict_shot, read_power_slider
+from detector import Detection, detect, find_power_slider, predict_shot, read_power_slider
 
 
 class ShotTracker:
@@ -46,6 +47,9 @@ class ShotTracker:
     # Hinted aim reads in a row before one without the hint (catches a hint
     # that kept fitting something else than the game's ghost ball).
     FULL_READ_EVERY = 8
+    # While the last full detection had no power slider (hidden then, e.g.
+    # on the opponent's turn), look for it again this often (seconds).
+    SLIDER_RETRY_SECONDS = .5
 
     def __init__(self, full_detect=detect):
         self.full_detect = full_detect
@@ -61,11 +65,12 @@ class ShotTracker:
         self.hinted_reads = 0
         # Whether the last tracked frame's aim was read with the hint.
         self.last_was_fast = False
+        self.slider_checked_at = 0.0
 
     def detect(self, frame: np.ndarray, now: float | None = None) -> Detection:
         now = time.monotonic() if now is None else now
         if self._can_track(frame, now):
-            detection = self._track(frame)
+            detection = self._track(frame, now)
             self.misses = 0 if detection.aim_segments else self.misses + 1
             if self.misses < self.MISSES_BEFORE_FULL:
                 self.last_was_full = False
@@ -123,8 +128,13 @@ class ShotTracker:
         thinnest = float(np.sqrt(max(0.0, np.linalg.eigvalsh(cov)[0])))
         return thinnest <= inner * self.STRIPE_SPREAD
 
-    def _track(self, frame: np.ndarray) -> Detection:
+    def _track(self, frame: np.ndarray, now: float = 0.0) -> Detection:
         base = self.base
+        if base.power_slider is None and now - self.slider_checked_at >= self.SLIDER_RETRY_SECONDS:
+            self.slider_checked_at = now
+            slider = find_power_slider(frame, base.table)
+            if slider is not None:
+                base = self.base = dataclasses.replace(base, power_slider=slider)
         x, y, w, h = base.table
         roi = frame[y:y + h, x:x + w]
         hint = self.hint if self.hinted_reads < self.FULL_READ_EVERY else None
