@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+from itertools import product
 
 import cv2
 import numpy as np
@@ -399,6 +400,394 @@ def _ring_peak(score: np.ndarray, best, ox: int, oy: int, ring_radius: float):
         if a > -1 and c > -1 and (a - 2 * b + c) < 0:
             fy = float(np.clip(.5 * (a - c) / (a - 2 * b + c), -.5, .5))
     return value, ox + ix + fx, oy + iy + fy, ring_radius
+
+
+# --- the ghost ring found anywhere on the table ------------------------------
+
+# Rays (angles) and offsets across the circle (px) along which a ring's
+# stroke is read.
+_STROKE_ANGLES = np.linspace(0, 2 * np.pi, 96, endpoint=False)
+_STROKE_OFFSETS = np.arange(-5.0, 5.01, .5)
+_STROKE_NEAR = np.nonzero(np.abs(_STROKE_OFFSETS) <= 2.5)[0]
+_PEAK_OFFSETS = np.arange(-7.0, 7.01, .5)
+_PEAK_AT = np.nonzero(np.abs(_PEAK_OFFSETS) <= 4.0)[0]
+_CORE_OFFSETS = np.arange(-1.5, 1.51, .5)
+# A stroke's core is at least this much brighter (Lab L, 8-bit) than the
+# darkest pixel 1-3 px away on each side.
+RING_STROKE_RISE = 15.0
+
+
+def _ray_profiles(image: np.ndarray, circles, offsets: np.ndarray) -> np.ndarray:
+    """``image`` sampled along each circle's rays at ``offsets`` px across
+    it: (circles, rays, offsets)."""
+    circles = np.asarray(circles, np.float64).reshape(-1, 3)
+    n = len(circles)
+    radii = circles[:, 2, None, None] + offsets[None, None, :]
+    xs = circles[:, 0, None, None] + np.cos(_STROKE_ANGLES)[None, :, None] * radii
+    ys = circles[:, 1, None, None] + np.sin(_STROKE_ANGLES)[None, :, None] * radii
+    # One row per circle: remap takes fewer than 32767 rows.
+    profiles = cv2.remap(image, xs.reshape(n, -1).astype(np.float32), ys.reshape(n, -1).astype(np.float32),
+                         cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    return profiles.reshape(n, len(_STROKE_ANGLES), len(offsets))
+
+
+def _stroke_contrast(profiles: np.ndarray, at) -> np.ndarray:
+    """For each offset index in ``at``: how much brighter the profile is
+    there than the darkest sample 1-3 px (six samples) away on its darker
+    side."""
+    at = np.asarray(at)
+    # Darkest of each run of six samples (past the ends: none), then per
+    # offset the run just before it and the one just after.
+    padded = np.pad(profiles, [(0, 0)] * (profiles.ndim - 1) + [(6, 6)], constant_values=np.inf)
+    darkest = np.lib.stride_tricks.sliding_window_view(padded, 6, axis=-1).min(axis=-1)
+    centre = profiles[..., at]
+    return np.minimum(centre - darkest[..., at], centre - darkest[..., at + 7]).astype(np.float32)
+
+
+def _stroke_shares(lightness: np.ndarray, circles) -> np.ndarray:
+    """For each circle (x, y, r): the share of rays that cross a thin bright
+    stroke within 2.5 px of it (see ``_thin_stroke_share``)."""
+    return (_ray_stroke_contrast(lightness, circles) >= RING_STROKE_RISE).mean(axis=-1)
+
+
+def _ray_stroke_contrast(lightness: np.ndarray, circles) -> np.ndarray:
+    """For each circle and ray, the strongest stroke contrast within 2.5 px
+    of the circle: (circles, rays)."""
+    return _stroke_contrast(_ray_profiles(lightness, circles, _STROKE_OFFSETS), _STROKE_NEAR).max(axis=-1)
+
+
+def _stroke_points(lightness: np.ndarray, cx: float, cy: float, rho: float):
+    """Per ray, where the thin bright stroke is strongest within 2.5 px of
+    the circle: (x, y) arrays, rays without one left out."""
+    contrast = _stroke_contrast(_ray_profiles(lightness, (cx, cy, rho), _STROKE_OFFSETS)[0], _STROKE_NEAR)
+    best = np.argmax(contrast, axis=1)
+    ok = contrast[np.arange(len(best)), best] >= RING_STROKE_RISE
+    radii = rho + _STROKE_OFFSETS[_STROKE_NEAR][best[ok]]
+    return cx + np.cos(_STROKE_ANGLES[ok]) * radii, cy + np.sin(_STROKE_ANGLES[ok]) * radii
+
+
+def _fit_circle(xs, ys, keep: float, rounds: int = 3) -> tuple[float, float, float] | None:
+    """Least-squares circle through the points, fitted again on those within
+    ``keep`` px of it: (x, y, r), or None when fewer than 12 are left."""
+    xs = np.asarray(xs, np.float64)
+    ys = np.asarray(ys, np.float64)
+    use = np.ones(len(xs), bool)
+    fit = None
+    for _ in range(rounds):
+        if use.sum() < 12:
+            return None
+        # Normal equations of u^2 + v^2 = a u + b v + c, (u, v) taken from
+        # the points' mean for precision: centre (a/2, b/2), r^2 = c + a^2/4 + b^2/4.
+        mx, my = float(xs[use].mean()), float(ys[use].mean())
+        u, v = xs[use] - mx, ys[use] - my
+        a = np.column_stack((u, v, np.ones(len(u))))
+        try:
+            sol = np.linalg.solve(a.T @ a, a.T @ (u * u + v * v))
+        except np.linalg.LinAlgError:
+            return None
+        cu, cv = sol[0] / 2, sol[1] / 2
+        cx, cy = cu + mx, cv + my
+        fit = (float(cx), float(cy), float(np.sqrt(max(sol[2] + cu * cu + cv * cv, 1e-6))))
+        use = np.abs(np.hypot(xs - cx, ys - cy) - fit[2]) <= keep
+    return fit
+
+
+def _ring_consensus(lightness: np.ndarray, cx: float, cy: float, rho: float,
+                    radius: float) -> tuple[float, float, float] | None:
+    """The circle near (cx, cy, rho) that the most rays have a stroke peak on.
+
+    Where the ring lies on the cue ball, a thin strip of the ball's face
+    between the ring's outline and the ball's own shaded rim is a bright
+    ridge as well, right beside the stroke; a least-squares fit took both
+    and landed 3-6 px off (synthetic near shots). Every local stroke peak
+    within 4 px of the circle is kept per ray; circles through peaks on three
+    rays 120 degrees apart are scored by how many rays have a peak within
+    0.75 px of them, and the best is fitted on those peaks."""
+    contrast = _stroke_contrast(_ray_profiles(lightness, (cx, cy, rho), _PEAK_OFFSETS)[0], _PEAK_AT)
+    padded = np.pad(contrast, ((0, 0), (1, 1)), constant_values=-np.inf)
+    peak = ((contrast >= RING_STROKE_RISE) & (contrast >= padded[:, :-2]) & (contrast >= padded[:, 2:]))
+    rays, cols = np.nonzero(peak)
+    if len(rays) < 20:
+        return None
+    radii = rho + _PEAK_OFFSETS[_PEAK_AT][cols]
+    px = cx + np.cos(_STROKE_ANGLES[rays]) * radii
+    py = cy + np.sin(_STROKE_ANGLES[rays]) * radii
+    n = len(_STROKE_ANGLES)
+    # (np.nonzero lists the peaks ray by ray.)
+    bounds = np.searchsorted(rays, np.arange(n + 1))
+    on_ray = [np.arange(bounds[a], bounds[a + 1]) for a in range(n)]
+    triples = []
+    for a in range(0, n // 3, 2):
+        groups = (on_ray[a], on_ray[a + n // 3], on_ray[a + 2 * n // 3])
+        if all(len(g) for g in groups):
+            triples.extend(product(*groups))
+    if not triples:
+        return None
+    t = np.array(triples)
+    ax, ay, bx, by, qx, qy = px[t[:, 0]], py[t[:, 0]], px[t[:, 1]], py[t[:, 1]], px[t[:, 2]], py[t[:, 2]]
+    d = 2 * (ax * (by - qy) + bx * (qy - ay) + qx * (ay - by))
+    ok = np.abs(d) > 1e-9
+    d = np.where(ok, d, 1.0)
+    a2, b2, q2 = ax * ax + ay * ay, bx * bx + by * by, qx * qx + qy * qy
+    ux = (a2 * (by - qy) + b2 * (qy - ay) + q2 * (ay - by)) / d
+    uy = (a2 * (qx - bx) + b2 * (ax - qx) + q2 * (bx - ax)) / d
+    rr = np.hypot(ax - ux, ay - uy)
+    ok &= (rr >= .8 * radius) & (rr <= 1.15 * radius)
+    if not ok.any():
+        return None
+    ux, uy, rr = ux[ok], uy[ok], rr[ok]
+    inlier = np.abs(np.hypot(px[None] - ux[:, None], py[None] - uy[:, None]) - rr[:, None]) <= .75
+    hit = np.zeros((len(ux), n), bool)
+    ci, pi = np.nonzero(inlier)
+    hit[ci, rays[pi]] = True
+    best = int(np.argmax(hit.sum(axis=1)))
+    return _fit_circle(px[inlier[best]], py[inlier[best]], keep=1.0)
+
+
+def _fit_ghost_ring(lightness: np.ndarray, ridge: np.ndarray, px: float, py: float,
+                    radius: float) -> tuple[float, float, float] | None:
+    """A ring fitted around the proposed centre (px, py): a circle through
+    the thin-ridge pixels about a ring's size from it, then on the strongest
+    stroke point along each ray (twice), then the rays' consensus."""
+    h, w = ridge.shape
+    reach = int(radius * 1.5) + 2
+    x0, x1 = max(0, int(px) - reach), min(w, int(px) + reach + 1)
+    y0, y1 = max(0, int(py) - reach), min(h, int(py) + reach + 1)
+    ys, xs = np.nonzero(ridge[y0:y1, x0:x1])
+    xs, ys = xs + x0, ys + y0
+    band = np.abs(np.hypot(xs - px, ys - py) - radius * .92) <= radius * .45
+    if band.sum() < 12:
+        return None
+    fit = _fit_circle(xs[band], ys[band], keep=2.0)
+    if fit is None:
+        return None
+    for _ in range(2):
+        if not (.6 * radius <= fit[2] <= 1.3 * radius):
+            break
+        sx, sy = _stroke_points(lightness, *fit)
+        if len(sx) < 30:
+            break
+        refit = _fit_circle(sx, sy, keep=1.0)
+        if refit is None:
+            break
+        fit = refit
+    return _ring_consensus(lightness, *fit, radius) or fit
+
+
+def _ring_core_white(hsv: np.ndarray, cx: float, cy: float, rho: float) -> float:
+    """Share of rays whose brightest pixel within 1.5 px of the circle is
+    guide white (V >= 165, S <= 70 as in ``white_strokes``)."""
+    h, w = hsv.shape[:2]
+    reach = int(rho) + 6
+    x0, y0 = max(0, int(cx) - reach), max(0, int(cy) - reach)
+    patch = hsv[y0:min(h, int(cy) + reach + 1), x0:min(w, int(cx) + reach + 1)]
+    circle = (cx - x0, cy - y0, rho)
+    v = _ray_profiles(patch[:, :, 2].astype(np.float32), circle, _CORE_OFFSETS)[0]
+    s = _ray_profiles(patch[:, :, 1].astype(np.float32), circle, _CORE_OFFSETS)[0]
+    k = np.argmax(v, axis=1)
+    rows = np.arange(len(k))
+    return float(np.mean((v[rows, k] >= 165) & (s[rows, k] <= 70)))
+
+
+def _circle_kernel(rho: float) -> np.ndarray:
+    """Correlation kernel: a thin circle of radius ``rho``, summing to one."""
+    return _circle_kernel_cached(round(float(rho), 4))
+
+
+@lru_cache(maxsize=64)
+def _circle_kernel_cached(rho: float) -> np.ndarray:
+    size = int(np.ceil(rho)) + 2
+    kernel = np.zeros((2 * size + 1, 2 * size + 1), np.float32)
+    points = {(int(round(size + rho * np.cos(a))), int(round(size + rho * np.sin(a))))
+              for a in np.linspace(0, 2 * np.pi, 120, endpoint=False)}
+    for x, y in points:
+        kernel[y, x] = 1.0 / len(points)
+    kernel.setflags(write=False)  # shared between calls
+    return kernel
+
+
+def find_ghost_ring(roi: np.ndarray, radius: float, hsv: np.ndarray | None = None,
+                    lightness: np.ndarray | None = None,
+                    around: tuple[float, float, float] | None = None) -> tuple[float, float, float, float] | None:
+    """Miniclip's ghost ring found anywhere on the table, without knowing the
+    cue ball: (x, y, ring radius, stroke share) in ROI pixels, or None.
+
+    The ring is a thin bright stroke between dark outlines all the way round.
+    Spots are proposed by correlating a circle with the thin-ridge map at
+    half size; each is fitted on its own stroke (``_fit_ghost_ring``) and
+    kept when nearly every ray crosses the stroke on the circle, the circle
+    is a ghost ring's size and the stroke is guide white. A striped ball's
+    white caps and the stick's metal joints make ring-like ridges too, but
+    smaller (0.73-0.83 radii against 0.87-0.94), less complete or not white.
+    Synthetic frames, every cloth and kind of shot: the ring found in 2821
+    of 2838, 0.05 px typical, no other ring taken. The game shows one guide:
+    the most complete ring is returned.
+
+    ``around`` (x, y, reach) takes only a ring centred within ``reach`` of
+    (x, y), and looks only there (a few milliseconds instead of ~25)."""
+    ox = oy = 0
+    if around is not None:
+        ax, ay, reach = around
+        h, w = roi.shape[:2]
+        margin = reach + radius * 1.5 + 10
+        x0, x1 = max(0, int(ax - margin)), min(w, int(ax + margin) + 1)
+        y0, y1 = max(0, int(ay - margin)), min(h, int(ay + margin) + 1)
+        if x1 - x0 < 16 or y1 - y0 < 16:
+            return None
+        roi = roi[y0:y1, x0:x1]
+        hsv = None if hsv is None else hsv[y0:y1, x0:x1]
+        lightness = None if lightness is None else lightness[y0:y1, x0:x1]
+        ox, oy, ax, ay = x0, y0, ax - x0, ay - y0
+    if lightness is None:
+        lightness = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32)
+    if hsv is None:
+        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    ridge = thin_ridges(lightness, RING_STROKE_RISE).astype(np.uint8)
+    # (Dilated a pixel: the stroke's width and a ring size known to a pixel.)
+    half = cv2.resize(cv2.dilate(ridge, np.ones((3, 3), np.uint8)).astype(np.float32), None,
+                      fx=.5, fy=.5, interpolation=cv2.INTER_AREA)
+    score = cv2.filter2D(half, -1, _circle_kernel(radius * .46), borderType=cv2.BORDER_CONSTANT)
+    if around is not None:
+        yy, xx = np.ogrid[:score.shape[0], :score.shape[1]]
+        score[np.hypot(xx * 2 + .5 - ax, yy * 2 + .5 - ay) > reach + radius * .3] = 0
+    gap = max(2, int(radius * .4))
+    spots = []
+    for _ in range(RING_PROPOSALS):
+        index = int(np.argmax(score))
+        if score.flat[index] < RING_PROPOSAL_SCORE:
+            break
+        sy, sx = divmod(index, score.shape[1])
+        score[max(0, sy - gap):sy + gap + 1, max(0, sx - gap):sx + gap + 1] = 0
+        spots.append((sx * 2 + .5, sy * 2 + .5))
+    if not spots:
+        return None
+    # Cheap first look: the best stroke share of three ring sizes at each
+    # spot (a real ring 0.90 or more there; 96% of other spots below 0.7,
+    # and the full fit is skipped for them).
+    sizes = (.86, .93, 1.0)
+    shares = _stroke_shares(lightness, [(px, py, radius * f) for px, py in spots for f in sizes])
+    best = None
+    for (px, py), first in zip(spots, shares.reshape(len(spots), len(sizes)).max(axis=1)):
+        if first < RING_FIRST_LOOK:
+            continue
+        fit = _fit_ghost_ring(lightness, ridge, px, py, radius)
+        if fit is None or not (GHOST_RING_SIZE[0] * radius <= fit[2] <= GHOST_RING_SIZE[1] * radius):
+            continue
+        if around is not None and np.hypot(fit[0] - ax, fit[1] - ay) > reach:
+            continue
+        contrast = _ray_stroke_contrast(lightness, fit)[0]
+        share = float(np.mean(contrast >= RING_STROKE_RISE))
+        if share < GHOST_RING_SHARE or (best is not None and share <= best[3]):
+            continue
+        # The game's ring has dark outlines on both sides: its stroke stands
+        # far above both (synthetic: median 73 or more, real frames 117-220).
+        # A light ring drawn round a ball has the ball's shadow inside but
+        # bare cloth outside (real frame: 26).
+        if float(np.median(contrast)) < GHOST_RING_CONTRAST:
+            continue
+        if _ring_core_white(hsv, *fit) < GHOST_RING_WHITE:
+            continue
+        best = (*fit, share)
+    return None if best is None else (best[0] + ox, best[1] + oy, best[2], best[3])
+
+
+# Ring search: at most this many proposed spots, each with at least this
+# share of a circle on (dilated) thin ridges.
+RING_PROPOSALS = 24
+RING_PROPOSAL_SCORE = .45
+# A spot is fitted only when a circle there has this share of rays on a
+# stroke (synthetic: real rings 0.90 or more, 96% of other spots below).
+RING_FIRST_LOOK = .7
+# A ghost ring: this share of rays crossing its stroke, a radius in this
+# range (ball radii; the game's is ~0.91), and this share of its stroke
+# guide white.
+GHOST_RING_SHARE = .88
+GHOST_RING_SIZE = (.85, 1.2)
+GHOST_RING_WHITE = .9
+GHOST_RING_CONTRAST = 50.0
+# Only the cue ball can overlap the ghost ring: a ball centre within this
+# many radii of the ring's centre is under it. The struck ball's is two true
+# radii away; the radius is known to whole pixels (12 for 12.3: a cue ball
+# 1.7 true radii away measured 1.74).
+RING_OVERLAP = 1.85
+# A circle centred within this many radii of the ghost ring's centre is the
+# ring itself (circle finding locks onto it), not a ball beside it.
+RING_ITSELF = .3
+# A ghost this many radii or more from a ball, at the end of its ray, is a
+# normal shot's (a ring right beside a ball can be the struck ball's own).
+RAY_GHOST_REACH = 2.4
+
+
+def ball_under_ring(candidates, ring_xy: tuple[float, float], radius: float,
+                    white: np.ndarray | None = None, offset: tuple[int, int] = (0, 0)):
+    """The cue-ball candidate under the ghost ring at ``ring_xy``, or None:
+    the whitest beside the ring's centre, else the ring's own circle (circle
+    finding locks onto the ring, a crisp white circle, and can miss the ball
+    under it; it is fitted again beside the ring later).
+
+    The struck ball touches the ghost ball two radii out, the cue ball under
+    the ring is closer, but with the radius known to a pixel and centres
+    beside a ring a pixel or two off, a ball 1.5-1.85 radii out can be
+    either (synthetic: struck balls measured at 1.66-1.8, cue balls at up to
+    1.84). There the game's object line tells: it leaves the struck ball's
+    centre, away from the ring. ``white`` is the guide's line mask (ball
+    faces removed) of the region starting at ``offset``."""
+    gx, gy = ring_xy
+    near = [(float(np.hypot(c[0] - gx, c[1] - gy)), c) for c in candidates]
+    near = [(d, c) for d, c in near if d <= radius * RING_OVERLAP]
+    if white is not None:
+        near = [(d, c) for d, c in near
+                if d <= radius * 1.5 or game_line_direction(white, (c[0] - offset[0], c[1] - offset[1]),
+                                                            (c[0] - gx, c[1] - gy), radius, cone_degrees=20.0) is None]
+    if not near:
+        return None
+    beside = [c for d, c in near if d >= radius * RING_ITSELF]
+    if beside:
+        return max(beside, key=lambda c: c[5])
+    return min(near, key=lambda item: item[0])[1]
+
+
+def paint_out_ring(roi: np.ndarray, ring, radius: float) -> np.ndarray:
+    """A copy of ``roi`` with the ghost ring (x, y, ring radius; ROI px)
+    painted out: its stroke and outlines filled in from beside them. Lying
+    on the cue ball, the ring is a crisp circle that circle finding and rim
+    fits lock onto or are pulled towards."""
+    gx, gy, rho = ring[:3]
+    half = radius * .1 + 2.5     # the stroke's half width with its outline
+    h, w = roi.shape[:2]
+    reach = int(rho + half) + 8
+    x0, x1 = max(0, int(gx) - reach), min(w, int(gx) + reach + 1)
+    y0, y1 = max(0, int(gy) - reach), min(h, int(gy) + reach + 1)
+    out = roi.copy()
+    if x1 - x0 < 4 or y1 - y0 < 4:
+        return out
+    yy, xx = np.ogrid[y0:y1, x0:x1]
+    band = (np.abs(np.hypot(xx - gx, yy - gy) - rho) <= half).astype(np.uint8) * 255
+    out[y0:y1, x0:x1] = cv2.inpaint(roi[y0:y1, x0:x1], band, 3, cv2.INPAINT_TELEA)
+    return out
+
+
+def ball_beside_ring(roi: np.ndarray, ring, radius: float, min_r: int, max_r: int):
+    """The whitest ball under the ghost ring (ROI px) found once the ring is
+    painted out: (x, y, r, sat, val, white_fraction, red_spot, open_rim) in
+    ROI px, or None. Circle finding can miss the cue ball under the ring
+    altogether or fit the ring instead (synthetic near shots, white cloth:
+    no cue ball found in 18 of 100)."""
+    gx, gy = ring[:2]
+    h, w = roi.shape[:2]
+    reach = int(radius * (RING_OVERLAP + 2.5)) + 4
+    x0, x1 = max(0, int(gx) - reach), min(w, int(gx) + reach + 1)
+    y0, y1 = max(0, int(gy) - reach), min(h, int(gy) + reach + 1)
+    if x1 - x0 < radius * 4 or y1 - y0 < radius * 4:
+        return None
+    window = paint_out_ring(roi[y0:y1, x0:x1], (gx - x0, gy - y0, ring[2]), radius)
+    gray = cv2.medianBlur(cv2.cvtColor(window, cv2.COLOR_BGR2GRAY), 5)
+    best = None
+    for found in find_balls(window, gray, min_r, max_r):
+        bx, by = found[0] + x0, found[1] + y0
+        if np.hypot(bx - gx, by - gy) <= radius * RING_OVERLAP and (best is None or found[5] > best[5]):
+            best = (bx, by, *found[2:])
+    return best
 
 
 def ray_direction_to_ghost(white: np.ndarray, cue: tuple[float, float, float], ghost: tuple[float, float],
@@ -1129,7 +1518,8 @@ def predict_shot(roi: np.ndarray, table: tuple[int, int, int, int],
     return {**shot, "stick_pull": pull, "hint": next_hint, "fast": info.get("fast", False)}
 
 
-def ghost_from_object_line(white: np.ndarray, balls_local, cue_local, radius: float):
+def ghost_from_object_line(white: np.ndarray, balls_local, cue_local, radius: float,
+                           ring_mask: np.ndarray | None = None):
     """(ghost x, y, struck ball) in ROI pixels from the game's object-ball
     line, or None.
 
@@ -1137,6 +1527,12 @@ def ghost_from_object_line(white: np.ndarray, balls_local, cue_local, radius: fl
     ring sits on top of the cue ball and cannot be read. The game still draws
     its object line from the struck ball's centre, and the ghost touches that
     ball on the far side: one diameter back along the line.
+
+    With ``ring_mask`` (the guide's strokes, ball faces removed) the ghost is
+    then placed on its ring along that line (``ring_on_line``): one
+    diameter back from the struck ball's centre was 1.4 px off (the ball
+    radius is known to whole pixels, ~0.5 px small), and on a ghost this
+    close to the cue ball that turned the aim by degrees.
     """
     cx, cy = cue_local[:2]
     best = None
@@ -1158,8 +1554,77 @@ def ghost_from_object_line(white: np.ndarray, balls_local, cue_local, radius: fl
         if not (.1 * radius <= gap <= 2.4 * radius) or (gx - cx) * dx + (gy - cy) * dy <= 0:
             continue
         if best is None or dist < best[0]:
-            best = (dist, gx, gy, (bx, by, br))
-    return None if best is None else (best[1], best[2], best[3])
+            best = (dist, gx, gy, (bx, by, br), (ax, ay), (dx, dy))
+    if best is None:
+        return None
+    _, gx, gy, struck, anchor, direction = best
+    if ring_mask is not None:
+        mask = ring_mask.copy()
+        # The cue ball's own rim is a ring of the same size right beside it.
+        cv2.circle(mask, (int(round(cx)), int(round(cy))), int(radius * 1.05), 0, thickness=-1)
+        on_ring = ring_on_line(mask, anchor, direction, radius, (cx, cy), struck[:2])
+        if on_ring is not None and np.hypot(on_ring[0] - gx, on_ring[1] - gy) <= 3.0:
+            gx, gy = on_ring[0], on_ring[1]
+    return gx, gy, struck
+
+
+_RING_ANGLES = np.linspace(0, 2 * np.pi, 120, endpoint=False)
+
+
+def ring_on_line(mask: np.ndarray, anchor, direction, radius: float, cue_xy, struck_xy,
+                 reach: float = 3.0):
+    """The ghost ring's centre on the object line ``anchor - s * direction``,
+    searched within ``reach`` px of s = one diameter, or None.
+
+    For each spot a circle of 0.8-1.05 radii is scored by how much of it
+    lies on the strokes (blurred), leaving out its parts on the cue ball and
+    the struck ball; the best spot is taken to a fraction of a pixel.
+    Synthetic near shots: 0.14 px typical against 1.46 for one diameter
+    back (the line itself is exact across, so only the spot along it is
+    searched)."""
+    blurred = cv2.GaussianBlur(mask.astype(np.float32) / 255, (0, 0), 1.0)
+    ax, ay = anchor
+    ux, uy = direction
+    cx, cy = cue_xy
+    tx, ty = struck_xy
+    spots = np.arange(2 * radius - reach, 2 * radius + reach + 1e-6, .25)
+    sizes = np.arange(.8 * radius, 1.05 * radius + 1e-6, .25)
+    scores = np.full((len(spots), len(sizes)), -1.0)
+    for i, s in enumerate(spots):
+        gx, gy = ax - s * ux, ay - s * uy
+        for j, rho in enumerate(sizes):
+            px, py = gx + rho * np.cos(_RING_ANGLES), gy + rho * np.sin(_RING_ANGLES)
+            use = (np.hypot(px - cx, py - cy) > 1.1 * radius) & (np.hypot(px - tx, py - ty) > 1.1 * radius)
+            if use.sum() < 30:
+                continue
+            values = cv2.remap(blurred, px[use].astype(np.float32)[None], py[use].astype(np.float32)[None],
+                               cv2.INTER_LINEAR)[0]
+            scores[i, j] = float(values.mean())
+    i, j = np.unravel_index(int(np.argmax(scores)), scores.shape)
+    if scores[i, j] < RING_ON_LINE_SCORE:
+        return None
+    s = float(spots[i])
+    if 0 < i < len(spots) - 1:
+        a, b, c = scores[i - 1, j], scores[i, j], scores[i + 1, j]
+        if min(a, c) > -1 and a - 2 * b + c < 0:
+            s += float(np.clip(.5 * (a - c) / (a - 2 * b + c), -.5, .5)) * .25
+    return ax - s * ux, ay - s * uy, float(sizes[j]), float(scores[i, j])
+
+
+def _is_ghost_ring(roi: np.ndarray, x: float, y: float, radius: float) -> bool:
+    """True when a thin bright stroke with dark outlines runs along nearly
+    the whole circle of about ``radius`` at (x, y): the ghost ring, not a
+    ball's rim (synthetic near shots on blue: a cue ball detected on the
+    ring scored 0.98-1.00, real cue balls at most 0.97, typically 0.31)."""
+    lightness = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)[:, :, 0].astype(np.float32)
+    return max(_thin_stroke_share(lightness, x, y, radius * f) for f in (.9, 1.0)) >= GHOST_RING_STROKE
+
+
+# The share of thin bright stroke along a circle from which it is the ring.
+GHOST_RING_STROKE = .98
+# A circle counts as the ghost ring when this share of it (blurred) lies on
+# the guide's strokes.
+RING_ON_LINE_SCORE = .35
 
 
 # Live tracking: the ghost is first looked for within this many ball radii
@@ -1294,6 +1759,12 @@ def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
                     direction, ghost = candidate, found
     if ghost is None:
         ghost = find_ghost_ball(ghost_mask, cue_local, None, ball_r, roi) if direction is None else None
+    if ghost is not None and np.hypot(ghost[0] - cue_local[0], ghost[1] - cue_local[1]) <= ball_r * RING_OVERLAP:
+        # A ring overlapping the cue ball: the ring score is pulled by the
+        # ball's face (3 px on synthetic near shots); fit it on its stroke.
+        exact = find_ghost_ring(roi, ball_r, hsv=roi_hsv, around=(ghost[0], ghost[1], ball_r * .5))
+        if exact is not None:
+            ghost = (exact[0], exact[1], exact[2], ghost[3])
     near_ghost = None
 
     def ball_touches(gxl, gyl):
@@ -1307,7 +1778,18 @@ def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
     # shot, not a hidden one; leave it alone.
     if (ghost is None or np.hypot(ghost[0] - cue_local[0], ghost[1] - cue_local[1]) <= cr * 1.5
             or not (ball_touches(ghost[0], ghost[1]) or against_cushion(ghost[0], ghost[1]))):
-        near_ghost = ghost_from_object_line(white, balls_local, cue_local, ball_r)
+        near_ghost = ghost_from_object_line(white, balls_local, cue_local, ball_r, ring_mask=ghost_mask)
+        # The ghost ring itself, found on its own stroke on top of the cue
+        # ball, places the ghost exactly (0.05 px typical against 0.14 from
+        # the object line, which can also not be read at all).
+        on_cue = find_ghost_ring(roi, ball_r, hsv=roi_hsv,
+                                 around=(cue_local[0], cue_local[1], ball_r * RING_OVERLAP))
+        if on_cue is not None and np.hypot(on_cue[0] - cue_local[0], on_cue[1] - cue_local[1]) >= ball_r * .2:
+            agrees = near_ghost is not None and np.hypot(near_ghost[0] - on_cue[0],
+                                                         near_ghost[1] - on_cue[1]) <= ball_r * .3
+            # (Without the object line the struck ball is the one touching
+            # the ring, found further on.)
+            near_ghost = (on_cue[0], on_cue[1], near_ghost[2] if agrees else None)
         if near_ghost is not None:
             ghost = (near_ghost[0], near_ghost[1], ball_r, 1.0)
             dx, dy = near_ghost[0] - cue_local[0], near_ghost[1] - cue_local[1]
@@ -1343,7 +1825,7 @@ def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
     obstacles = [(bx, by, br) for bx, by, br, kind in balls if kind != "cue"]
     angle = float(np.degrees(np.arctan2(uy, ux)))
     selected = None
-    if near_ghost is not None:
+    if near_ghost is not None and near_ghost[2] is not None:
         # The ball whose object line placed the ghost is the struck ball.
         bx, by, br = near_ghost[2]
         selected = (int(round(bx + left)), int(round(by + top)), int(br))
@@ -2280,6 +2762,45 @@ def stick_direction(stick_lines, cue_xy: tuple[float, float], radius: float,
     return ux, uy
 
 
+def stick_axis(stick_lines, cue_xy: tuple[float, float], radius: float,
+               aim: tuple[float, float]) -> tuple[float, float] | None:
+    """The stick's own direction (pointing like ``aim``), from the longest
+    image line through the cue ball's centre that lies behind it within 15
+    degrees of ``aim``, or None.
+
+    The aim read from a shot whose struck ball nearly touches the cue ball
+    is degrees off (the ghost lies on the cue ball), and at the stick's far
+    rings, ~17 radii back, that put them 1.8 radii beside the assumed axis:
+    they stayed as balls. A long straight edge of the stick gives its
+    direction to ~0.5 degrees. (A line ahead of the cue ball, the game's
+    own lines, is not the stick; ``aim`` tells the sides apart.)"""
+    if stick_lines is None or aim is None:
+        return None
+    cx, cy = cue_xy
+    ax, ay = aim
+    best = None
+    for x1, y1, x2, y2 in stick_lines[:, 0, :].astype(float):
+        length = float(np.hypot(x2 - x1, y2 - y1))
+        if length < radius * 6:
+            continue
+        if abs((cx - x1) * (y2 - y1) - (cy - y1) * (x2 - x1)) / length > radius * .8:
+            continue
+        d1, d2 = float(np.hypot(x1 - cx, y1 - cy)), float(np.hypot(x2 - cx, y2 - cy))
+        if min(d1, d2) > radius * 5:
+            continue
+        fx, fy = (x1, y1) if d1 > d2 else (x2, y2)
+        if (fx - cx) * ax + (fy - cy) * ay >= 0:
+            continue
+        ux, uy = (x2 - x1) / length, (y2 - y1) / length
+        if ux * ax + uy * ay < 0:
+            ux, uy = -ux, -uy
+        if ux * ax + uy * ay < np.cos(np.radians(15)):
+            continue
+        if best is None or length > best[0]:
+            best = (length, (float(ux), float(uy)))
+    return None if best is None else best[1]
+
+
 def shadow_direction(lightness: np.ndarray, cloth: np.ndarray, balls, radius: float) -> tuple[float, float] | None:
     """Unit direction in which the balls' drop shadows fall, measured as the
     darkest side of a ring just outside each object ball (None when too few
@@ -2611,19 +3132,7 @@ def _thin_stroke_share(lightness: np.ndarray, fx: float, fy: float, fr: float) -
     ghost ring's white line between its dark outlines. A ball's rim has its
     bright middle further in and no such peak (at most 0.47 on synthetic
     white tables; a ring 0.97 or more)."""
-    offsets = np.arange(-5.0, 5.01, .5)
-    xs = (fx + np.outer(np.cos(_WHITE_RIM_ANGLES), fr + offsets)).astype(np.float32)
-    ys = (fy + np.outer(np.sin(_WHITE_RIM_ANGLES), fr + offsets)).astype(np.float32)
-    profiles = cv2.remap(lightness, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-    near = np.nonzero(np.abs(offsets) <= 2.5)[0]
-    hits = 0
-    for p in profiles:
-        for k in near:
-            below, above = p[max(0, k - 6):k], p[k + 1:k + 7]
-            if len(below) and len(above) and p[k] - below.min() >= 15 and p[k] - above.min() >= 15:
-                hits += 1
-                break
-    return hits / len(profiles)
+    return float(_stroke_shares(lightness, (fx, fy, fr))[0])
 
 
 _WHITE_RIM_ANGLES = np.linspace(0, 2 * np.pi, 96, endpoint=False)
@@ -3237,6 +3746,8 @@ def detect(frame: np.ndarray) -> Detection:
         cue_candidates.append((*ball, sat, val, white_fraction, red_spot))
         balls.append((*ball, "ball"))
     cue = None
+    # The ghost ring when it was looked for anywhere on the table (frame px).
+    ghost_ring = None
     if cue_candidates:
         # The cue ball is the white candidate at the end of the long cue stick.
         # This distinguishes it from white stripes and bright aiming markers.
@@ -3281,6 +3792,8 @@ def detect(frame: np.ndarray) -> Detection:
         # white-striped ball instead, so a candidate whose ray ends in a ghost
         # ball wins; the stick choice only breaks ties.
         ray_candidates = [c for c in cue_candidates if c[5] >= .52]
+        far_ghost = {}   # candidates whose ray ends in a ghost a few radii out: that ghost
+        roi_hsv = None
         if ray_candidates:
             local_all = [(bx - x, by - y, br, kind) for bx, by, br, kind in balls]
             radius = float(np.median([b[2] for b in balls]))
@@ -3298,6 +3811,8 @@ def detect(frame: np.ndarray) -> Detection:
                     if ghost is not None:
                         break
                 verified.append((ghost is not None, candidate is cue, candidate[5], candidate))
+                if ghost is not None and np.hypot(ghost[0] - local[0], ghost[1] - local[1]) >= radius * RAY_GHOST_REACH:
+                    far_ghost[id(candidate)] = ghost
             if verified:
                 best = max(verified, key=lambda item: item[:3])
                 if best[0] or cue is None:
@@ -3316,11 +3831,68 @@ def detect(frame: np.ndarray) -> Detection:
             if (cue is not None and whitest is not cue and whitest[5] >= .75
                     and whitest[5] >= cue[5] + .15 and (colourless or whitest[3] <= cue[3] - 10)):
                 cue = whitest
+        radius = float(np.median([b[2] for b in balls]))
+        seen = far_ghost.get(id(cue)) if cue is not None else None
+        # A ghost at the end of a ray counts once it passes the strict ring
+        # test (a few ms around it): the game's object line from a struck
+        # ball can end at a striped ball, and the ring overlapping the cue
+        # ball can read as a ring further on (synthetic near shots 40053,
+        # 40004 on blue).
+        ray_to_ghost = seen is not None and find_ghost_ring(roi, radius, hsv=roi_hsv,
+                                                            around=(seen[0], seen[1], radius * .5)) is not None
+        if not ray_to_ghost:
+            # No ray was read out to a ghost: the struck ball may lie right
+            # next to the cue ball, its ring on top of the cue ball and the
+            # ray hidden under both. Only the cue ball can overlap the ghost
+            # ring: it marks where the cue ball will be at contact, and the
+            # struck ball only touches it. So the ball under the ring found
+            # anywhere on the table is the cue ball (synthetic near shots on
+            # blue: wrong cue ball in 9 of 100 before).
+            ring = find_ghost_ring(roi, radius, hsv=roi_hsv)
+            if ring is not None:
+                ghost_ring = (ring[0] + x, ring[1] + y, ring[2])
+                lines = guide if ray_candidates else white_guide_mask(
+                    roi, [(bx - x, by - y, br, kind) for bx, by, br, kind in balls], ridges=True)
+                under = ball_under_ring(cue_candidates, ghost_ring[:2], radius, lines, (x, y))
+                if under is None or np.hypot(under[0] - ghost_ring[0], under[1] - ghost_ring[1]) < radius * RING_ITSELF:
+                    # No ball found under the ring, or only the ring itself:
+                    # look for the ball again with the ring painted out. Only
+                    # a ball circle finding missed counts (else it is a ball
+                    # touching the ring, such as the struck one, measured a
+                    # little close; the cue ball is then elsewhere).
+                    found = ball_beside_ring(roi, ring, radius, min_r, max_r)
+                    if found is not None and any(np.hypot(c[0] - x - found[0], c[1] - y - found[1]) < radius * .6
+                                                 for c in cue_candidates if c is not under):
+                        found = None
+                    if found is not None:
+                        bx, by = found[0] + x, found[1] + y
+                        under = (bx, by, *found[2:7])
+                        rim_open[(bx, by)] = found[7]
+                        cue_candidates.append(under)
+                        balls.append((bx, by, found[2], "ball"))
+                if under is not None:
+                    cue = under
         if cue:
             cue_index = min(range(len(balls)), key=lambda i: np.hypot(balls[i][0]-cue[0], balls[i][1]-cue[1]))
-            white_cloth = _WhiteCloth.of(roi, balls, (x, y))
-            moved = (white_cloth_cue_centre(roi, (cue[0] - x, cue[1] - y), balls, (x, y), white_cloth)
+            # With the ghost ring on the cue ball, its rim is fitted on the
+            # picture with the ring painted out (white cloth, synthetic near
+            # shots: 0.3 px typical against 0.8, 1.2 at the 90th percentile
+            # against 5.6).
+            ring_on_ball = (ghost_ring is not None
+                            and np.hypot(cue[0] - ghost_ring[0], cue[1] - ghost_ring[1]) <= radius * RING_OVERLAP)
+            fit_roi = paint_out_ring(roi, (ghost_ring[0] - x, ghost_ring[1] - y, ghost_ring[2]), radius) if ring_on_ball else roi
+            white_cloth = _WhiteCloth.of(fit_roi, balls, (x, y))
+            moved = (white_cloth_cue_centre(fit_roi, (cue[0] - x, cue[1] - y), balls, (x, y), white_cloth)
                      if white_cloth is not None else None)
+            if moved is None and ring_on_ball and white_cloth is None and not _light_cloth(cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)):
+                # A coloured cloth: the usual rim fit, without the ring
+                # (synthetic near shots on blue: 0.75 px at the 90th
+                # percentile against 1.4).
+                clean = cv2.GaussianBlur(felt_distance_image(fit_roi, cv2.cvtColor(fit_roi, cv2.COLOR_BGR2HSV), as_float=True),
+                                         (0, 0), 1.0)
+                fx, fy, _ = refine_circle(clean, cue[0] - x, cue[1] - y, radius)
+                if np.hypot(fx - (cue[0] - x), fy - (cue[1] - y)) <= radius * .5:   # (the ring pulls a fit 6-7 px)
+                    moved = (fx, fy)
             if moved is not None:
                 # (The candidate tuple carries the colour measurements on.)
                 cue = (int(round(moved[0] + x)), int(round(moved[1] + y)), *cue[2:])
@@ -3352,6 +3924,17 @@ def detect(frame: np.ndarray) -> Detection:
                                             cue_position[2], cv2.cvtColor(roi, cv2.COLOR_BGR2HSV))
             if stick_aim:
                 aim_for_stick = stick_aim
+                # Without a ray read out to a ghost the aim is rough (a ghost
+                # on top of the cue ball, or none): the stick's own line, where
+                # one is found, gives its direction better (``stick_axis``),
+                # and then its rings can be told by lying on its axis. A ray
+                # to a ghost gives it best (0.1 degrees against ~0.3, with
+                # lines now and then 3-10 degrees off: real balls beside the
+                # stick were dropped).
+                exact = None if ray_to_ghost else stick_axis(stick_lines, (cue_position[0] - x, cue_position[1] - y),
+                                                             float(np.median([b[2] for b in balls])), stick_aim)
+                if exact is not None:
+                    aim_for_stick = exact
                 # Read from the stick alone the side can be wrong; a struck
                 # ball right in front must not be dropped then.
                 min_behind = 1.35 if aim else 3.5
@@ -3361,7 +3944,7 @@ def detect(frame: np.ndarray) -> Detection:
                 body = {(c[0], c[1]): (c[3], c[4], c[5]) for c in cue_candidates}
                 balls = separate_cue_stick_detections(balls, cue_position, aim_for_stick, rim_open,
                                                       distance=distance, offset=(x, y), body=body,
-                                                      min_behind=min_behind, axis_rule=bool(aim),
+                                                      min_behind=min_behind, axis_rule=bool(aim) or exact is not None,
                                                       confirmed=confirmed_balls,
                                                       white_cloth=white_cloth is not None)
             # Exactly one ball is the cue ball; other white/striped detections
@@ -3374,20 +3957,34 @@ def detect(frame: np.ndarray) -> Detection:
                          note=f"Table found · {len(balls)} circle candidates · too many to track confidently")
     if cue:
         shot = predict_shot(roi, table, balls, cue[:3])
-        aim_now = shot.get("aim_dir")
-        if aim_now is not None and (aim is None or aim_now[0] * aim[0] + aim_now[1] * aim[1] < .985):
-            # The aim used for the cue-stick filter above was wrong (the ghost
-            # ring on top of the cue ball hid the ray); filter the stick's
-            # rings along the real aim and predict again.
-            filtered = separate_cue_stick_detections(
-                balls, cue[:3], aim_now, rim_open,
-                distance=shared.get("distance") if shared.get("distance") is not None
-                else felt_distance_image(roi, cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), as_float=True),
-                offset=(x, y), body={(c[0], c[1]): (c[3], c[4], c[5]) for c in cue_candidates},
-                confirmed=confirmed_balls, white_cloth=white_cloth is not None)
-            if len(filtered) != len(balls):
-                balls = filtered
-                shot = predict_shot(roi, table, balls, cue[:3])
+
+        def stick_pass(balls, shot, aim_before):
+            """Filter the stick's rings along the aim just read when that
+            differs from the aim used before, or, with the ghost on top of
+            the cue ball (its aim degrees off), along the stick's own line
+            where one is found (see ``stick_axis``); predict again if any
+            went."""
+            aim_now = shot.get("aim_dir")
+            ghost_now = shot.get("ghost")
+            on_cue = (ghost_now is not None and balls
+                      and np.hypot(ghost_now[0] - cue[0], ghost_now[1] - cue[1]) <= cue[2] * RING_OVERLAP)
+            axis = (stick_axis(stick_lines, (cue[0] - x, cue[1] - y), float(np.median([b[2] for b in balls])), aim_now)
+                    if on_cue else None)
+            if aim_now is not None and (axis is not None or aim_before is None
+                                        or aim_now[0] * aim_before[0] + aim_now[1] * aim_before[1] < .985):
+                filtered = separate_cue_stick_detections(
+                    balls, cue[:3], axis or aim_now, rim_open,
+                    distance=shared.get("distance") if shared.get("distance") is not None
+                    else felt_distance_image(roi, cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), as_float=True),
+                    offset=(x, y), body={(c[0], c[1]): (c[3], c[4], c[5]) for c in cue_candidates},
+                    confirmed=confirmed_balls, white_cloth=white_cloth is not None)
+                if len(filtered) != len(balls):
+                    return filtered, predict_shot(roi, table, filtered, cue[:3])
+            return balls, shot
+
+        # The aim used for the cue-stick filter above can be wrong (the ghost
+        # ring on top of the cue ball hid the ray).
+        balls, shot = stick_pass(balls, shot, aim)
         if shot["ghost"]:
             # Nothing can occupy the spot where the cue ball will be at impact:
             # a "ball" centred on the ghost ring is the ring itself (the ray and
@@ -3401,7 +3998,15 @@ def detect(frame: np.ndarray) -> Detection:
         ring_on_cue = None
         if balls:
             radius = float(np.median([b[2] for b in balls]))
-            if shot["ghost"] and np.hypot(cue[0] - shot["ghost"][0], cue[1] - shot["ghost"][1]) < radius * 1.5:
+            if ghost_ring is not None and np.hypot(cue[0] - ghost_ring[0], cue[1] - ghost_ring[1]) <= radius * RING_OVERLAP:
+                # The ring found on the table lies on the cue ball. Only a
+                # "cue ball" fitted on the ring itself is fitted again: one
+                # beside it is the ball (light cloths, synthetic near shots:
+                # 7-10 px off on the ring, 0.1-2 after; beside it the fit
+                # moved good ones by 3-4 px, on a white cloth 5-19).
+                if np.hypot(cue[0] - ghost_ring[0], cue[1] - ghost_ring[1]) <= radius * RING_ITSELF:
+                    ring_on_cue = ghost_ring
+            elif shot["ghost"] and np.hypot(cue[0] - shot["ghost"][0], cue[1] - shot["ghost"][1]) < radius * 1.5:
                 ring_on_cue = shot["ghost"]
             elif not shot["ghost"]:
                 # No ghost found: the "cue ball" may be the ring itself.
@@ -3414,6 +4019,12 @@ def detect(frame: np.ndarray) -> Detection:
                 sy, sx = ly - y0_, lx - x0_
                 near = score[max(0, sy - 2):sy + 3, max(0, sx - 2):sx + 3]
                 if near.size and float(near.max()) >= RING_ON_CUE_SCORE:
+                    ring_on_cue = (cue[0], cue[1], radius)
+                elif _is_ghost_ring(roi, lx, ly, radius):
+                    # That score needs cloth inside the ring; with the white
+                    # cue ball under it there is none (synthetic near shots:
+                    # -0.21). A thin bright line with dark outlines along the
+                    # whole circle is the ring all the same.
                     ring_on_cue = (cue[0], cue[1], radius)
         if ring_on_cue is not None:
             # The struck ball right next to the cue ball puts the ghost ring
@@ -3431,6 +4042,9 @@ def detect(frame: np.ndarray) -> Detection:
                 balls = [(moved[0], moved[1], b[2], b[3]) if b[3] == "cue" else b for b in balls]
                 cue = (moved[0], moved[1], *cue[2:])
                 shot = predict_shot(roi, table, balls, cue[:3])
+                # The aim is read from the real cue ball now (it was read
+                # from the ring before): its stick's rings go along it.
+                balls, shot = stick_pass(balls, shot, None)
         balls = uniform_ball_size(balls)
         cue = (*cue[:2], balls[0][2]) if balls else cue
         return Detection(table=table, balls=balls, cue=cue[:3], aim_segments=shot["aim"],
