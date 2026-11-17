@@ -37,7 +37,7 @@ It is a **visual practice aid only**. Never add code that clicks, aims, moves th
 - Table: four corner pockets (dark blobs next to cloth), cushion nose = pocket centre inset by `POCKET_TO_CUSHION`·span, then each edge snapped to the cushion→cloth brightness drop. Cloth-colour fit is the fallback.
 - Balls: Hough circles on a cloth-difference image and a grey image, refined to sub-pixel on the rim, rejected when the inside is mostly cloth.
 - Cue ball = the white ball whose aim ray ends in Miniclip's hollow ghost-ball reticle. Aim = polar ray scan + sub-pixel ghost.
-- Struck ball right next to the cue ball ("near" shots): the ghost ring lies on the cue ball and hides the ray. `find_ghost_ring` finds the ring anywhere (thin bright stroke between dark outlines all round, white, ~0.9 ball radii; fitted on its own stroke, 0.05 px); only the cue ball can overlap it (`ball_under_ring`; the struck ball, which the game's object line leaves, only touches it). A cue circle on the ring itself, or none, is found again with the ring painted out (`paint_out_ring`, `ball_beside_ring`). A ghost on the cue ball is placed on the ring in `_predict_paths`.
+- Struck ball right next to the cue ball ("near" shots): the ghost ring lies on the cue ball and hides the ray. `find_ghost_ring` finds the ring anywhere (thin bright stroke between dark outlines all round, white, ~0.9 ball radii; fitted on its own stroke, 0.05 px); only the cue ball can overlap it (`ball_under_ring`; the struck ball, which the game's object line leaves, only touches it). A cue circle on the ring itself, or none, is found again with the ring painted out (`paint_out_ring`, `ball_beside_ring`). A ghost on the cue ball is placed on the ring in `_predict_paths`, and the aim there comes from the stick (`stick_direction_near`: its band of off-cloth shade behind the cue ball, else its Hough edges; 0.16 deg at the 95th percentile).
 - Target = ball touching the ghost; object/cue lines are fitted on the game's own short white lines when visible.
 - White cloth: lines read as thin ridges between their dark outlines (`white_stroke_masks`); cue ball and stripes fitted on the lit-side rim dip (`_WhiteCloth`), away from the shadow direction the balls show.
 
@@ -50,9 +50,9 @@ The guide is visible in screenshots/screen shares (`WDA_NONE`). To stop it feedi
 .venv\Scripts\python -m py_compile main.py detector.py capture.py overlay.py simulator_ui.py pool_physics.py fake_game.py stress_test.py live_check.py
 .venv\Scripts\python stress_test.py --count 300 --quiet
 ```
-Last known results: 238 tests pass (19 skip without the real screenshots); 286/300 synthetic shots pass every check; synthetic near shots 1510/1900 on 19 cloths; live check 12/12.
+Last known results: 241 tests pass (19 skip without the real screenshots); 286/300 synthetic shots pass every check; synthetic near shots 1587/1900 on 19 cloths; live check 12/12.
 
 ## Known limits
-- Struck ball nearly touching the cue ball: the ring on the cue ball is found, but the cue ball's centre is then only good to ~1 px (whole pixels, rim half hidden), so with the ghost a few px from it the aim can be degrees off; white and pale cloths (white, light grey, beige, sky) still fail about half of these shots.
+- Struck ball nearly touching the cue ball: the aim comes from the stick; where no stick shows behind the cue ball (~a quarter, e.g. against a cushion) it comes from the cue ball's centre, only good to ~1 px (whole pixels, rim half hidden), so the aim can be degrees off; white and pale cloths (white, light grey, beige, sky) still fail about a third of these shots, mostly on the cue ball's position.
 - Balls boxed in inside a rack can be off by ~0.5 radius.
 - Not yet verified on a real live AirPlay mirror or at Windows display scaling other than 100%.
