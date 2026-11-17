@@ -20,7 +20,6 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
-| Light grey and pale cloths (and their near shots) | detector | Jartartarta | `jartartarta/pale-cloths` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Power needed for a shot:** record ~20-30 real shots (slider % at release + where the balls stop) to fit Miniclip's friction and the %-to-speed scale per cue; then compute the minimum power to pot and add it to `Detection` for Codingchancer to mark on the slider. Also confirm the slider reading on a mid-drag and a full-power frame.
@@ -29,13 +28,15 @@ Border rules:
 - [ ] Balls boxed in inside a rack can be off by ~0.5 radius (mostly fixed by the packing grid, #27; a few left in the wide sweep).
 - [ ] Raise the synthetic pass rate (`stress_test.py --count 300`) from 286/300 towards 297+/300 without making real-game results worse.
 - [ ] **Near shots without a stick in view** (cue ball against a cushion, about a quarter of near shots): the aim still comes from the cue ball's centre, good to ~1 px, so it can be degrees off (17 synthetic near frames fail on the aim alone). A sub-pixel cue ball centre (a new `Detection` field the tracker passes back) or a rim fit beside the ring would help.
-- [ ] **Light grey cloth** (96/150 synthetic, white is now 105): the white-cloth fixes (#33) are gated to near-white cloth; check which apply. Near shots on pale cloths are weak too (light grey 63, beige 69, sky 65, white 64 of 100), mostly the cue ball's position beside the ring.
+- [ ] **Light grey and white cloth** (116 and 125/150 synthetic; near shots 63 and 64/100): the game's object line on light grey read a few degrees off or not at all; striped balls whose white caps blend into the cloth; extra circles in racks; the cue ball's position beside the ring in near shots (also on beige/sky, 72-73/100, where the tint fit is not used with the ring on the ball).
+- [ ] **Black 8 ball on the near-black Lucky Shot cloth:** missed in most synthetic frames (black 85/150).
 - [ ] White cloth leftovers: a ball lying on the table's watermark lettering keeps its circle-finding centre (the letters' edges read as a second rim); stripes packed in a rack; check on a live white table.
 
 ## Next — Codingchancer (overlay + simulator)
 - [ ] **Display scaling:** check Fit table and the guide at Windows scaling 125% and 150%, fix what is off.
 
 ## Done
+- [x] Grey and light tinted cloths (Jartartarta, #36): on grey cloth the table's watermark lettering counts as cloth, not balls; on light tinted cloths (beige, sky, yellow, lime) the cue ball is fitted where the cloth's tint begins on its lit side (sky 3.5 -> 1.2 px at the 90th percentile); the stick's rings filtered again along the exact aim (rings smaller than a ball only). 19-cloth sweep 2478 -> 2546/2850 (grey 107 -> 142, beige 123 -> 135, sky 117 -> 132), near shots 1587 -> 1611/1900 (grey 70 -> 94), no frame worse; real screenshots 23/27 identical, on a light blue table the aim 4 deg off on main now lies on the game's line; stress 286/300; live 12/12.
 - [x] Near-shot aim (Jartartarta, #35): with the ghost on the cue ball the aim is read from the cue stick behind it (`stick_direction_near`: its band of off-cloth shade, else its straight edges; read in 77% of near shots, 0.16 deg at the 95th percentile), also in the tracker. Synthetic near shots 1510 -> 1587/1900 (no frame worse), aim check failures 162 -> 48; other shots 2478/2850 the same frames; stress 286/300; live 12/12; the real near-cue screenshot's aim now lies along its stick (was 5.5 deg off).
 - [x] Struck ball nearly touching the cue ball (Jartartarta, #34): the ghost ring is found on its own anywhere on the table (`find_ghost_ring`: a thin bright stroke between dark outlines, 0.04 px typical; 2847/2850 synthetic frames, no false ring), and with no ray to a ghost the ball under it is the cue ball; a cue ball that circle finding missed or fitted on the ring is found again with the ring painted out; a ghost on the cue ball is placed on the ring (also in the tracker). Synthetic near shots 570 -> 1510/1900 on 19 cloths (blue 31 -> 89, white 9 -> 57); other shots 2478/2850, the same frames; real screenshots 25/27 identical, the real near-cue frame now right; stress 286/300; live 12/12.
 - [x] White tables (Jartartarta, #33): cue ball and striped balls fitted on their lit-side rim dip (cue 1.4 -> 0.44 px typical, loose stripes 2.9 -> 0.65 px), the aim ray / object line / cue line read as thin ridges between their outlines (their white core is no brighter than white cloth), ghost found on ridges when the plain strokes show none, robust shadow direction. Synthetic white 75 -> 105/150; the 17 other cloths identical frame by frame; real frames identical; stress 286/300; live 12/12. White aim read 19 ms fast / 31 ms full (was 12 / 27, without reading the object line).
