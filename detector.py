@@ -162,6 +162,9 @@ def _long_strokes(mask: np.ndarray) -> np.ndarray:
 
 # Lab lightness (8-bit) from which a cloth counts as light in the ball check.
 LIGHT_CLOTH_L = 150.0
+# A colourless cloth at least this light (grey, not the near-black Lucky
+# Shot cloth) has watermark lettering in a darker shade of it.
+GREY_CLOTH_L = 60.0
 # On a light, pale cloth, how much a darker shade of it (lettering, logo,
 # shadows) counts in the cloth-distance image; a lighter one counts in full.
 DARKER_SHADE_WEIGHT = .25
@@ -1065,6 +1068,7 @@ def separate_cue_stick_detections(
     axis_rule: bool = True,
     confirmed: set | None = None,
     white_cloth: bool = False,
+    rings_only: bool = False,
 ) -> list[tuple[int, int, int, str]]:
     """Drop circle-like cue-stick ornaments lying behind the tracked cue ball.
 
@@ -1082,6 +1086,10 @@ def separate_cue_stick_detections(
     ``white_cloth`` for the same reason a full-size circle with a clear rim
     on the stick's axis is not dropped as a ring at once: the ball-under-
     the-stick test below decides (size, rim, the stick's width beside it).
+    ``rings_only``: drop only circles smaller than a ball centred on the axis
+    (rings and joints), keeping every other circle near the stick (the
+    ball-under-the-stick test is for a fresh look, not for a small
+    correction of the axis).
     """
     cx, cy, cr = cue
     ux, uy = aim
@@ -1104,6 +1112,14 @@ def separate_cue_stick_detections(
             # decoration is narrower.
             full_and_rimmed = (white_cloth and br >= typical_r * STICK_BALL_SIZE and rim_open is not None
                                and rim_open.get((bx, by), 0.0) >= STICK_BALL_RIM)
+            # On a small correction of the axis a full-size circle on it can
+            # be a ball under the stick, looking narrow and grey under one of
+            # its joints (green 6 on green cloth): only the first look, with
+            # the ball-under-the-stick test, drops one. (Rings and joints
+            # are smaller: the joints ~0.8-0.9 of a ball.)
+            if rings_only and br >= typical_r * STICK_FULL_SIZE:
+                kept.append((bx, by, br, kind))
+                continue
             if (axis_rule and across <= typical_r * STICK_AXIS_SHARE and not full_and_rimmed
                     and not _wider_than_stick(distance, bx - offset[0], by - offset[1], ux, uy, typical_r)):
                 continue
@@ -1112,6 +1128,9 @@ def separate_cue_stick_detections(
             # that (the 8 is dark, the cue ball and stripes mostly white).
             sat, val, white = (body or {}).get((bx, by), (255.0, 0.0, 0.0))
             if across <= typical_r * STICK_AXIS_SHARE and sat < 60 and 50 < val < 175 and white < .3:
+                continue
+            if rings_only:
+                kept.append((bx, by, br, kind))
                 continue
             # (Without the aim's axis rule a ball half under the stick, its
             # circle shrunk by the stick, must not be lost on size alone.)
@@ -2944,6 +2963,13 @@ STICK_AIM_GATE = 45.0
 # and the shortest run of it (ball radii) behind the cue ball.
 STICK_SHADE = 20.0
 STICK_RUN = 7.0
+# The stick's rings are filtered again along the aim read from the ghost
+# when it turned more than this from the first rough reading (0.5 degree
+# steps): 17 radii back a 0.75 degree turn is 2.4 px, beyond the 0.2
+# radii that tell a ring on the axis.
+STICK_REFILTER_COS = float(np.cos(np.radians(.25)))
+# ...and then a circle at least this share of a ball's size is kept.
+STICK_FULL_SIZE = .95
 
 
 def stick_axis(stick_lines, cue_xy: tuple[float, float], radius: float,
@@ -3071,7 +3097,7 @@ class _WhiteCloth:
         # A colourless cloth only (a bright yellow or pink one is lit as
         # strongly but its colour finds every rim).
         sample = lab[::8, ::8].reshape(-1, 3).astype(np.float32)
-        if float(np.hypot(np.median(sample[:, 1]) - 128, np.median(sample[:, 2]) - 128)) >= 8:
+        if float(np.hypot(np.median(sample[:, 1]) - 128, np.median(sample[:, 2]) - 128)) >= WHITE_CLOTH_CHROMA:
             return None
         local = [(bx - offset[0], by - offset[1], br, kind) for bx, by, br, kind in balls]
         radius = float(np.median([b[2] for b in local]))
@@ -3090,7 +3116,7 @@ class _WhiteCloth:
         ring = np.hypot(xx - int(x), yy - int(y)) < reach
         a = float(np.median(self.lab[y0:y1, x0:x1, 1][ring])) - 128
         b = float(np.median(self.lab[y0:y1, x0:x1, 2][ring])) - 128
-        return float(np.hypot(a, b)) < 8
+        return float(np.hypot(a, b)) < WHITE_CLOTH_CHROMA
 
     def rim_fit(self, x: float, y: float) -> tuple[float, float] | None:
         """Centre of the ball near (x, y) from its lit-side rim dip, or None."""
@@ -3161,6 +3187,109 @@ def white_cloth_cue_centre(roi: np.ndarray, cue_xy: tuple[float, float], balls,
     if context is None or not context.white_here(*cue_xy):
         return None
     return context.rim_fit(*cue_xy)
+
+
+def tinted_cloth_cue_centre(roi: np.ndarray, cue_xy: tuple[float, float], balls,
+                            offset: tuple[int, int], ring=None) -> tuple[float, float] | None:
+    """Cue-ball centre on a light, tinted cloth (beige, sky, yellow, lime),
+    or None elsewhere (or when unsure).
+
+    There the ball's shaded rim is about as light as the cloth, and its drop
+    shadow, a darker shade of the cloth, has lost some of its colour like
+    the white ball: the usual fit slid towards the shadow (synthetic sky:
+    3.5 px at the 90th percentile, beige 2.1). The white ball stays
+    colourless right up to its rim, where the cloth's tint begins, so on
+    each ray of its lit half the rim is where the colour difference from the
+    cloth crosses halfway from the ball's to the cloth's (``_lit_rim_tint``);
+    a circle is fitted to those points by consensus, from the rough centre
+    and again from that fit, as on a white cloth. Sky 1.1 px, beige 1.3 at
+    the 90th percentile, never 3. ``ring`` (x, y, radius; ROI px): a ghost
+    ring on the ball, painted out of ``roi`` in blended colours, so rim
+    points on its band are left out (they were 3-7 px off)."""
+    h, w = roi.shape[:2]
+    hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    felt = _felt_lab(roi, hsv)
+    if felt[0] < LIGHT_CLOTH_L or np.hypot(felt[1] - 128, felt[2] - 128) < WHITE_CLOTH_CHROMA or not balls:
+        return None
+    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
+    lightness = lab[:, :, 0].astype(np.float32)
+    local = [(bx - offset[0], by - offset[1], br, kind) for bx, by, br, kind in balls]
+    radius = float(np.median([b[2] for b in local]))
+    sdir = shadow_direction(lightness, local_lightness(lightness), local, radius)
+    if sdir is None:
+        return None
+    x0, y0 = cue_xy
+    reach = int(radius * 3)
+    wx0, wx1 = max(0, int(x0) - reach), min(w, int(x0) + reach + 1)
+    wy0, wy1 = max(0, int(y0) - reach), min(h, int(y0) + reach + 1)
+    patch = lab[wy0:wy1, wx0:wx1].astype(np.float32)
+    tint = cv2.GaussianBlur(np.hypot(patch[:, :, 1] - felt[1], patch[:, :, 2] - felt[2]).astype(np.float32),
+                            (0, 0), .7)
+    others = [(bx - wx0, by - wy0) for bx, by, _, _ in local if np.hypot(bx - x0, by - y0) > radius * .6]
+    cx, cy = x0 - wx0, y0 - wy0
+    fit = None
+    for inner, outer in ((.4, 1.7), (.6, 1.35)):
+        points = _lit_rim_tint(tint, cx, cy, radius, sdir, inner, outer, others)
+        if ring is not None and len(points):
+            off_band = np.abs(np.hypot(points[:, 0] + wx0 - ring[0], points[:, 1] + wy0 - ring[1]) - ring[2])
+            points = points[off_band > radius * .1 + 4.5]
+        found = _consensus_circle(points, cx, cy, radius) if len(points) >= WHITE_RIM_MIN_POINTS else None
+        if found is None or np.hypot(found[0] - (x0 - wx0), found[1] - (y0 - wy0)) > .8 * radius:
+            break
+        fit = found
+        cx, cy = fit[0], fit[1]
+    return None if fit is None else (fit[0] + wx0, fit[1] + wy0)
+
+
+def _lit_rim_tint(tint: np.ndarray, cx: float, cy: float, radius: float, sdir, inner: float, outer: float,
+                  others=()) -> np.ndarray:
+    """Rim points on the lit side (rays more than ~100 degrees from the
+    shadow) of a ball on a tinted cloth: on each ray from (cx, cy) between
+    ``inner`` and ``outer`` radii, the outermost place where ``tint`` (the
+    colour difference from the cloth) falls through halfway from the ball's
+    level (0.5-0.8 radii out) to the cloth's (the ray's outer fifth), to a
+    fraction of a pixel. Rays where something off the cloth's colour runs on
+    beyond it are left out, and so are rays towards ``others`` (balls)
+    within 3.2 radii, as in ``_lit_rim_dips``."""
+    shadow = np.arctan2(sdir[1], sdir[0])
+    keep = np.cos(_WHITE_RIM_ANGLES - shadow) < -.2
+    for ox, oy in others:
+        dist = float(np.hypot(ox - cx, oy - cy))
+        if radius * .6 < dist <= 3.2 * radius:
+            half = np.arcsin(min(1.0, 1.2 * radius / dist)) + np.radians(5)
+            keep &= np.cos(_WHITE_RIM_ANGLES - np.arctan2(oy - cy, ox - cx)) < np.cos(half)
+    angles = _WHITE_RIM_ANGLES[keep]
+    if not len(angles):
+        return np.zeros((0, 2))
+    step = .25
+    steps = np.arange(inner * radius, outer * radius, step)
+    xs = (cx + np.outer(np.cos(angles), steps)).astype(np.float32)
+    ys = (cy + np.outer(np.sin(angles), steps)).astype(np.float32)
+    profiles = cv2.remap(tint, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    ball_part = (steps >= .5 * radius) & (steps <= .8 * radius)
+    points = []
+    for angle, p in zip(angles, profiles):
+        level = float(np.median(p[-max(4, len(p) // 5):]))
+        inside = float(np.median(p[ball_part])) if ball_part.any() else float(p[:len(p) // 3].max())
+        if inside - level < TINT_RIM_STEP:
+            continue
+        half = (inside + level) / 2
+        above = p >= half
+        crossings = np.nonzero(above[:-1] & ~above[1:])[0]
+        if not len(crossings):
+            continue
+        j = int(crossings[-1])
+        beyond = p[j + 4:]
+        if len(beyond) and float(np.mean(beyond > half)) > .15:
+            continue
+        t = steps[j] + (p[j] - half) / max(float(p[j] - p[j + 1]), 1e-6) * step
+        points.append((cx + t * np.cos(angle), cy + t * np.sin(angle)))
+    return np.array(points) if points else np.zeros((0, 2))
+
+
+# On a tinted cloth, a ball's colour difference from the cloth is at least
+# this much above the cloth's own (Lab a/b) for its rim to be read by it.
+TINT_RIM_STEP = 6.0
 
 
 def white_cloth_stripe_centres(context: "_WhiteCloth", balls, offset: tuple[int, int], cue_xy,
@@ -3323,6 +3452,8 @@ _WHITE_RIM_ANGLES = np.linspace(0, 2 * np.pi, 96, endpoint=False)
 # Cloth lightness (Lab L, 8-bit) from which the cue ball is fitted on its
 # lit side, as the table's brightest cloth (white ~225-231; light grey ~182).
 WHITE_CLOTH_L = 205.0
+# ...and its colour (Lab chroma) below this: a colourless cloth.
+WHITE_CLOTH_CHROMA = 8.0
 # A rim dip is at least this much darker than the cloth on its ray.
 WHITE_RIM_DIP = 8.0
 # A white-cloth rim fit needs at least this many agreeing rim points.
@@ -3590,6 +3721,31 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
                 # darker shade of the cloth. Lettering has nothing brighter.
                 if float(np.mean((dl > 8) & (dab < 12))) >= .3:
                     cloth_inside = (np.abs(dl) < 4) & (dab < 10)
+            elif np.hypot(felt_lab[1] - 128, felt_lab[2] - 128) < 8 and felt_lab[0] >= GREY_CLOTH_L:
+                # A darker colourless cloth (grey): its watermark lettering
+                # is the cloth in one darker shade as well, and the bowls of
+                # its letters read as balls (synthetic grey: 66 of 150
+                # frames had one).
+                if roi_light is None:
+                    roi_light = local_lightness(roi_lab[:, :, 0])
+                if letter_shade is False:
+                    letter_shade = lettering_shade(roi_lab, roi_light, felt_lab)
+                if letter_shade is not None:
+                    if len(near_cloth) >= 12:
+                        # The ring round a letter's bowl lies on its stroke:
+                        # the cloth is the lighter part of it, as on a light
+                        # cloth, and the inside is judged against that.
+                        local = local.copy()
+                        local[0] = max(local[0], min(float(np.percentile(near_cloth[:, 0], 80)),
+                                                     float(roi_light[cy, cx])))
+                        cloth_inside |= np.sqrt((((inner_lab - local) * lab_weights) ** 2).sum(axis=1)) < 10
+                    dl = inner_lab[:, 0] - local[0]
+                    dab = np.hypot(inner_lab[:, 1] - local[1], inner_lab[:, 2] - local[2])
+                    if roi_bright is None:
+                        roi_bright = cv2.dilate(((roi_lab[:, :, 0] > roi_light + 12) * 255).astype(np.uint8),
+                                                np.ones((5, 5), np.uint8)) > 0
+                    near_bright = roi_bright[y0:y1, x0:x1][dist2 <= (r * .62) ** 2]
+                    cloth_inside |= (dab < 10) & (np.abs(dl - letter_shade) < 10) & ~near_bright
         cloth_fraction = float(np.mean(cloth_inside))
         centre = patch[dist2 <= (r * .4) ** 2]
         # A badge-only proposal stands for a ball that looks like cloth; a
@@ -4068,6 +4224,12 @@ def detect(frame: np.ndarray) -> Detection:
             white_cloth = _WhiteCloth.of(fit_roi, balls, (x, y))
             moved = (white_cloth_cue_centre(fit_roi, (cue[0] - x, cue[1] - y), balls, (x, y), white_cloth)
                      if white_cloth is not None else None)
+            if moved is None and white_cloth is None and not ring_on_ball:
+                # A light, tinted cloth: the rim read by the cloth's tint on
+                # the lit side (the usual fit slides towards the shadow).
+                # (Not with the ghost ring on the ball: even with rim points
+                # on the ring left out, 7 of 400 near shots got worse.)
+                moved = tinted_cloth_cue_centre(fit_roi, (cue[0] - x, cue[1] - y), balls, (x, y))
             if moved is None and ring_on_ball and white_cloth is None and not _light_cloth(cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)):
                 # A coloured cloth: the usual rim fit, without the ring
                 # (synthetic near shots on blue: 0.75 px at the 90th
@@ -4154,14 +4316,17 @@ def detect(frame: np.ndarray) -> Detection:
                       and np.hypot(ghost_now[0] - cue[0], ghost_now[1] - cue[1]) <= cue[2] * RING_OVERLAP)
             axis = (stick_axis(stick_lines, (cue[0] - x, cue[1] - y), float(np.median([b[2] for b in balls])), aim_now)
                     if on_cue else None)
-            if aim_now is not None and (axis is not None or aim_before is None
-                                        or aim_now[0] * aim_before[0] + aim_now[1] * aim_before[1] < .985):
+            turn = None if aim_now is None or aim_before is None else aim_now[0] * aim_before[0] + aim_now[1] * aim_before[1]
+            fresh = axis is not None or aim_before is None or (turn is not None and turn < .985)
+            if aim_now is not None and (fresh or turn < STICK_REFILTER_COS):
+                # (Only a small turn from the first rough reading: only the
+                # rings centred on the axis go.)
                 filtered = separate_cue_stick_detections(
                     balls, cue[:3], axis or aim_now, rim_open,
                     distance=shared.get("distance") if shared.get("distance") is not None
                     else felt_distance_image(roi, cv2.cvtColor(roi, cv2.COLOR_BGR2HSV), as_float=True),
                     offset=(x, y), body={(c[0], c[1]): (c[3], c[4], c[5]) for c in cue_candidates},
-                    confirmed=confirmed_balls, white_cloth=white_cloth is not None)
+                    confirmed=confirmed_balls, white_cloth=white_cloth is not None, rings_only=not fresh)
                 if len(filtered) != len(balls):
                     return filtered, predict_shot(roi, table, filtered, cue[:3])
             return balls, shot
