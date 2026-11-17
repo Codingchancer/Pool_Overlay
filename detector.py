@@ -162,6 +162,9 @@ def _long_strokes(mask: np.ndarray) -> np.ndarray:
 
 # Lab lightness (8-bit) from which a cloth counts as light in the ball check.
 LIGHT_CLOTH_L = 150.0
+# A colourless cloth at least this light (grey, not the near-black Lucky
+# Shot cloth) has watermark lettering in a darker shade of it.
+GREY_CLOTH_L = 60.0
 # On a light, pale cloth, how much a darker shade of it (lettering, logo,
 # shadows) counts in the cloth-distance image; a lighter one counts in full.
 DARKER_SHADE_WEIGHT = .25
@@ -3590,6 +3593,31 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
                 # darker shade of the cloth. Lettering has nothing brighter.
                 if float(np.mean((dl > 8) & (dab < 12))) >= .3:
                     cloth_inside = (np.abs(dl) < 4) & (dab < 10)
+            elif np.hypot(felt_lab[1] - 128, felt_lab[2] - 128) < 8 and felt_lab[0] >= GREY_CLOTH_L:
+                # A darker colourless cloth (grey): its watermark lettering
+                # is the cloth in one darker shade as well, and the bowls of
+                # its letters read as balls (synthetic grey: 66 of 150
+                # frames had one).
+                if roi_light is None:
+                    roi_light = local_lightness(roi_lab[:, :, 0])
+                if letter_shade is False:
+                    letter_shade = lettering_shade(roi_lab, roi_light, felt_lab)
+                if letter_shade is not None:
+                    if len(near_cloth) >= 12:
+                        # The ring round a letter's bowl lies on its stroke:
+                        # the cloth is the lighter part of it, as on a light
+                        # cloth, and the inside is judged against that.
+                        local = local.copy()
+                        local[0] = max(local[0], min(float(np.percentile(near_cloth[:, 0], 80)),
+                                                     float(roi_light[cy, cx])))
+                        cloth_inside |= np.sqrt((((inner_lab - local) * lab_weights) ** 2).sum(axis=1)) < 10
+                    dl = inner_lab[:, 0] - local[0]
+                    dab = np.hypot(inner_lab[:, 1] - local[1], inner_lab[:, 2] - local[2])
+                    if roi_bright is None:
+                        roi_bright = cv2.dilate(((roi_lab[:, :, 0] > roi_light + 12) * 255).astype(np.uint8),
+                                                np.ones((5, 5), np.uint8)) > 0
+                    near_bright = roi_bright[y0:y1, x0:x1][dist2 <= (r * .62) ** 2]
+                    cloth_inside |= (dab < 10) & (np.abs(dl - letter_shade) < 10) & ~near_bright
         cloth_fraction = float(np.mean(cloth_inside))
         centre = patch[dist2 <= (r * .4) ** 2]
         # A badge-only proposal stands for a ball that looks like cloth; a
