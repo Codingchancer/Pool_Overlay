@@ -46,14 +46,21 @@ class TintedClothCueTests(unittest.TestCase):
             d = detector.detect(frame)
             self.assertLess(np.hypot(d.cue[0] - truth.cue[0], d.cue[1] - truth.cue[1]), 1.5, f"{seed} {kind} {cloth}")
 
-    def test_only_on_light_tinted_cloth(self):
-        # A darker or colourless cloth keeps its own fits.
-        for cloth in ("blue", "white", "light grey", "pink"):
+    def test_only_on_light_tinted_or_light_grey_cloth(self):
+        # A darker cloth, or a white one (its dip fit), keeps its own fits.
+        for cloth in ("blue", "white", "grey", "pink"):
             frame, truth = fg.render(fg.random_scene(40001, "scatter", cloth))
             x, y, w, h = detector.find_table_bounds(frame)
             d = detector.detect(frame)
-            self.assertIsNone(detector.tinted_cloth_cue_centre(frame[y:y + h, x:x + w],
-                                                               (d.cue[0] - x, d.cue[1] - y), d.balls, (x, y)), cloth)
+            self.assertIsNone(detector.pale_cloth_cue_centre(frame[y:y + h, x:x + w],
+                                                             (d.cue[0] - x, d.cue[1] - y), d.balls, (x, y)), cloth)
+
+    def test_cue_ball_on_light_grey(self):
+        # 3-5 px towards the shadow before: no tint, and no rim dip either.
+        for seed, kind in ((40020, "scatter"), (40014, "pot"), (40020, "miss"), (40007, "cushion"), (40019, "cushion")):
+            frame, truth = fg.render(fg.random_scene(seed, kind, "light grey"))
+            d = detector.detect(frame)
+            self.assertLess(np.hypot(d.cue[0] - truth.cue[0], d.cue[1] - truth.cue[1]), 1.5, f"{seed} {kind}")
 
 
 class StickRingTests(unittest.TestCase):
