@@ -47,7 +47,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from detector import STRIPE_RIM, Detection, coloured_rim_share, detect
+from detector import HIGHLIGHT, STRIPE_RIM, Detection, coloured_rim_share, detect
 from tracking import ShotTracker, change_thumbnail, screen_changed
 
 HERE = Path(__file__).resolve().parent
@@ -138,16 +138,27 @@ COLOUR_TOL = 40.0
 # many radii wide around them (the ghost ring at rest: GHOST_LEAVE_OUT).
 OTHER_LEAVE_OUT = 1.08
 GHOST_LEAVE_OUT = 1.25
-# Telling solids from stripes after a shot (``ball_colour``): white share of
-# the disc within 0.95 radii. Synthetic balls turned every way, as the
-# mirror shows them: solids (their one number badge) at most 0.19, stripes
-# at least 0.32. A ball with another closer than PACKED radii (a rack) is
-# a solid only up to PACKED_SOLID (synthetic racks: solids up to 0.19,
-# stripes from 0.18; in between it stays unknown).
-SOLID_WHITE = .22
-STRIPE_WHITE = .29
+# Telling solids from stripes after a shot (``ball_signature``): a stripe
+# has STRIPE_EDGE or more of its edge (0.75-0.95 radii) white, or
+# STRIPE_WHITE of its disc (turned end-on); a solid at most SOLID_EDGE of
+# its edge and less than SOLID_WHITE of its disc. Synthetic balls turned
+# every way, as the mirror shows them: solids' edges at most 0.14 white,
+# stripes' at least 0.39 (whole discs: solids 0.18, stripes up to 0.8). Real
+# frames: badge-up solids 0.25-0.31 white in all but 0.05 at the edge,
+# stripes 0.2-0.54 at the edge. A ball with another closer than PACKED radii
+# (a rack) is a solid only up to PACKED_SOLID at its edge.
+STRIPE_EDGE = .17
+# ... spread round it, not on one side (``edge_side`` at most this: a real
+# solid's big badge turned to the edge is one patch there).
+STRIPE_SIDE = .5
+# Edge pixels this many radii from the highlight's spot (``HIGHLIGHT``) are
+# left out of the edge's white.
+HIGHLIGHT_REACH = .4
+STRIPE_WHITE = .5
+SOLID_EDGE = .1
+SOLID_WHITE = .4
 PACKED = 2.2
-PACKED_SOLID = .12
+PACKED_SOLID = .06
 # After the shot a ball matches one before it at most COLOUR_MATCH apart in
 # colour (Lab; one ball turned two ways: 25 at the 99th percentile, red and
 # maroon can be 14 apart) and MATCH_MAX with half the radii it moved (at
@@ -157,6 +168,10 @@ MATCH_MAX = 45.0
 # The colour bound holds only for balls whose colour was read from enough of
 # them: at most this share white.
 SURE_WHITE = .6
+# A pair whose solid or stripe is known on both sides counts this much
+# cheaper when choosing (balls of one colour are a few apart, of different
+# colours 20 or more).
+KNOWN_BONUS = 10.0
 
 
 def _sub_pixel(score: np.ndarray, iy: int, ix: int) -> tuple[float, float]:
@@ -707,8 +722,9 @@ def refined(frame: np.ndarray, detection: Detection) -> Detection:
 def ball_colour(frame: np.ndarray, x: float, y: float, r: float) -> dict:
     """The colour of a ball's coloured part (median Lab within 0.9 radii,
     white left out: a stripe's white caps and the number badge turn with the
-    ball; a stripe turned end-on shows its colour only as a ring at the rim)
-    and its share of white within 0.95 radii."""
+    ball; a stripe turned end-on shows its colour only as a ring at the rim),
+    its share of white within 0.95 radii, and that share along its edge
+    (0.75-0.95 radii: a stripe's caps reach it, a solid's badge hardly)."""
     h, w = frame.shape[:2]
     reach = int(np.ceil(r)) + 1
     x0, x1 = max(0, int(x) - reach), min(w, int(x) + reach + 1)
@@ -728,20 +744,42 @@ def ball_colour(frame: np.ndarray, x: float, y: float, r: float) -> dict:
     white = (lab[:, 0] > 140) & (chroma < max(18.0, .45 * float(np.percentile(chroma[disc], 75))))
     coloured = inner & ~white
     pix = lab[coloured] if coloured.sum() >= 5 else lab[inner]
+    # The edge, but where the light's highlight reaches it (as white as a
+    # badge or a cap, always at the same spot).
+    hx, hy = x + HIGHLIGHT[0] * r, y + HIGHLIGHT[1] * r
+    edge = (d >= r * .75) & disc & (np.hypot(xx - hx, yy - hy).reshape(-1) > HIGHLIGHT_REACH * r)
+    on_edge = edge & white
+    side = 1.0
+    if on_edge.any():
+        # How much the white along the edge lies on one side (1: one patch,
+        # 0: spread round or on opposite sides).
+        ex, ey = (xx.reshape(-1) - x)[on_edge], (yy.reshape(-1) - y)[on_edge]
+        side = float(np.hypot(*np.mean(np.column_stack([ex, ey]) / np.maximum(d[on_edge], 1e-6)[:, None], axis=0)))
     return {"lab": [round(float(v), 1) for v in np.median(pix, axis=0)],
-            "white": round(float(white[disc].mean()), 3)}
+            "white": round(float(white[disc].mean()), 3),
+            "edge_white": round(float(white[edge].mean()) if edge.any() else 0.0, 3),
+            "edge_side": round(side, 3)}
 
 
 def ball_signature(frame: np.ndarray, x: float, y: float, r: float, packed: bool = False) -> dict:
     """A ball's colour (``ball_colour``) and whether it is striped (True,
-    False, or None when its share of white is in between), for telling balls
-    apart after the shot. A ball ``packed`` among others (a rack) is a solid
-    only with less white (PACKED_SOLID): its circle can be off by half a
-    radius and take in a neighbour's white."""
+    False, or None when unsure), for telling balls apart after the shot. A
+    stripe's white caps reach its edge (or, turned end-on, it is mostly
+    white); a solid's one number badge, even facing up, stays inside it (on
+    the real game the badge-up solids show as much white in all as stripes
+    seen side-on). A ball ``packed`` among others (a rack) is a solid only
+    with less white: its circle can be off by half a radius and take in a
+    neighbour's white."""
     out = ball_colour(frame, x, y, r)
     out["packed"] = bool(packed)
-    solid = PACKED_SOLID if packed else SOLID_WHITE
-    out["stripe"] = True if out["white"] >= STRIPE_WHITE else (False if out["white"] <= solid else None)
+    edge, white = out["edge_white"], out["white"]
+    solid_edge = PACKED_SOLID if packed else SOLID_EDGE
+    if (edge >= STRIPE_EDGE and out["edge_side"] <= STRIPE_SIDE) or white >= STRIPE_WHITE:
+        out["stripe"] = True
+    elif edge <= solid_edge and white < SOLID_WHITE:
+        out["stripe"] = False
+    else:
+        out["stripe"] = None
     return out
 
 
@@ -819,9 +857,10 @@ def _balls_with_signatures(frame, detection: Detection, cue_xy=None):
 def match_balls(before: list[dict], after: list[dict], radius: float, fixed=None) -> list[int | None]:
     """For each ball before the shot, the index of the same ball after it, or
     None if it was potted: by colour, nearer first for a tie. A solid never
-    matches a stripe; pairs whose solid or stripe is known on both sides go
-    first (an unsure ball, as in a rack, must not take another's place).
-    Greedy on the cheapest pairs. ``fixed``: {before index: after index}
+    matches a stripe; a pair whose solid or stripe is known on both sides
+    goes before an unsure one of about the same cost (KNOWN_BONUS: an unsure
+    ball, as in a rack, must not take its twin's place). Greedy on the
+    cheapest pairs. ``fixed``: {before index: after index}
     already known (a ball followed to where it stopped)."""
     fixed = dict(fixed or {})
     pairs = []
@@ -834,7 +873,8 @@ def match_balls(before: list[dict], after: list[dict], radius: float, fixed=None
             if colour > COLOUR_MATCH and _colour_sure(b) and _colour_sure(a):
                 continue
             moved = float(np.hypot(b["x"] - a["x"], b["y"] - a["y"])) / max(radius, 1.0)
-            pairs.append((not known, colour + .5 * min(moved, 20.0), i, j))
+            cost = colour + .5 * min(moved, 20.0)
+            pairs.append((cost - (KNOWN_BONUS if known else 0.0), cost, i, j))
     pairs.sort()
     result: list[int | None] = [fixed.get(i) for i in range(len(before))]
     used = set(fixed.values())
