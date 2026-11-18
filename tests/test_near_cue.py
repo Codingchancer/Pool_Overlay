@@ -22,6 +22,17 @@ import fake_game as fg
 import stress_test as st
 
 
+def setUpModule():
+    # These frames were chosen on the old flat look (number up, straight
+    # band); balls turned as in the game are checked in test_turned_balls
+    # and by the sweeps.
+    fg.TURN_BALLS = False
+
+
+def tearDownModule():
+    fg.TURN_BALLS = True
+
+
 def table_roi(frame):
     x, y, w, h = detector.find_table_bounds(frame)
     return frame[y:y + h, x:x + w], (x, y)

@@ -733,6 +733,9 @@ CUE_WHITE = .7
 # A circle centred within this many radii of the ghost ring's centre is the
 # ring itself (circle finding locks onto it), not a ball beside it.
 RING_ITSELF = .3
+# Once the ghost is found, no ball other than the cue ball lies within this
+# many ghost radii of its centre (the struck ball touches it, two radii out).
+GHOST_OVERLAP = 1.3
 # A ghost this many radii or more from a ball, at the end of its ray, is a
 # normal shot's (a ring right beside a ball can be the struck ball's own).
 RAY_GHOST_REACH = 2.4
@@ -807,7 +810,8 @@ def ball_beside_ring(roi: np.ndarray, ring, radius: float, min_r: int, max_r: in
     window = paint_out_ring(roi[y0:y1, x0:x1], (gx - x0, gy - y0, ring[2]), radius)
     gray = cv2.medianBlur(cv2.cvtColor(window, cv2.COLOR_BGR2GRAY), 5)
     best = None
-    for found in find_balls(window, gray, min_r, max_r):
+    # (The cue ball is white: no ball the cloth's colour is looked for.)
+    for found in find_balls(window, gray, min_r, max_r, cloth_coloured=False):
         bx, by = found[0] + x0, found[1] + y0
         if np.hypot(bx - gx, by - gy) <= radius * RING_OVERLAP and (best is None or found[5] > best[5]):
             best = (bx, by, *found[2:])
@@ -3249,6 +3253,29 @@ def _ring_white(lab: np.ndarray, x: float, y: float, r: float) -> float:
     return float(np.mean((chroma < 12) & (px[:, 0] >= 170)))
 
 
+# The cue ball is white right out to its rim, but for its small red dot. A
+# striped ball turned with its band towards the rim (seen end-on: a white
+# face ringed by its colour) is as white inside; its rim is coloured (Lab
+# chroma CUE_RIM_CHROMA or more) along STRIPE_RIM of it or more.
+CUE_RIM_CHROMA = 25.0
+STRIPE_RIM = .25
+_RIM_COLOUR_ANGLES = np.linspace(0, 2 * np.pi, 48, endpoint=False)
+
+
+def coloured_rim_share(lab: np.ndarray, x: float, y: float, r: float) -> float:
+    """Share of the rim of the ball at (x, y) (0.8 and 0.88 radii ``r``, the
+    more coloured of the two on each ray) that is clearly coloured, on the
+    Lab image ``lab``: 0 on synthetic cue balls (real frames: at most 0.15),
+    0.3 or more on 95% of synthetic striped balls turned end-on or mostly
+    white."""
+    radii = np.array([.8, .88])[:, None] * r
+    xs = (x + np.cos(_RIM_COLOUR_ANGLES)[None] * radii).astype(np.float32)
+    ys = (y + np.sin(_RIM_COLOUR_ANGLES)[None] * radii).astype(np.float32)
+    px = cv2.remap(lab, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE).astype(np.float32)
+    chroma = np.hypot(px[..., 1] - 128, px[..., 2] - 128).max(axis=0)
+    return float(np.mean(chroma >= CUE_RIM_CHROMA))
+
+
 def white_cloth_cue_centre(roi: np.ndarray, cue_xy: tuple[float, float], balls,
                            offset: tuple[int, int], context: "_WhiteCloth | None" = None
                            ) -> tuple[float, float] | None:
@@ -3949,8 +3976,195 @@ def has_number_badge(patch_hsv: np.ndarray, xx, yy, cx: float, cy: float, r: flo
     return float(middle.mean()) >= .5 and float(outside.mean()) <= .08
 
 
+# Where the balls' highlight sits (radii right of and below the centre) when
+# a frame has too few balls to measure it (``highlight_offset``): real frames
+# show it at (-0.3..-0.4, -0.4..-0.6), the synthetic table at (-0.35, -0.38).
+HIGHLIGHT = (-.38, -.45)
+HIGHLIGHT_BALLS = 4
+HIGHLIGHT_PEAK = 1.0
+_HL_GRID = np.linspace(-.9, .9, 19)
+_HL_GX, _HL_GY = np.meshgrid(_HL_GRID, _HL_GRID)
+_HL_DISC = np.hypot(_HL_GX, _HL_GY) <= .85
+_HL_SEARCH = np.hypot(_HL_GX, _HL_GY) <= .75
+_HL_RING = np.linspace(0, 2 * np.pi, 48, endpoint=False)
+
+
+def highlight_offset(smooth: np.ndarray, centres, radius: float) -> tuple[float, float]:
+    """Where the balls' highlight sits, in radii from their centre: the peak
+    of their average brightness pattern on ``smooth`` (lightness, blurred a
+    little), each ball's own level and spread taken out so its colour does
+    not count; number badges and stripes, turned every way, average out.
+    HIGHLIGHT with fewer than HIGHLIGHT_BALLS balls or no clear peak (in the
+    balls' own spread). Real frames: (-0.3..-0.4, -0.4..-0.6), peak 1.5-2.1."""
+    if len(centres) < HIGHLIGHT_BALLS:
+        return HIGHLIGHT
+    total = np.zeros_like(_HL_GX)
+    for x, y in centres:
+        p = cv2.remap(smooth, (x + _HL_GX * radius).astype(np.float32), (y + _HL_GY * radius).astype(np.float32),
+                      cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        v = p[_HL_DISC]
+        total += (p - v.mean()) / max(float(v.std()), 1.0)
+    score = np.where(_HL_SEARCH, total / len(centres), -np.inf)
+    iy, ix = np.unravel_index(int(np.argmax(score)), score.shape)
+    if score[iy, ix] < HIGHLIGHT_PEAK or np.hypot(_HL_GX[iy, ix], _HL_GY[iy, ix]) < .15:
+        return HIGHLIGHT
+    return float(_HL_GX[iy, ix]), float(_HL_GY[iy, ix])
+
+
+# A circle that looks like cloth inside is a ball the cloth's colour
+# (``BallLook.cloth_coloured_ball``) when it lies CLOTH_COLOURED_GAP radii or
+# more from every ball found, its highlight is HIGHLIGHT_RISE (Lab L)
+# brighter than the rest of the circle through it, HIGHLIGHT_OVER_CLOTH
+# brighter than the cloth around and HIGHLIGHT_OVER_LEVEL brighter than the
+# cloth's own level there, its inside differs from that cloth by
+# CLOTH_COLOURED_DL in lightness or CLOTH_COLOURED_DAB in colour, and it is
+# not the ghost ring: no circle near its rim with a thin bright stroke along
+# CLOTH_COLOURED_RING of it whose core is guide white along
+# CLOTH_COLOURED_RING_WHITE of it.
+CLOTH_COLOURED_GAP = 1.75
+HIGHLIGHT_RISE = 12.0
+HIGHLIGHT_OVER_CLOTH = 15.0
+HIGHLIGHT_OVER_LEVEL = 8.0
+# ...and its highlight is not on a line: going out from it HIGHLIGHT_RUN
+# radii in any direction, no more than HIGHLIGHT_LINE of its rise is left
+# all the way (a spot fades: real balls 0.32 typical at 0.35 radii, 0.69 at
+# the 90th percentile; along a line ~1), unless HIGHLIGHT_ACROSS or more is
+# left HIGHLIGHT_SIDE radii to one side, at the spot or 0.3 radii along (a
+# stripe's white cap is wide; the guide's strokes and the stick are not).
+HIGHLIGHT_RUN = (.15, .3, .45)
+HIGHLIGHT_SIDE = .25
+HIGHLIGHT_LINE = .75
+HIGHLIGHT_ACROSS = .5
+_HL_DIRS = np.radians(np.arange(0, 360, 11.25))
+CLOTH_COLOURED_RING = .8
+CLOTH_COLOURED_RING_WHITE = .7
+CLOTH_COLOURED_DL = 6.0
+CLOTH_COLOURED_DAB = 4.0
+
+
+class BallLook:
+    """What the test for a ball the colour of the cloth needs, measured once
+    per picture (``roi``, BGR): Lab, lightness (blurred a little too), HSV,
+    where the highlight sits (``highlight_offset`` on the ``confident``
+    balls' centres, or ``offset``) and the cloth's own lightness around each
+    spot with the balls found (``found``) painted out (``local_lightness``:
+    the table's lettering does not lower it; packed balls' white would
+    raise it)."""
+
+    def __init__(self, roi: np.ndarray, found, confident, radius: float, offset=None, hsv=None):
+        self.lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
+        self.lightness = self.lab[:, :, 0].astype(np.float32)
+        self.smooth = cv2.GaussianBlur(self.lightness, (0, 0), max(1.0, radius * .1))
+        self.hsv = hsv if hsv is not None else cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        self.radius = radius
+        self.offset = offset if offset is not None else highlight_offset(self.smooth, confident, radius)
+        masked = self.lightness.copy()
+        fill = float(np.median(self.lightness[::4, ::4]))
+        for x, y in found:
+            cv2.circle(masked, (int(round(x)), int(round(y))), int(round(radius * 1.25)), fill, -1)
+        self.cloth = local_lightness(masked)
+
+    def cloth_coloured_ball(self, cx: float, cy: float) -> bool:
+        """True when the circle at (cx, cy) shows a ball's highlight and
+        its own shade (see the constants above; the gap to other balls is
+        checked by the caller).
+
+        A ball the colour of the cloth (purple 4 on a purple table, red 3 on
+        red, the 8 on black) looks like cloth inside, and with its number
+        turned away (most of the time: the balls roll) it shows no badge
+        either. What it still has is the glossy highlight every ball shows
+        at the same spot (the light is the same for all), paler and brighter
+        than the cloth, and its own shade. Rings, lettering and shadows have
+        cloth there."""
+        lab, radius = self.lab, self.radius
+        h, w = lab.shape[:2]
+        reach = int(np.ceil(radius * 1.85)) + 1
+        x0, x1 = max(0, int(cx) - reach), min(w, int(cx) + reach + 1)
+        y0, y1 = max(0, int(cy) - reach), min(h, int(cy) + reach + 1)
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            return False
+        yy, xx = np.mgrid[y0:y1, x0:x1]
+        d = np.hypot(xx - cx, yy - cy)
+        px = lab[y0:y1, x0:x1].astype(np.float32)
+        ring = px[(d >= radius * 1.35) & (d <= radius * 1.8)]
+        inner = px[d <= radius * .6]
+        ox, oy = self.offset
+        at_spot = np.hypot(xx - cx - ox * radius, yy - cy - oy * radius) <= radius * .15
+        spot = px[at_spot]
+        if len(ring) < 12 or len(inner) < 6 or len(spot) == 0:
+            return False
+        cloth = np.median(ring, axis=0)
+        # Brighter than the cloth around, and than the cloth's own level
+        # there (bare cloth between the dark strokes of the table's
+        # lettering is brighter than a ring over the letters).
+        spot_l = float(np.median(spot[:, 0]))
+        level = float(np.median(self.cloth[y0:y1, x0:x1][at_spot]))
+        if spot_l - float(cloth[0]) < HIGHLIGHT_OVER_CLOTH or spot_l - level < HIGHLIGHT_OVER_LEVEL:
+            return False
+        body = np.median(inner, axis=0)
+        if (abs(float(body[0] - cloth[0])) < CLOTH_COLOURED_DL
+                and float(np.hypot(body[1] - cloth[1], body[2] - cloth[2])) < CLOTH_COLOURED_DAB):
+            return False
+        rho = float(np.hypot(ox, oy))
+        ang = _HL_RING[np.cos(_HL_RING - np.arctan2(oy, ox)) < np.cos(np.radians(45))]
+        sx, sy = cx + ox * radius, cy + oy * radius
+        ux, uy = np.cos(_HL_DIRS), np.sin(_HL_DIRS)
+        run = np.asarray(HIGHLIGHT_RUN)[:, None] * radius
+        side = HIGHLIGHT_SIDE * radius
+        mid = HIGHLIGHT_RUN[1] * radius
+        xs = np.concatenate(([sx], cx + np.cos(ang) * rho * radius, (sx + ux * run).ravel(),
+                             sx - uy * side, sx + uy * side, sx + ux * mid - uy * side, sx + ux * mid + uy * side))
+        ys = np.concatenate(([sy], cy + np.sin(ang) * rho * radius, (sy + uy * run).ravel(),
+                             sy + ux * side, sy - ux * side, sy + uy * mid + ux * side, sy + uy * mid - ux * side))
+        xs, ys = xs.astype(np.float32)[None], ys.astype(np.float32)[None]
+        v = cv2.remap(self.smooth, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
+        base = float(np.median(v[1:1 + len(ang)]))
+        rise = float(v[0]) - base
+        if rise < HIGHLIGHT_RISE:
+            return False
+        # A highlight is a spot, fading every way. A white line (the game's
+        # guide) or the cue stick through that point, or ending there, stays
+        # bright along itself and is dark on both sides across it, at the
+        # spot and further along (a stripe's white cap there is wide).
+        # Read on the unblurred lightness (blurred, a thin line sinks to the
+        # cloth's level) and from the cloth's own level where the circle's
+        # is lower (lettering under it: the bare cloth beside a line is no
+        # wider bright stroke).
+        v = cv2.remap(self.lightness, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)[0]
+        ref = max(float(np.median(v[1:1 + len(ang)])), level)
+        rest = (v[1 + len(ang):] - ref) / max(float(v[0]) - ref, 1.0)
+        k = len(_HL_DIRS)
+        along = rest[:len(HIGHLIGHT_RUN) * k].reshape(len(HIGHLIGHT_RUN), k).min(axis=0)
+        across = rest[len(HIGHLIGHT_RUN) * k:].reshape(4, k)
+        i = int(np.argmax(along))
+        if along[i] > HIGHLIGHT_LINE and float(across[:, i].max()) < HIGHLIGHT_ACROSS:
+            return False
+        # Not the ghost ring (a circle found on it can sit a few px off its
+        # centre; its stroke is guide white, a real ball's outline is tinted).
+        return not any(_ring_core_white(self.hsv, *circle) >= CLOTH_COLOURED_RING_WHITE
+                       for circle in _rings_nearby(self.lightness, cx, cy, radius))
+
+
+_RING_NEAR_SHIFTS = np.arange(-.25, .26, .125)
+_RING_NEAR_SIZES = (.8, .85, .9, .95, 1.0, 1.05)
+
+
+def _rings_nearby(lightness: np.ndarray, cx: float, cy: float, radius: float, most: int = 8):
+    """Circles within 0.25 radii of (cx, cy), 0.8-1.05 radii across, with a
+    thin bright stroke (``_thin_stroke_share``) along CLOTH_COLOURED_RING or
+    more of them, the best ``most`` first. Real frames: the game's ghost ring
+    0.84-1.0 (cut by the cushion: 0.84); a ball 0.97 typical too (Miniclip
+    outlines its balls), but tinted: guide white along 0.08 of it (0.49 at
+    the 90th percentile), the ghost ring 0.76-0.97."""
+    circles = [(cx + dx * radius, cy + dy * radius, radius * f)
+               for dx in _RING_NEAR_SHIFTS for dy in _RING_NEAR_SHIFTS for f in _RING_NEAR_SIZES]
+    shares = _stroke_shares(lightness, circles)
+    order = [i for i in np.argsort(-shares)[:most] if shares[i] >= CLOTH_COLOURED_RING]
+    return [circles[i] for i in order]
+
+
 def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared: dict | None = None,
-               sites: list[tuple[float, float, float]] | None = None):
+               sites: list[tuple[float, float, float]] | None = None, cloth_coloured: bool = True):
     """Ball circles in the table ROI: (x, y, r, sat, val, white_fraction, red_spot).
 
     Candidates come from circle finding on grey levels and on colour distance
@@ -4034,6 +4248,8 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
     pockets_local = [(-inset, -inset), (tw / 2, -2 * inset), (tw + inset, -inset),
                      (-inset, th + inset), (tw / 2, th + 2 * inset), (tw + inset, th + inset)]
     accepted = []
+    # Circles that look like cloth inside and show no number badge.
+    cloth_like = []
     refit: set[tuple[int, int]] = set()
     for cx, cy, r in proposals:
         if not (0 <= cx < tw and 0 <= cy < th):
@@ -4155,11 +4371,12 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
                 body_hue = float(np.median(hue_delta(inner[body][:, 0], local_hue)))
                 if abs(body_hue) > 15:
                     refit.add((cx, cy))
+        badge = False
         if cloth_fraction > .35:
             # A solid ball the same colour as the cloth (purple 4 on a purple
             # table, red 3 on red) looks like cloth inside, but its white
-            # number badge fills the centre. Hollow rings, lettering and
-            # shadows have cloth there.
+            # number badge fills the centre when it faces up. Hollow rings,
+            # lettering and shadows have cloth there.
             badge_v = 150.0
             # A pale cloth (any colour) passes the default badge-white test
             # itself; the badge must then be brighter than the cloth.
@@ -4170,17 +4387,41 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
                 ring_s = float(np.median(ring[:, 1]))
                 if ring_s >= 25:
                     badge_s = min(badge_s, ring_s * .6)
-            if not has_number_badge(patch, xx, yy, cx, cy, r, badge_v, badge_s):
-                if shared is not None and sites is None:
-                    # (On a white cloth detect() looks at these again: there
-                    # the white cue ball itself can look like cloth.)
-                    shared.setdefault("cloth_like", []).append((cx, cy, r, cloth_fraction))
-                continue
+            badge = has_number_badge(patch, xx, yy, cx, cy, r, badge_v, badge_s)
         sat = float(np.median(inner[:, 1]))
         val = float(np.median(inner[:, 2]))
         white_fraction = float(np.mean((inner[:, 1] < 90) & (inner[:, 2] > 150)))
         red_spot = float(np.mean((centre[:, 0] < 30) & (centre[:, 1] > 70) & (centre[:, 2] < 90)))
+        if cloth_fraction > .35 and not badge:
+            # Judged again below, once the balls show where their
+            # highlight sits (a ball the cloth's colour, number turned away).
+            cloth_like.append((cloth_fraction, cx, cy, r, sat, val, white_fraction, red_spot))
+            continue
         accepted.append((cloth_fraction, cx, cy, r, sat, val, white_fraction, red_spot))
+    if cloth_like and accepted and cloth_coloured:
+        confident = [item for item in accepted if item[0] <= .35 and (item[1], item[2]) not in from_badge]
+        radius = float(np.median([item[3] for item in confident])) if confident else typical
+        centres = [(item[1], item[2]) for item in accepted]
+        look = None
+        for item in sorted(cloth_like):
+            cloth_fraction, cx, cy = item[:3]
+            if all((cx - ax) ** 2 + (cy - ay) ** 2 >= (radius * CLOTH_COLOURED_GAP) ** 2 for ax, ay in centres):
+                if look is None:
+                    # (Only now: most frames have no such circle left.)
+                    offset = shared.get("highlight") if sites is not None and shared is not None else None
+                    look = BallLook(roi, centres, [(c[1], c[2]) for c in confident], radius, offset, roi_hsv)
+                    if shared is not None and sites is None:
+                        shared["highlight"] = look.offset
+                if look.cloth_coloured_ball(float(cx), float(cy)):
+                    accepted.append(item)
+                    centres.append((cx, cy))
+                    continue
+            if shared is not None and sites is None:
+                # (On a white cloth detect() looks at these again: there
+                # the white cue ball itself can look like cloth.)
+                shared.setdefault("cloth_like", []).append((cx, cy, item[3], cloth_fraction))
+    elif cloth_like and shared is not None and sites is None:
+        shared.setdefault("cloth_like", []).extend((item[1], item[2], item[3], item[0]) for item in cloth_like)
     # Balls never overlap (touching balls are one diameter apart). Two
     # proposals on the same ball are ~0.3 diameters apart; touching rack
     # balls can look as close as ~0.75 diameters when the radius estimate is
@@ -4233,7 +4474,9 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
         # proposed again; the same checks decide.
         spots = rack_gaps([(b[0], b[1]) for b in result], typical, tw, th, pockets_local)
         if spots:
-            extra = find_balls(roi, gray, min_r, max_r, {"distance": distance}, sites=spots)
+            extra = find_balls(roi, gray, min_r, max_r,
+                               {"distance": distance, "highlight": shared.get("highlight") if shared else None},
+                               sites=spots)
             for item in extra:
                 if all(np.hypot(item[0] - b[0], item[1] - b[1]) >= typical * 1.5 for b in result):
                     result.append(item)
@@ -4508,8 +4751,25 @@ def detect(frame: np.ndarray) -> Detection:
                                       minLineLength=max(45, min_r * 6), maxLineGap=max(12, int(min_r * 1.2)))
         # The cue ball is bright white over most of its face; striped object
         # balls and Miniclip's reticle are much less white across the full disc.
-        white_candidates = [c for c in cue_candidates if c[5] >= .68]
-        shaft_candidates = white_candidates or [c for c in cue_candidates if c[5] >= .52 and c[3] < 80]
+        # A striped ball turned end-on is as white inside, but its rim is
+        # coloured (``coloured_rim_share``): it only counts when nothing else
+        # is left (synthetic white cloth with turned balls, where the cue
+        # ball's own ray is often not confirmed: cue ball wrong in 39 of 150
+        # frames before).
+        lab_roi = None
+        striped = set()
+        typical_r = float(np.median([b[2] for b in balls]))
+        for c in cue_candidates:
+            if c[5] >= .52:
+                if lab_roi is None:
+                    lab_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
+                if coloured_rim_share(lab_roi, c[0] - x, c[1] - y, typical_r) >= STRIPE_RIM:
+                    striped.add(id(c))
+        plain = [c for c in cue_candidates if id(c) not in striped]
+        white_candidates = ([c for c in plain if c[5] >= .68]
+                            or [c for c in cue_candidates if c[5] >= .68])
+        shaft_candidates = (white_candidates or [c for c in plain if c[5] >= .52 and c[3] < 80]
+                            or [c for c in cue_candidates if c[5] >= .52 and c[3] < 80])
         stick_matches = []
         if stick_lines is not None:
             for candidate in shaft_candidates:
@@ -4560,13 +4820,14 @@ def detect(frame: np.ndarray) -> Detection:
                     ghost = find_ghost_ball(ghost_mask, local, direction, radius, roi)
                     if ghost is not None:
                         break
-                verified.append((ghost is not None, candidate is cue, candidate[5], candidate))
+                verified.append((ghost is not None, id(candidate) not in striped, candidate is cue, candidate[5],
+                                 candidate))
                 if ghost is not None and np.hypot(ghost[0] - local[0], ghost[1] - local[1]) >= radius * RAY_GHOST_REACH:
                     far_ghost[id(candidate)] = ghost
             if verified:
-                best = max(verified, key=lambda item: item[:3])
+                best = max(verified, key=lambda item: item[:4])
                 if best[0] or cue is None:
-                    cue = best[3]
+                    cue = best[4]
             # The ray and ghost of a struck ball right next to the cue ball
             # are hidden under the ring, while a striped ball's own object
             # line can pass for a ray ending in a "ghost". The cue ball is
@@ -4575,7 +4836,7 @@ def detect(frame: np.ndarray) -> Detection:
             # (On a colourless light cloth a striped ball's white half is as
             # unsaturated as the cue ball, 4 against 4 on synthetic seed
             # 40003: there the whiteness alone decides.)
-            whitest = max(cue_candidates, key=lambda c: c[5])
+            whitest = max(plain or cue_candidates, key=lambda c: c[5])
             roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
             colourless = _light_cloth(roi_hsv) and _cloth_saturation(roi_hsv) < 40
             if (cue is not None and whitest is not cue and whitest[5] >= .75
@@ -4752,13 +5013,16 @@ def detect(frame: np.ndarray) -> Detection:
         def drop_ring_ball(balls, shot):
             """Nothing can occupy the spot where the cue ball will be at
             impact: a "ball" centred on the ghost ring is the ring itself
-            (the ray and deflection line inside it can make it look filled).
+            (the ray and deflection line inside it can make it look filled),
+            and one centred within GHOST_OVERLAP ghost radii of it is a
+            circle on its stroke and lines (the struck ball only touches it,
+            two radii out; a gap in a rack can be proposed right there).
             Drop it and predict again so it is not masked or used as an
             obstacle."""
             if not shot["ghost"]:
                 return balls, shot
             gx, gy, gr = shot["ghost"]
-            cleaned = [b for b in balls if b[3] == "cue" or np.hypot(b[0] - gx, b[1] - gy) > gr * .6]
+            cleaned = [b for b in balls if b[3] == "cue" or np.hypot(b[0] - gx, b[1] - gy) > gr * GHOST_OVERLAP]
             if len(cleaned) == len(balls):
                 return balls, shot
             return cleaned, predict_shot(roi, table, cleaned, cue[:3])

@@ -18,6 +18,17 @@ import fake_game as fg
 from tracking import ShotTracker
 
 
+def setUpModule():
+    # These frames were chosen on the old flat look (number up, straight
+    # band); balls turned as in the game are checked in test_turned_balls
+    # and by the sweeps.
+    fg.TURN_BALLS = False
+
+
+def tearDownModule():
+    fg.TURN_BALLS = True
+
+
 class StickCrossingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

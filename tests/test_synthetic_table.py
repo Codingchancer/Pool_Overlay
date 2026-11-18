@@ -22,6 +22,17 @@ import stress_test as st
 APP = QApplication.instance() or QApplication([])
 
 
+def setUpModule():
+    # These frames were chosen on the old flat look (number up, straight
+    # band); balls turned as in the game are checked in test_turned_balls
+    # and by the sweeps.
+    fg.TURN_BALLS = False
+
+
+def tearDownModule():
+    fg.TURN_BALLS = True
+
+
 def run(seed, kind=None):
     return st.evaluate(seed, kind)
 

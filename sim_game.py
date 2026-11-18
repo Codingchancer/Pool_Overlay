@@ -50,25 +50,35 @@ class ShotRecord:
     # Every 60 Hz physics frame (``frames`` keeps every ``every``-th).
     positions: list[tuple[tuple[float, float] | None, dict[int, tuple[float, float]]]] = field(default_factory=list)
     trails: dict[int, list[tuple[float, float]]] = field(default_factory=dict)
+    # How each ball (0: the cue ball) is turned on each of ``positions``:
+    # rolled along its path, so the number badge and stripe turn with it.
+    turns: list[dict[int, tuple[float, ...]]] = field(default_factory=list)
     first_contact: int | None = None
     pocketed: tuple[int, ...] = ()
     message: str = ""
 
 
 class SimGame:
-    def __init__(self, seed: int, cloth: str | tuple = "blue", harsh: bool = False, aim_error: float = .25):
+    def __init__(self, seed: int, cloth: str | tuple = "blue", harsh: bool = False, aim_error: float = .25,
+                 turned: bool | None = None):
         self.seed = seed
         self.aim_error = aim_error      # degrees (1 sigma) the planner misses its aim by
         self.rng = np.random.default_rng(seed)
         base = fg.random_scene(seed, "scatter", cloth)
         self.harsh = harsh
-        self.base = replace(base, balls={}, show_stick=True, show_guide=True)
+        # ``turned`` False: the balls are drawn flat and do not turn (the old
+        # look); None: as ``fake_game.TURN_BALLS``.
+        self.base = replace(base, balls={}, show_stick=True, show_guide=True,
+                            turned=fg.TURN_BALLS if turned is None else turned)
         self.table = base.table
         self.r = base.radius
         self.pockets = fg.pocket_centres(self.table)
         self.rules = EightBallGame()
         self.balls: dict[int, tuple[float, float]] = {}
         self.cue: tuple[float, float] | None = None
+        # How the balls are turned (number -> 3x3 rotation, 0: the cue ball);
+        # one not in it yet is turned at random by its position.
+        self.turns: dict[int, np.ndarray] = {}
         self.shots: list[ShotRecord] = []
         self._rack()
 
@@ -220,11 +230,20 @@ class SimGame:
 
     # --- rendering -----------------------------------------------------------
 
+    def _turn_of(self, number: int, point) -> np.ndarray:
+        turn = self.turns.get(number)
+        return turn if turn is not None else fg.ball_turn(self.base, number, *point)
+
     def scene(self, balls=None, cue=None, aim_degrees=0.0, guide=False, stick=False,
-              power: float | None = None, pull: float = 0.0) -> fg.Scene:
-        s = replace(self.base, balls=dict(self.balls if balls is None else balls),
-                    cue=self.cue if cue is None else cue, aim_degrees=float(aim_degrees),
-                    show_guide=guide, show_stick=stick, power=power, stick_pull=float(pull))
+              power: float | None = None, pull: float = 0.0, turns=None) -> fg.Scene:
+        """The table as the mirror shows it; ``turns`` (as ``ShotRecord.turns``)
+        defaults to how the balls are turned now."""
+        balls = dict(self.balls if balls is None else balls)
+        cue = self.cue if cue is None else cue
+        if turns is None and self.base.turned:
+            turns = {n: tuple(self._turn_of(n, p).ravel()) for n, p in [(0, cue), *balls.items()] if p is not None}
+        s = replace(self.base, balls=balls, cue=cue, aim_degrees=float(aim_degrees),
+                    show_guide=guide, show_stick=stick, power=power, stick_pull=float(pull), turns=turns)
         return fg.harsh(s) if self.harsh else s
 
     def render_aim(self, plan: ShotPlan, aim_degrees: float | None = None, pull: float = 1.0):
@@ -279,12 +298,13 @@ class SimGame:
         while int(k) < len(record.positions):
             cue, balls = record.positions[int(k)]
             yield t, fg.render(self.scene(balls=balls, cue=cue if cue is not None else (-100.0, -100.0),
-                                          power=0.0 if slider else None))[0], "roll"
+                                          power=0.0 if slider else None, turns=record.turns[int(k)]))[0], "roll"
             t += step
             k += ratio
         cue, balls = record.positions[-1] if record.positions else (self.cue, self.balls)
         still = fg.render(self.scene(balls=balls, cue=cue if cue is not None else (-100.0, -100.0),
-                                     power=0.0 if slider else None))[0]
+                                     power=0.0 if slider else None,
+                                     turns=record.turns[-1] if record.turns else None))[0]
         for _ in range(int(round(rest * fps))):
             yield t, still, "rest"
             t += step
@@ -347,6 +367,18 @@ class SimGame:
         result, positions, dropped, trails = self._simulate(plan)
         record = ShotRecord(plan, dict(self.balls), self.cue)
         record.positions = positions
+        # Each ball rolls along its path (a pocketed one keeps its last turn).
+        turning = ({n: self._turn_of(n, p) for n, p in [(0, self.cue), *self.balls.items()] if p is not None}
+                   if self.base.turned else {})
+        last_at = {0: self.cue, **self.balls}
+        for cue, balls in positions:
+            for n, p in [(0, cue), *balls.items()]:
+                q = last_at.get(n)
+                if p is not None and q is not None and n in turning:
+                    turning[n] = fg.roll(turning[n], p[0] - q[0], p[1] - q[1], self.r)
+                last_at[n] = p
+            record.turns.append({n: tuple(t.ravel()) for n, t in turning.items()})
+        self.turns = turning
         order_dropped = list(dropped)
         last = len(record.positions) - 1
         record.frames = [p for i, p in enumerate(record.positions) if i % every == 0 or i == last]

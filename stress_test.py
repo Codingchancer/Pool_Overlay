@@ -1,16 +1,20 @@
 """Measure the detector on many synthetic frames with known geometry.
 
-    python stress_test.py [--count 200] [--start 0] [--cloth white] [--harsh] [--save-failures DIR]
+    python stress_test.py [--count 200] [--start 0] [--cloth white] [--harsh] [--flat] [--save-failures DIR]
 
 Prints error statistics and every failed check per seed. A frame passes when
 the table, cue ball, balls, ghost ball, aim angle, target and predicted
-directions all match the truth within the tolerances below.
+directions all match the truth within the tolerances below. The balls are
+turned at random as the game's balls are (``fake_game.draw_ball``);
+``--flat`` draws them the old way (number up, straight band) to compare
+with results from before.
 """
 from __future__ import annotations
 
 import argparse
 import os
 from collections import Counter
+from dataclasses import replace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -90,8 +94,11 @@ def bounce_check(segments, direction, truth, balls, true_start=None, true_dir=No
     return mech, true_deg, len(drawn)
 
 
-def evaluate(seed: int, kind: str | None = None, cloth: str | int = "blue", harsh: bool = False):
+def evaluate(seed: int, kind: str | None = None, cloth: str | int = "blue", harsh: bool = False,
+             flat: bool = False):
     scene = fg.random_scene(seed, kind, cloth)
+    if flat:
+        scene = replace(scene, turned=False)
     if harsh:
         scene = fg.harsh(scene)
     return check_scene(scene)
@@ -284,6 +291,8 @@ def main_cli():
     parser.add_argument("--cloth", default="blue", help="cloth colour: " + ", ".join(list(fg.CLOTH_HUES) + list(fg.CLOTH_HSV)) + ", black, or h,s,v")
     parser.add_argument("--harsh", action="store_true",
                         help="show each scene as a real mirror might: stream scale, 4:2:0 colour, display tone")
+    parser.add_argument("--flat", action="store_true",
+                        help="balls drawn flat (number up, straight band), as before they were turned")
     parser.add_argument("--save-failures")
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
@@ -292,7 +301,7 @@ def main_cli():
     collected = {}
     for seed in range(args.start, args.start + args.count):
         cloth = tuple(int(v) for v in args.cloth.split(",")) if args.cloth.count(",") == 2 else args.cloth
-        scene, frame, truth, d, problems, stats = evaluate(seed, args.kind, cloth, args.harsh)
+        scene, frame, truth, d, problems, stats = evaluate(seed, args.kind, cloth, args.harsh, args.flat)
         for key, value in stats.items():
             collected.setdefault(key, []).append(value)
         if problems:
