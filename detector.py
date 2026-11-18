@@ -168,6 +168,9 @@ def _long_strokes(mask: np.ndarray) -> np.ndarray:
 
 # Lab lightness (8-bit) from which a cloth counts as light in the ball check.
 LIGHT_CLOTH_L = 150.0
+# A light cloth with less colour (Lab chroma) than this is pale (white,
+# light grey, beige, sky): striped balls are fitted on their band there.
+PALE_CLOTH_CHROMA = 25.0
 # A colourless cloth at least this light (grey, not the near-black Lucky
 # Shot cloth) has watermark lettering in a darker shade of it.
 GREY_CLOTH_L = 60.0
@@ -3221,21 +3224,29 @@ class _WhiteCloth:
         radii from (x, y): a striped ball's white caps (0.28-0.46 on
         synthetic white tables) or the cue ball (~0.9); a solid ball's only
         white is its number badge inside 0.5 radii (at most 0.15)."""
-        r = self.radius
-        h, w = self.lightness.shape
-        reach = int(np.ceil(r)) + 1
-        x0, x1 = max(0, int(x) - reach), min(w, int(x) + reach + 1)
-        y0, y1 = max(0, int(y) - reach), min(h, int(y) + reach + 1)
-        if x1 <= x0 or y1 <= y0:
-            return 0.0
-        yy, xx = np.mgrid[y0:y1, x0:x1]
-        d = np.hypot(xx - x, yy - y)
-        ring = (d >= .5 * r) & (d <= .85 * r)
-        if not ring.any():
-            return 0.0
-        px = self.lab[y0:y1, x0:x1][ring].astype(np.float32)
-        chroma = np.hypot(px[:, 1] - 128, px[:, 2] - 128)
-        return float(np.mean((chroma < 12) & (px[:, 0] >= 170)))
+        return _ring_white(self.lab, x, y, self.radius)
+
+
+def _ring_white(lab: np.ndarray, x: float, y: float, r: float) -> float:
+    """Share of pure white (colourless, Lab L 170 or more) between 0.5 and
+    0.85 radii ``r`` from (x, y) on the Lab image ``lab``: a striped ball's
+    white caps (0.28-0.46 on synthetic white tables) or the cue ball (~0.9);
+    a solid ball's only white is its number badge inside 0.5 radii (at most
+    0.15)."""
+    h, w = lab.shape[:2]
+    reach = int(np.ceil(r)) + 1
+    x0, x1 = max(0, int(x) - reach), min(w, int(x) + reach + 1)
+    y0, y1 = max(0, int(y) - reach), min(h, int(y) + reach + 1)
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    d = np.hypot(xx - x, yy - y)
+    ring = (d >= .5 * r) & (d <= .85 * r)
+    if not ring.any():
+        return 0.0
+    px = lab[y0:y1, x0:x1][ring].astype(np.float32)
+    chroma = np.hypot(px[:, 1] - 128, px[:, 2] - 128)
+    return float(np.mean((chroma < 12) & (px[:, 0] >= 170)))
 
 
 def white_cloth_cue_centre(roi: np.ndarray, cue_xy: tuple[float, float], balls,
@@ -3496,6 +3507,187 @@ def merge_duplicate_balls(balls, confirmed: set) -> list:
     return out
 
 
+def stripe_centres(roi: np.ndarray, balls, offset: tuple[int, int], cue_xy, stick=None,
+                   confirmed: set | None = None, ghost=None) -> list:
+    """``balls`` with every striped ball moved onto the circle through the
+    two arcs where its coloured band meets the cloth.
+
+    A striped ball's white caps are close to a light cloth (white, light
+    grey, beige, sky), so circle finding slid along the band or towards the
+    drop shadow (synthetic loose stripes: 0.11-0.20 radii off at the 90th
+    percentile on those cloths, solid balls 0.05). The band is coloured
+    right up to the rim at both its ends, and those two arcs lie opposite
+    each other (also for a band seen at a slant on a 3D-drawn ball: two
+    great circles cross at opposite points). On each ray from the rough
+    centre whose inside is band-coloured, the rim is where the colour
+    difference from the cloth falls halfway to the cloth's
+    (``_band_rim_points``); a circle of the balls' radius (within 10%) is
+    fitted to those points by consensus, from the rough centre and again
+    from that fit, when its points lie on both sides of the ball (both
+    arcs: one alone, beside a ball in a rack, moved a ball half a radius).
+    Only on a pale cloth (Lab L at least ``LIGHT_CLOTH_L``, chroma below
+    ``PALE_CLOTH_CHROMA``: white, light grey, beige, sky) is the ball moved.
+    On a darker one circle finding places stripes well already (0.05 radii
+    at the 90th percentile) and the fit, its halfway level pulled by the
+    drop shadow's colour, a little worse (0.06-0.08); on a light coloured
+    one (yellow, lime) it gained little, and on a real light blue table it
+    moved Miniclip's 3D-drawn stripes (curved bands, outlined) by 2-3 px
+    with nothing to show it was right.
+    ``stick`` ((x, y) of the cue ball, unit direction of the aim): a ball
+    the cue stick lies across behind the cue ball keeps its centre (the
+    stick's colour hides the band). A fitted ball is added to ``confirmed``:
+    a ball-sized circle through its band's two arcs makes it a ball, not
+    one of the stick's rings (moved onto the stick's axis, a stripe under
+    the stick was dropped as one in near shots, where the stick is read
+    later). ``ghost`` ((x, y), frame px): the ghost ring when known; rays
+    towards it are left out like rays towards balls. The struck ball
+    touches it, one diameter from its centre: the game's object line is
+    drawn from that ball's centre across its band (fitted, it was 3-6 px
+    off in 4 of 2850 synthetic frames), so its fit is used only when it
+    puts the ball a diameter from the ghost (within 0.1 radii) and the
+    circle found did not (0.25 radii or more off); the ghost and the
+    object line place it later anyway."""
+    if not balls:
+        return balls
+    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32)
+    felt = _felt_lab(roi)
+    move = felt[0] >= LIGHT_CLOTH_L and np.hypot(felt[1] - 128, felt[2] - 128) < PALE_CLOTH_CHROMA
+    colour = cv2.GaussianBlur(np.hypot(lab[:, :, 1] - felt[1], lab[:, :, 2] - felt[2]), (0, 0), .7)
+    light = cv2.GaussianBlur(lab[:, :, 0], (0, 0), .7)
+    radius = float(np.median([b[2] for b in balls]))
+    local = [(bx - offset[0], by - offset[1]) for bx, by, _, _ in balls]
+    blocking = local + ([(ghost[0] - offset[0], ghost[1] - offset[1])] if ghost is not None else [])
+    out = []
+    for (bx, by, br, kind), (lx, ly) in zip(balls, local):
+        struck = ghost is not None and np.hypot(bx - ghost[0], by - ghost[1]) < radius * BAND_STRUCK
+        # A ball the stick lies across keeps its centre.
+        keep = False
+        if stick is not None and not struck:
+            (sx, sy), (ux, uy) = stick
+            behind = -((bx - sx) * ux + (by - sy) * uy)
+            keep = 0 < behind < radius * 40 and abs((bx - sx) * uy - (by - sy) * ux) <= radius * 2
+        if (kind == "cue" or keep or np.hypot(bx - cue_xy[0], by - cue_xy[1]) <= br * .6
+                or _ring_white(lab, lx, ly, radius) < STRIPE_RING_WHITE):
+            out.append((bx, by, br, kind))
+            continue
+        others = [(ox, oy) for ox, oy in (local if struck else blocking)
+                  if np.hypot(ox - lx, oy - ly) > radius * .6]
+        cx, cy, fit = lx, ly, None
+        for inner, outer in ((.3, 1.7), (.55, 1.35)):
+            points = _band_rim_points(colour, light, cx, cy, radius, inner, outer, others, rough=fit is None)
+            found = (_consensus_circle(points, cx, cy, radius, radii=BAND_RADII, min_points=BAND_MIN_POINTS,
+                                       min_arc=BAND_MIN_ARC) if len(points) >= BAND_MIN_POINTS else None)
+            if found is None or np.hypot(found[0] - lx, found[1] - ly) > radius * .6:
+                break
+            fit = found
+            cx, cy = fit[0], fit[1]
+        if fit is not None and struck:
+            touch = 2 * fit[2]
+            gap_before = abs(np.hypot(bx - ghost[0], by - ghost[1]) - touch)
+            gap_after = abs(np.hypot(fit[0] + offset[0] - ghost[0], fit[1] + offset[1] - ghost[1]) - touch)
+            if gap_before < fit[2] * .25 or gap_after > fit[2] * .1:
+                fit = None
+        if fit is not None:
+            if move:
+                bx, by = int(round(fit[0] + offset[0])), int(round(fit[1] + offset[1]))
+            if confirmed is not None:
+                confirmed.add((bx, by))
+        out.append((bx, by, br, kind))
+    return out
+
+
+_BAND_ANGLES = np.radians(np.arange(0, 360, 3.0))
+
+
+def _band_rim_points(colour: np.ndarray, light: np.ndarray, cx: float, cy: float, radius: float,
+                     inner: float, outer: float, others=(), rough: bool = False) -> np.ndarray:
+    """Rim points of a ball's coloured parts: on each ray from (cx, cy)
+    between ``inner`` and ``outer`` radii whose inside (0.5-0.8 radii) is at
+    least ``BAND_STEP`` above the cloth's level in ``colour`` (the colour
+    difference from the cloth), the outermost place where it falls through
+    halfway to that level, to a fraction of a pixel. Left out: rays where
+    colour runs on beyond it; rays that only cross the band's long edge into
+    a white cap (the cap, ``BAND_CAP`` lighter than the cloth in ``light``,
+    lies just beyond: its rim is shaded darker); rays towards ``others``
+    (balls within 3.2 radii). ``rough``: (cx, cy) may be half a radius
+    off, so a ray's inside is its band colour anywhere from 0.2 radii out
+    to the rim (the 80th percentile there): 0.5-0.8 radii from a centre
+    that far off can be the white number badge, and the far end of the
+    band was never found."""
+    keep = np.ones(len(_BAND_ANGLES), bool)
+    for ox, oy in others:
+        dist = float(np.hypot(ox - cx, oy - cy))
+        if dist < radius * 3.2:
+            half = np.arcsin(min(1.0, radius * 1.15 / max(dist, 1e-6))) + np.radians(8)
+            keep &= np.abs((_BAND_ANGLES - np.arctan2(oy - cy, ox - cx) + np.pi) % (2 * np.pi) - np.pi) > half
+    angles = _BAND_ANGLES[keep]
+    if not len(angles):
+        return np.zeros((0, 2))
+    step = .25
+    steps = np.arange(inner * radius, outer * radius, step)
+    xs = (cx + np.outer(np.cos(angles), steps)).astype(np.float32)
+    ys = (cy + np.outer(np.sin(angles), steps)).astype(np.float32)
+    profiles = cv2.remap(colour, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    lights = cv2.remap(light, xs, ys, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    ball_part = ((steps >= .2 * radius) & (steps <= 1.0 * radius) if rough
+                 else (steps >= .5 * radius) & (steps <= .8 * radius))
+    tail = max(4, len(steps) // 5)
+    ahead = int(radius * .3 / step)
+    points = []
+    for angle, p, lp in zip(angles, profiles, lights):
+        level = float(np.median(p[-tail:]))
+        inside = float(np.percentile(p[ball_part], 80) if rough else np.median(p[ball_part]))
+        if inside - level < BAND_STEP:
+            continue
+        cut = (inside + level) / 2
+        above = p >= cut
+        crossings = np.nonzero(above[:-1] & ~above[1:])[0]
+        if not len(crossings):
+            continue
+        j = int(crossings[-1])
+        beyond = p[j + 4:]
+        if len(beyond) and float(np.mean(beyond > cut)) > .15:
+            continue
+        near = lp[j + 2:j + 2 + ahead]
+        if len(near) and float(near.max()) > float(np.median(lp[-tail:])) + BAND_CAP:
+            continue
+        t = steps[j] + (p[j] - cut) / max(float(p[j] - p[j + 1]), 1e-6) * step
+        points.append((cx + t * np.cos(angle), cy + t * np.sin(angle)))
+    return np.array(points) if points else np.zeros((0, 2))
+
+
+# A ray's inside is a striped ball's band when its colour difference from
+# the cloth is at least BAND_STEP above the cloth's own; a white cap lies
+# beyond a band edge when the lightness there is BAND_CAP above the cloth's.
+BAND_STEP = 15.0
+BAND_CAP = 15.0
+# The band fit: radius within BAND_RADII of the balls', at least
+# BAND_MIN_POINTS rim points agreeing over BAND_MIN_ARC degrees.
+BAND_RADII = (.9, 1.1)
+BAND_MIN_POINTS = 8
+BAND_MIN_ARC = 150.0
+# A ball closer than this many radii to the ghost is the struck one (it
+# touches the ghost: 2 radii).
+BAND_STRUCK = 2.6
+
+
+def _carry_ball_keys(old, new, rim_open: dict, cue_candidates: list, confirmed: set) -> list:
+    """Balls moved (``old`` to ``new``, in the same order): what the stick
+    filter looks up by a ball's position (its rim share, its colour among
+    ``cue_candidates``, a fitted rim in ``confirmed``) goes along, or a
+    stripe under the stick's line was dropped as one of its rings.
+    Returns the updated ``cue_candidates``."""
+    for (ox, oy, _, _), (nx, ny, _, _) in zip(old, new):
+        if (ox, oy) == (nx, ny):
+            continue
+        if (ox, oy) in rim_open:
+            rim_open[(nx, ny)] = rim_open[(ox, oy)]
+        if (ox, oy) in confirmed:
+            confirmed.add((nx, ny))
+        cue_candidates = [(nx, ny, *c[2:]) if (c[0], c[1]) == (ox, oy) else c for c in cue_candidates]
+    return cue_candidates
+
+
 def drop_second_circles(balls, distance: np.ndarray | None, offset: tuple[int, int]) -> list:
     """One circle per object ball: of two closer than ``SECOND_CIRCLE`` radii
     (real balls are at least ~1.75 radii apart, even packed) the one whose
@@ -3602,31 +3794,35 @@ def _circle_through(points: np.ndarray) -> tuple[float, float, float]:
     return float(fx), float(fy), float(np.sqrt(max(1e-9, sol[2] + fx ** 2 + fy ** 2)))
 
 
-def _consensus_circle(points: np.ndarray, cx: float, cy: float, radius: float):
+def _consensus_circle(points: np.ndarray, cx: float, cy: float, radius: float, radii=(.8, 1.05),
+                      min_points: int | None = None, min_arc: float = 90.0):
     """The circle most rim points agree on (within 0.75 px): (x, y, r), or
-    None when too few agree or they cover less than 90 deg of the rim.
-    Circles through three points at a time (a fixed random sequence, so the
-    result is repeatable), radius 0.8-1.05 of the ball's."""
+    None when fewer than ``min_points`` (default ``WHITE_RIM_MIN_POINTS``)
+    agree or they cover less than ``min_arc`` degrees of the rim. Circles
+    through three points at a time (a fixed random sequence, so the result
+    is repeatable), radius ``radii`` (0.8-1.05) of the ball's."""
+    low, high = radii[0] * radius, radii[1] * radius
+    min_points = WHITE_RIM_MIN_POINTS if min_points is None else min_points
     rng = np.random.default_rng(0)
     n = len(points)
     best = best_circle = None
     for _ in range(200):
         fx, fy, fr = _circle_through(points[rng.choice(n, 3, replace=False)])
-        if not (.8 * radius <= fr <= 1.05 * radius) or np.hypot(fx - cx, fy - cy) > .8 * radius:
+        if not (low <= fr <= high) or np.hypot(fx - cx, fy - cy) > .8 * radius:
             continue
         inliers = np.abs(np.hypot(points[:, 0] - fx, points[:, 1] - fy) - fr) < .75
         if best is None or inliers.sum() > best.sum():
             best, best_circle = inliers, (fx, fy, fr)
-    if best is None or best.sum() < WHITE_RIM_MIN_POINTS or best.mean() < .5:
+    if best is None or best.sum() < min_points or best.mean() < .5:
         return None
     chosen = points[best]
     angles = np.sort(np.arctan2(chosen[:, 1] - cy, chosen[:, 0] - cx))
     gaps = np.diff(np.concatenate([angles, [angles[0] + 2 * np.pi]]))
-    if 2 * np.pi - gaps.max() < np.radians(90):
+    if 2 * np.pi - gaps.max() < np.radians(min_arc):
         return None
     fx, fy, fr = _circle_through(chosen)
     # A short arc can make the free fit wander; then keep the consensus circle.
-    if not (.8 * radius <= fr <= 1.05 * radius) or np.hypot(fx - best_circle[0], fy - best_circle[1]) > 1.5:
+    if not (low <= fr <= high) or np.hypot(fx - best_circle[0], fy - best_circle[1]) > 1.5:
         fx, fy, fr = best_circle
     return fx, fy, fr
 
@@ -4460,15 +4656,7 @@ def detect(frame: np.ndarray) -> Detection:
                 cue = (int(round(moved[0] + x)), int(round(moved[1] + y)), *cue[2:])
             if white_cloth is not None:
                 moved_balls = white_cloth_stripe_centres(white_cloth, balls, (x, y), cue[:2], confirmed_balls)
-                # The stick filter looks a ball's colour and rim up by its
-                # position: a moved ball takes them along (without, a stripe
-                # under the stick's line was dropped as a stick ring).
-                for (ox, oy, _, _), (nx, ny, _, _) in zip(balls, moved_balls):
-                    if (ox, oy) != (nx, ny):
-                        if (ox, oy) in rim_open:
-                            rim_open[(nx, ny)] = rim_open[(ox, oy)]
-                        cue_candidates = [(nx, ny, *c[2:]) if (c[0], c[1]) == (ox, oy) else c
-                                          for c in cue_candidates]
+                cue_candidates = _carry_ball_keys(balls, moved_balls, rim_open, cue_candidates, confirmed_balls)
                 balls = moved_balls
             cue_position = cue[:3]
             bx, by, br, _ = balls[cue_index]
@@ -4515,6 +4703,16 @@ def detect(frame: np.ndarray) -> Detection:
             cue_index = min(range(len(balls)), key=lambda i: np.hypot(balls[i][0]-cue[0], balls[i][1]-cue[1]))
             bx, by, br, _ = balls[cue_index]
             balls[cue_index] = (bx, by, br, "cue")
+            # Striped balls on the two arcs where their band meets the cloth
+            # (after the stick filter: a ball under the stick, moved onto
+            # its axis, read as one of its rings).
+            ghost_xy = (ghost_ring[:2] if ghost_ring is not None
+                        else (seen[0] + x, seen[1] + y) if ray_to_ghost else None)
+            moved_balls = stripe_centres(roi, balls, (x, y), cue[:2],
+                                         stick=(cue_position[:2], aim_for_stick) if stick_aim else None,
+                                         confirmed=confirmed_balls, ghost=ghost_xy)
+            cue_candidates = _carry_ball_keys(balls, moved_balls, rim_open, cue_candidates, confirmed_balls)
+            balls = moved_balls
     if len(balls) > 24:
         return Detection(table=table, balls=[], power_slider=slider, power_percent=read_power_slider(frame, slider),
                          note=f"Table found · {len(balls)} circle candidates · too many to track confidently")
@@ -4551,16 +4749,21 @@ def detect(frame: np.ndarray) -> Detection:
         # The aim used for the cue-stick filter above can be wrong (the ghost
         # ring on top of the cue ball hid the ray).
         balls, shot = stick_pass(balls, shot, aim)
-        if shot["ghost"]:
-            # Nothing can occupy the spot where the cue ball will be at impact:
-            # a "ball" centred on the ghost ring is the ring itself (the ray and
-            # deflection line inside it can make it look filled). Drop it and
-            # predict again so it is not masked or used as an obstacle.
+        def drop_ring_ball(balls, shot):
+            """Nothing can occupy the spot where the cue ball will be at
+            impact: a "ball" centred on the ghost ring is the ring itself
+            (the ray and deflection line inside it can make it look filled).
+            Drop it and predict again so it is not masked or used as an
+            obstacle."""
+            if not shot["ghost"]:
+                return balls, shot
             gx, gy, gr = shot["ghost"]
             cleaned = [b for b in balls if b[3] == "cue" or np.hypot(b[0] - gx, b[1] - gy) > gr * .6]
-            if len(cleaned) != len(balls):
-                balls = cleaned
-                shot = predict_shot(roi, table, balls, cue[:3])
+            if len(cleaned) == len(balls):
+                return balls, shot
+            return cleaned, predict_shot(roi, table, cleaned, cue[:3])
+
+        balls, shot = drop_ring_ball(balls, shot)
         ring_on_cue = None
         if balls:
             radius = float(np.median([b[2] for b in balls]))
@@ -4611,6 +4814,9 @@ def detect(frame: np.ndarray) -> Detection:
                 # The aim is read from the real cue ball now (it was read
                 # from the ring before): its stick's rings go along it.
                 balls, shot = stick_pass(balls, shot, None)
+                # (Only now is the ghost found when the "cue ball" was the
+                # ring: a second circle on the ring stayed as a ball.)
+                balls, shot = drop_ring_ball(balls, shot)
         balls = uniform_ball_size(balls)
         cue = (*cue[:2], balls[0][2]) if balls else cue
         return Detection(table=table, balls=balls, cue=cue[:3], aim_segments=shot["aim"],

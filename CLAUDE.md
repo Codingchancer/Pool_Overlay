@@ -41,6 +41,7 @@ It is a **visual practice aid only**. Never add code that clicks, aims, moves th
 - Target = ball touching the ghost; object/cue lines are fitted on the game's own short white lines when visible (`game_line_direction`: first the narrow band through the ball with the most stroke pixels, then its principal axis; long runs along the table border, the cushion's lit edge, are cleared from the line mask by `_clear_border_runs`).
 - White cloth: lines read as thin ridges between their dark outlines (`white_stroke_masks`); cue ball and stripes fitted on the lit-side rim dip (`_WhiteCloth`), away from the shadow direction the balls show. A cue ball circle finding rejected as cloth is taken back (`white_cloth_missed_balls`: lit-side rim, drop shadow, lit face, no ball within 3 radii).
 - Grey cloth: lettering (one darker shade of the cloth) counts as cloth in the ball test, as on light cloths (not on the near-black Lucky Shot cloth). Light tinted cloths (beige, sky, yellow, lime): the cue ball is fitted where the cloth's tint begins on its lit side (`pale_cloth_cue_centre`).
+- Stripes on pale cloths (white, light grey, beige, sky; `PALE_CLOTH_CHROMA`): fitted on the two opposite arcs where the coloured band meets the cloth (`stripe_centres`, after the stick filter; colour difference from the cloth, halfway crossing, consensus circle of the balls' radius with points on both sides). A ball the stick lies across keeps its centre; the struck ball is moved only when its circle is not a diameter from the ghost and the fit is. On other cloths the fit only marks the ball as confirmed for the stick filter.
 - Light grey cloth: where 3% or more of the cloth passes the white test (`LIT_CLOTH_SHARE`), strokes must be 10 brighter than the cloth around them, as on white. The cue ball is fitted on its lit side where its shading meets the cloth's level (`pale_cloth_cue_centre` with `KNEE_RISE`), also with the ring painted out in near shots. Under the ring, a ball as white as a cue ball is the cue ball whatever lines leave it (`CUE_WHITE`); a short-ray "ghost" that fails the strict ring test is dropped when the ring lies on the cue ball (`SHORT_RAY`).
 
 ## Capture feedback (important)
@@ -52,10 +53,10 @@ The guide is visible in screenshots/screen shares (`WDA_NONE`). To stop it feedi
 .venv\Scripts\python -m py_compile main.py detector.py capture.py overlay.py simulator_ui.py pool_physics.py fake_game.py stress_test.py live_check.py
 .venv\Scripts\python stress_test.py --count 300 --quiet
 ```
-Last known results: 258 tests pass (19 skip without the real screenshots); 290/300 synthetic shots pass every check; 2602/2850 on the 19-cloth sweep (5 kinds x 30) and near shots 1641/1900; live check 12/12.
+Last known results: 265 tests pass (19 skip without the real screenshots); 290/300 synthetic shots pass every check; 2604/2850 on the 19-cloth sweep (5 kinds x 30) and near shots 1651/1900; live check 12/12.
 
 ## Known limits
 - Struck ball nearly touching the cue ball: the aim comes from the stick; where no stick shows behind the cue ball (~a quarter, e.g. against a cushion) it comes from the cue ball's centre, only good to ~1 px (whole pixels, rim half hidden), so the aim can be degrees off; white and pale cloths (white, light grey, beige, sky) still fail a quarter to a third of these shots, mostly on the cue ball's position (light grey: the lit arc beside the ring and the struck ball is short, and the fit gives up).
-- White and light grey cloth: a striped ball's white caps blend into the cloth; its centre can be ~0.5 radius off, and on the table's lettering it can be missed.
+- Pale cloths: a stripe against a cushion or packed beside others keeps its circle (up to ~0.5 radius off); ~1 in 100 stripes is never proposed by circle finding (e.g. on the table's lettering) and is missed. Miniclip's real stripes are drawn in 3D (curved bands, outlined): the band fit is checked on synthetic flat bands only.
 - Balls boxed in inside a rack can be off by ~0.5 radius.
 - Not yet verified on a real live AirPlay mirror or at Windows display scaling other than 100%.
