@@ -18,6 +18,17 @@ import shot_recorder as sr
 import sim_game as sg
 
 
+def setUpModule():
+    # These frames were chosen on the old flat look (number up, straight
+    # band); balls turned as in the game are checked in test_turned_balls
+    # and by the sweeps.
+    fg.TURN_BALLS = False
+
+
+def tearDownModule():
+    fg.TURN_BALLS = True
+
+
 class ReleasePowerTests(unittest.TestCase):
     def test_held_then_snapped_back(self):
         history = [(0.0, 10.0), (.1, 30.0), (.2, 55.0), (.3, 55.0), (.4, 55.0), (.45, 0.0)]

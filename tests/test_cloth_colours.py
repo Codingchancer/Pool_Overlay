@@ -21,6 +21,17 @@ import stress_test as st
 SEEDS = range(9000, 9004)
 
 
+def setUpModule():
+    # These frames were chosen on the old flat look (number up, straight
+    # band); balls turned as in the game are checked in test_turned_balls
+    # and by the sweeps.
+    fg.TURN_BALLS = False
+
+
+def tearDownModule():
+    fg.TURN_BALLS = True
+
+
 class ClothColourTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

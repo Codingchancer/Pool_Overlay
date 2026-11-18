@@ -19,6 +19,17 @@ from capture import DEFAULT_STYLE, GuideStyle
 APP = QApplication.instance() or QApplication([])
 
 
+def setUpModule():
+    # These frames were chosen on the old flat look (number up, straight
+    # band); balls turned as in the game are checked in test_turned_balls
+    # and by the sweeps.
+    fg.TURN_BALLS = False
+
+
+def tearDownModule():
+    fg.TURN_BALLS = True
+
+
 def blocked_shot():
     """A synthetic frame whose predicted object path runs into another ball."""
     for kind in (None, "pot"):

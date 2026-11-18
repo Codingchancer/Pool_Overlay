@@ -64,6 +64,14 @@ class Scene:
     letterbox: float = .07
     seed: int = 0
     cloth_hue: int = 98                               # OpenCV hue; Miniclip's default blue
+    # Balls turned as in the real game (``draw_ball``): the number badge is
+    # mostly off-centre, at the rim or round the back, and a stripe is a belt
+    # round the ball. False: the old flat look (number up, straight band).
+    turned: bool = True
+    # How each ball is turned (number, 0 the cue ball -> 3x3 rotation, ball
+    # to camera, row by row); a ball not in it is turned at random, by its
+    # number and position (``ball_turn``).
+    turns: dict[int, tuple[float, ...]] | None = None
 
 
 @dataclass
@@ -363,8 +371,114 @@ def stroke_line(canvas, p0, p1, width, color, alpha=1.0):
     _blend(canvas, (slice(by0, by1), slice(bx0, bx1)), np.clip(width / 2 + .5 - d, 0, 1) * alpha, color)
 
 
-def draw_ball(canvas, cx, cy, r, number, rng):
-    """Shaded ball: solid, striped, 8 ball or cue ball (number 0)."""
+# A turned ball (``draw_ball``): the stripe is the belt within this |cosine|
+# of its axis (0.52 r wide seen side-on, as the flat band); the number badge
+# (one, as on Miniclip's balls) and the cue ball's red dot are caps 0.45 r
+# and 0.13 r across seen face-on.
+TURN_BAND = .52
+TURN_BADGE = .45
+TURN_DOT = .13
+
+
+def random_turn(rng) -> np.ndarray:
+    """A rotation drawn uniformly (from a random unit quaternion)."""
+    q = rng.normal(size=4)
+    w, x, y, z = q / np.linalg.norm(q)
+    return np.array([[1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+                     [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+                     [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)]])
+
+
+def ball_turn(scene: Scene, number: int, x: float, y: float) -> np.ndarray | None:
+    """How ball ``number`` (0: the cue ball) at (x, y) is turned: from
+    ``scene.turns``, else at random by its number and position (a ball that
+    stays put keeps its look), or None when ``scene.turned`` is False."""
+    if not scene.turned:
+        return None
+    if scene.turns and number in scene.turns:
+        return np.asarray(scene.turns[number], np.float64).reshape(3, 3)
+    return random_turn(np.random.default_rng([number, int(round(x * 64)) % 2 ** 31,
+                                              int(round(y * 64)) % 2 ** 31, 7]))
+
+
+def roll(turn: np.ndarray, dx: float, dy: float, r: float) -> np.ndarray:
+    """``turn`` after the ball rolled (dx, dy) px without slipping (camera:
+    x right, y down, z into the table)."""
+    step = float(np.hypot(dx, dy))
+    if step < 1e-9:
+        return turn
+    ax, ay = dy / step, -dx / step
+    a = step / r
+    c, s = np.cos(a), np.sin(a)
+    k = np.array([[0, 0, ay], [0, 0, -ax], [-ay, ax, 0]])
+    return (np.eye(3) + s * k + (1 - c) * k @ k) @ turn
+
+
+def _number_stamp(number: int, r: float):
+    """The number as printed on the badge (text alpha 0..1, centred) and the
+    stamp's centre."""
+    text = str(number)
+    scale = r / 30
+    thickness = max(1, int(round(r / 14)))
+    (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, thickness)
+    half = int(np.ceil(max(r * TURN_BADGE, tw / 2, th / 2))) + 3
+    stamp = np.zeros((2 * half + 1, 2 * half + 1), np.float32)
+    cv2.putText(stamp, text, (int(round(half - tw / 2)), int(round(half + th / 2))),
+                cv2.FONT_HERSHEY_SIMPLEX, scale, 1.0, thickness, cv2.LINE_AA)
+    return stamp, half
+
+
+def _turned_base(dx, dy, d, r, number, turn, colour, white):
+    """Unshaded colours of a turned ball: each pixel's point on the sphere
+    taken back into the ball's own axes (z: the stripe's axis; x: the badge
+    or the cue ball's dot, the number upright along z). Edges antialiased
+    from each feature's gradient across the picture."""
+    k = np.maximum(d, r)
+    nx, ny = dx / k, dy / k
+    nz = -np.sqrt(np.clip(1 - nx * nx - ny * ny, 0, 1))     # facing the camera
+    nzc = np.minimum(nz, -.08)                              # (gradients at the rim)
+
+    def along(axis):
+        g = nx * axis[0] + ny * axis[1] + nz * axis[2]
+        slope = np.hypot(axis[0] - axis[2] * nx / nzc, axis[1] - axis[2] * ny / nzc) / r
+        return g, np.maximum(slope, 1e-6)
+
+    if number == 0:
+        base = np.broadcast_to(white, dx.shape + (3,)).copy()
+        g, slope = along(turn[:, 0])
+        dot = np.clip((g - np.sqrt(1 - TURN_DOT ** 2)) / slope + .5, 0, 1)[..., None]
+        return base * (1 - dot) + np.array([40, 40, 200], np.float32) * dot
+    base = np.broadcast_to(colour, dx.shape + (3,)).copy()
+    if number >= 9:
+        g, slope = along(turn[:, 2])
+        band = np.clip((TURN_BAND - np.abs(g)) / slope + .5, 0, 1)[..., None]
+        base = base * band + white * (1 - band)
+    g, slope = along(turn[:, 0])
+    cap = np.clip((g - np.sqrt(1 - TURN_BADGE ** 2)) / slope + .5, 0, 1)
+    if cap.max() <= 0:
+        return base
+    base = base * (1 - cap[..., None]) + np.array([240, 242, 242], np.float32) * cap[..., None]
+    stamp, half = _number_stamp(number, r)
+    right, down = turn[:, 1], -turn[:, 2]
+    map_x = (half + (nx * right[0] + ny * right[1] + nz * right[2]) * r).astype(np.float32)
+    map_y = (half + (nx * down[0] + ny * down[1] + nz * down[2]) * r).astype(np.float32)
+    ink = cv2.remap(stamp, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    ink = (ink * cap)[..., None]
+    return base * (1 - ink) + np.array([25, 25, 25], np.float32) * ink
+
+
+def draw_ball(canvas, cx, cy, r, number, rng, turn=None):
+    """Shaded ball: solid, striped, 8 ball or cue ball (number 0).
+
+    ``turn`` (3x3 rotation, ball to camera; see ``ball_turn``) turns it as
+    the real game's balls are: the stripe is a belt round the ball (curved,
+    its white caps grow and shrink, end-on a white ball with a coloured
+    ring), the one number badge (on the belt of a stripe) and the cue ball's
+    red dot can face up, sit at the rim, squashed, or be round the back, and
+    the number turns with its badge. None draws it flat: a straight band,
+    the badge near the middle facing up. Shading, highlight and drop shadow
+    stay where the light puts them either way.
+    """
     # Soft drop shadow first.
     got = _patch(canvas, cx + r * .2, cy + r * .25, r * 1.4)
     if got is not None:
@@ -378,6 +492,15 @@ def draw_ball(canvas, cx, cy, r, number, rng):
     dx, dy = xx - cx, yy - cy
     d = np.hypot(dx, dy)
     white = np.array([236, 240, 240], np.float32)
+    if turn is not None:
+        colour = None if number == 0 else _bgr(PALETTE[number if number <= 8 else number - 8])
+        base = _turned_base(dx, dy, d, r, number, turn, colour, white)
+        shade = 1 - .38 * np.clip(d / r, 0, 1) ** 2.5
+        base *= shade[..., None]
+        spot = np.exp(-((dx + r * .35) ** 2 + (dy + r * .38) ** 2) / (2 * (r * .18) ** 2)) * .55
+        base += (255 - base) * spot[..., None]
+        _blend(canvas, region, np.clip(r + .5 - d, 0, 1), base.astype(np.float32))
+        return
     if number == 0:
         base = np.broadcast_to(white, dx.shape + (3,)).copy()
     else:
@@ -569,9 +692,9 @@ def render(scene: Scene) -> tuple[np.ndarray, Truth]:
                 r / 9, darker, max(2, int(r / 3)), cv2.LINE_AA)
     # Balls.
     for number, (bx, by) in scene.balls.items():
-        draw_ball(canvas, bx, by, r, number, rng)
+        draw_ball(canvas, bx, by, r, number, rng, ball_turn(scene, number, bx, by))
     cx, cy = scene.cue
-    draw_ball(canvas, cx, cy, r, 0, rng)
+    draw_ball(canvas, cx, cy, r, 0, rng, ball_turn(scene, 0, cx, cy))
     truth = solve_truth(scene)
     a = np.radians(scene.aim_degrees)
     ux, uy = float(np.cos(a)), float(np.sin(a))
@@ -686,18 +809,25 @@ CLOTH_HSV = {"white": (0, 0, 228), "light grey": (0, 0, 175), "grey": (0, 0, 120
              "dark green": (65, 180, 80), "maroon": (175, 190, 90), "sky": (100, 80, 225)}
 
 
+# Whether random scenes (and ``sim_game``'s games) turn their balls; tests
+# written for the old flat look switch it off for their module.
+TURN_BALLS = True
+
+
 def random_scene(seed: int, kind: str | None = None, cloth: str | int = "blue") -> Scene:
     """Random scene; ``cloth`` is a CLOTH_HUES name, "black" (colourless
     Lucky Shot cloth) or an OpenCV hue. The same seed gives the same layout
-    whatever the cloth colour."""
+    whatever the cloth colour. Its balls are turned unless TURN_BALLS is
+    off."""
+    scene = replace(_random_scene(seed, kind), turned=TURN_BALLS)
     if cloth == "black":
-        return replace(_random_scene(seed, kind), cloth_black=True)
+        return replace(scene, cloth_black=True)
     if isinstance(cloth, tuple):
-        return replace(_random_scene(seed, kind), cloth_hsv=tuple(cloth))
+        return replace(scene, cloth_hsv=tuple(cloth))
     if cloth in CLOTH_HSV:
-        return replace(_random_scene(seed, kind), cloth_hsv=CLOTH_HSV[cloth])
+        return replace(scene, cloth_hsv=CLOTH_HSV[cloth])
     hue = CLOTH_HUES[cloth] if isinstance(cloth, str) else int(cloth)
-    return replace(_random_scene(seed, kind), cloth_hue=hue)
+    return replace(scene, cloth_hue=hue)
 
 
 def _random_scene(seed: int, kind: str | None = None) -> Scene:

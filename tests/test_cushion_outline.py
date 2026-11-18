@@ -19,6 +19,17 @@ from capture import DEFAULT_STYLE, GuideStyle, cushion_contacts
 APP = QApplication.instance() or QApplication([])
 
 
+def setUpModule():
+    # These frames were chosen on the old flat look (number up, straight
+    # band); balls turned as in the game are checked in test_turned_balls
+    # and by the sweeps.
+    fg.TURN_BALLS = False
+
+
+def tearDownModule():
+    fg.TURN_BALLS = True
+
+
 class CushionOutlineTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
