@@ -1,13 +1,15 @@
 """Checks ``shot_recorder`` on whole synthetic games against the exact truth.
 
     python recorder_check.py [--games 3] [--cloth blue] [--fps 60] [--harsh] [--snap 0]
-                             [--max-shots 12] [--workers 4] [--all-cloths]
+                             [--max-shots 12] [--workers 4] [--all-cloths] [--flat]
 
 Each shot is streamed as the mirror would show it (``SimGame.shot_stream``:
 aiming, dragging the slider, the release, the balls rolling, rest) and fed to
 the recorder frame by frame. Every log is compared with what really
 happened: the power set, the start positions, the cue ball's and the struck
 ball's positions frame by frame, where the balls stopped and what was potted.
+The balls are turned and roll as the game's do; ``--flat`` gives the old look
+(number up, straight band).
 """
 from __future__ import annotations
 
@@ -36,8 +38,8 @@ END_TOL = 3.0
 
 
 def check_game(job):
-    seed, cloth, fps, harsh, snap, max_shots, slider_every = job
-    game = sg.SimGame(seed, cloth=cloth, harsh=harsh)
+    seed, cloth, fps, harsh, snap, max_shots, slider_every, flat = job
+    game = sg.SimGame(seed, cloth=cloth, harsh=harsh, turned=not flat)
     rec = ShotRecorder(None)
     truth_at = {}
     results = []
@@ -208,15 +210,16 @@ def main(argv=None):
     ap.add_argument("--max-shots", type=int, default=12)
     ap.add_argument("--no-slider-every", type=int, default=0, help="hide the slider on every n-th shot")
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--flat", action="store_true", help="balls not turned (number up, straight band)")
     args = ap.parse_args(argv)
     cloths = list(fg.CLOTH_HUES) + list(fg.CLOTH_HSV) if args.all_cloths else [args.cloth]
     total = [0, 0]
     for cloth in cloths:
-        jobs = [(s, cloth, args.fps, args.harsh, args.snap, args.max_shots, args.no_slider_every)
+        jobs = [(s, cloth, args.fps, args.harsh, args.snap, args.max_shots, args.no_slider_every, args.flat)
                 for s in range(args.start, args.start + args.games)]
         with Pool(min(args.workers, len(jobs))) as pool:
             games = pool.map(check_game, jobs)
-        ok, n = summarize(games, f"{cloth}{' harsh' if args.harsh else ''} {args.fps:.0f} fps")
+        ok, n = summarize(games, f"{cloth}{' harsh' if args.harsh else ''}{' flat' if args.flat else ''} {args.fps:.0f} fps")
         total[0] += ok
         total[1] += n
     if len(cloths) > 1:
