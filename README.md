@@ -109,14 +109,14 @@ Each shot gets a JSON log and two PNGs (the release and the rest frame) in `outp
 
 The opponent's shots are logged with power `null`. Moving the cue ball by hand (ball in hand) is not logged. Spin is not read.
 
-`python recorder_check.py --all-cloths` checks the recorder on whole synthetic games against the exact truth. The test: 18 cloths, 30 fps, the slider snapping back over two frames, and every 5th shot without a slider.
-- **Every check:** 227 of 288 shots were logged right.
-- **What the power fit uses:** 256 were right in the power at release (within 0.4%), the cue ball's and the struck ball's tracks, and where they stopped or went in. On most cloths the cue ball's movement is within 1 px.
-- **The struck ball touching the cue ball:** 19 shots. The detector misses that ball, so the log says the struck ball is unknown rather than guessing.
+`python recorder_check.py --all-cloths --fps 30 --snap 2 --no-slider-every 5` checks the recorder on whole synthetic games against the exact truth: 18 cloths, 3 games each, 30 fps, the slider snapping back over two frames, every 5th shot without a slider. The balls turn as they roll, as the game's do (`--flat` gives the old look: number up, straight band).
+- **Every check:** 389 of 648 shots were logged right (521 with the old flat look).
+- **What the power fit uses:** 490 were right in the power at release (within 1.5%), the cue ball's and the struck ball's tracks, and where they stopped or went in (582 flat). The struck ball is followed as a disc on the cloth, not by its picture, since its number and stripe turn as it rolls.
+- **The struck ball touching the cue ball:** 43 shots. The detector misses that ball, so the log says the struck ball is unknown rather than guessing.
 - **The rest:**
-  - the cue ball's position on white, sky and beige cloth, 3–5 px off;
-  - end spots of balls close to the cloth's colour;
-  - a few balls not followed by the recorder, matched by colour to the wrong ball afterwards.
+  - the struck ball's movement 1.5–3 px off its true movement, mostly on white and pale cloths and against cushions or pocket jaws;
+  - end spots of balls the recorder does not follow, from the detector, more than 3 px off;
+  - on the break, a solid and a stripe of one colour swapped in the potted list (in the packed rack a stripe can show mostly white).
 
 ## Tests
 

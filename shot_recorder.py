@@ -120,8 +120,23 @@ RING_DEAD = .6
 SHADOW_RATIO = (.4, .97)
 SHADOW_SPREAD = .12
 SHADOW_OUT = 1.08
-# The rim fit is taken when it is at most this far (px) from the disc.
+# A ball the detection missed after the shot stands out from the cloth picture
+# at least this much (disc response; balls at rest show ~.8-1).
+MISSING_MIN = .45
+# The rim fit is taken when it is at most this far (px) from the disc; within
+# RIM_CUSHION radii of the table's edge (the cushion's lit edge can take the
+# fit there), at most RIM_AGREE px. (Elsewhere the disc is the one off: a
+# ball beside it in the disc's ring pushes it away by pixels.)
 RIM_AGREE = 1.0
+RIM_TRUST = .25
+RIM_CUSHION = 1.6
+# The struck ball's start is taken from up to this many frames after the shot
+# began, while its found spot stays within HOME_STILL px of the first.
+EARLY_FRAMES = 8
+HOME_STILL = .6
+# With one such frame, its find is taken within HOME_ONE px of the detector's
+# spot (whole pixels at times, up to ~1.5 px off).
+HOME_ONE = 2.0
 # Painting the still frame's balls out: a ball's disc this many radii wide
 # (its shadow too).
 PAINT_BALL = 1.6
@@ -362,19 +377,28 @@ class BallFollower:
             self.scores.append(found[2])
 
 
+def stick_band(detection: Detection, r: float) -> list:
+    """The stick behind the cue ball while aiming, as a ``game_graphics``
+    band (none without an aim)."""
+    if detection.cue is None or detection.aim_dir is None:
+        return []
+    cx, cy = float(detection.cue[0]), float(detection.cue[1])
+    ax, ay = detection.aim_dir
+    return [("line", (cx, cy), (cx - ax * 40 * r, cy - ay * 40 * r), 1.4 * r)]
+
+
 def game_graphics(detection: Detection, r: float) -> list:
     """Where the game draws over the cloth while aiming, as bands to paint
     out: ("line", start, end, width) and ("ring", centre, radius, width).
     The aim ray from the cue ball to the ghost ball, the ghost ring, the
     short object line from the struck ball and cue line from the ghost, and
     the stick behind the cue ball."""
-    out = []
-    cue, ghost = detection.cue, detection.ghost
-    if cue is None or detection.aim_dir is None:
+    out = stick_band(detection, r)
+    if not out:
         return out
+    cue, ghost = detection.cue, detection.ghost
     cx, cy = float(cue[0]), float(cue[1])
     ax, ay = detection.aim_dir
-    out.append(("line", (cx, cy), (cx - ax * 40 * r, cy - ay * 40 * r), 1.4 * r))
     if ghost is not None:
         gx, gy = float(ghost[0]), float(ghost[1])
         out.append(("line", (cx, cy), (gx, gy), .8 * r))
@@ -422,7 +446,10 @@ def cloth_picture(frame: np.ndarray, table, balls, r: float, graphics=()) -> np.
     mask[:2], mask[-2:], mask[:, :2], mask[:, -2:] = 0, 0, 0, 0
     # Filled with the cloth around, smoothly (a blur of the cloth that is
     # left, normalised): inpainting drags the cloth's grain in as streaks.
+    # Not from the strip along the border either (the cushion's edge, the
+    # pocket mouths): a ball against a cushion would be filled darker.
     keep = (1 - mask).astype(np.float32)
+    keep[:edge], keep[-edge:], keep[:, :edge], keep[:, -edge:] = 0, 0, 0, 0
     sigma = max(2.0, r)
     num = cv2.GaussianBlur(roi.astype(np.float32) * keep[..., None], (0, 0), sigma)
     den = cv2.GaussianBlur(keep, (0, 0), sigma)[..., None]
@@ -478,6 +505,53 @@ def _disc_response(unlike: np.ndarray, weight: np.ndarray, inside: np.ndarray, r
     return np.where(ok, a / np.maximum(b, 1e-6) - c / np.maximum(d, 1e-6), -1.0).astype(np.float32)
 
 
+def find_missing_ball(frame: np.ndarray, cloth: np.ndarray, table, r: float, signature: dict, taken) -> dict | None:
+    """A ball the detection missed (a stripe against a cushion, say), of the
+    colours ``signature`` gives: the disc on the table that differs from the
+    cloth picture (``cloth``) more than the ring around it, at least
+    MISSING_MIN, of its colour (within COLOUR_TOL) and not the other kind
+    (solid or stripe), away from the balls found (``taken``: centres). Its
+    signature with x, y, or None."""
+    x, y, w, h = (int(round(v)) for v in table)
+    fh, fw = frame.shape[:2]
+    inside, ring, half = _disc_kernels(r)
+    # The ring reaches past the table's edge for a ball against a cushion
+    # (outside the table the cloth picture is the frame itself).
+    x0, y0, x1, y1 = max(0, x - half), max(0, y - half), min(fw, x + w + half), min(fh, y + h + half)
+    if x1 - x0 < 4 * half or y1 - y0 < 4 * half:
+        return None
+    unlike, shadow, _ = _cloth_maps(frame[y0:y1, x0:x1], cloth[y0:y1, x0:x1])
+    weight = np.ones(unlike.shape, np.float32)
+    for tx, ty in taken:
+        cv2.circle(weight, (int(round(tx - x0)), int(round(ty - y0))), int(np.ceil(OTHER_LEAVE_OUT * r)), 0.0, -1)
+    resp = _disc_response(np.where(shadow, 0, unlike), weight, inside, ring)
+    peaks = (resp >= cv2.dilate(resp, np.ones((3, 3), np.uint8))) & (resp > MISSING_MIN)
+    ys, xs = np.nonzero(peaks)
+    best = None
+    kept = []
+    for i in np.argsort(-resp[ys, xs]):
+        if len(kept) == 8:
+            break
+        if not all(np.hypot(xs[i] - xs[j], ys[i] - ys[j]) > r for j in kept):
+            continue
+        kept.append(i)
+        cx, cy = x0 + float(xs[i]) + half, y0 + float(ys[i]) + half
+        if not (x < cx < x + w and y < cy < y + h):
+            continue
+        if any(np.hypot(cx - tx, cy - ty) < 1.5 * r for tx, ty in taken):
+            continue
+        cx, cy = refine_ball_centre(frame, cx, cy, r)
+        sig = ball_signature(frame, cx, cy, r)
+        colour = float(np.linalg.norm(np.subtract(sig["lab"], signature["lab"])))
+        if colour > COLOUR_TOL:
+            continue
+        if sig.get("stripe") is not None and signature.get("stripe") is not None and sig["stripe"] != signature["stripe"]:
+            continue
+        if best is None or colour < best[0]:
+            best = (colour, {"x": round(cx, 2), "y": round(cy, 2), **sig})
+    return None if best is None else best[1]
+
+
 class RollingFollower(BallFollower):
     """Follows a coloured ball as it rolls, whatever its number and stripe
     (which turn with it) show: it is a disc that differs from the cloth
@@ -508,6 +582,7 @@ class RollingFollower(BallFollower):
         self.strength: float | None = None   # how much it stood out at rest (``calibrate``)
         self.last_strength = 0.0
         self.others: list[tuple[float, float]] = []
+        self.table = None   # (x, y, w, h) of the cloth, for the rim fit's trust
         self.template = None
 
     @property
@@ -605,10 +680,18 @@ class RollingFollower(BallFollower):
             return None
         _, x, y, score, self.last_strength = best
         # The disc's centre moves a little with the stream's block noise
-        # around the ball; its rim does not. (Against a cushion the rim fit
-        # can take the cushion's lit edge: then the disc.)
+        # around the ball and with a ball beside it; its rim does not.
+        # (Against a cushion the rim fit can take the cushion's lit edge:
+        # there only a small correction is taken.)
         rx, ry = refine_ball_centre(frame, x, y, self.r)
-        if np.hypot(rx - x, ry - y) <= RIM_AGREE:
+        trust = RIM_TRUST * self.r
+        if self.table is not None:
+            tx, ty, tw, th = self.table
+            if min(x - tx, tx + tw - x, y - ty, ty + th - y) < RIM_CUSHION * self.r:
+                trust = RIM_AGREE
+        else:
+            trust = RIM_AGREE
+        if np.hypot(rx - x, ry - y) <= trust:
             x, y = rx, ry
         return x, y, score
 
@@ -634,19 +717,21 @@ RIM_CONTRAST = 6.0
 RIM_OUTER = .4
 
 
-def refine_ball_centre(frame: np.ndarray, x: float, y: float, r: float, angles: int = 72):
+def refine_ball_centre(frame: np.ndarray, x: float, y: float, r: float, angles: int = 72, spread: bool = False):
     """Sub-pixel ball centre fitted on its rim: on rays from (x, y) between
     0.8 and 1.2 radii, the strongest colour edge on each, or the outermost
     strong one (``RIM_OUTER``: a stripe's band or a number badge at the rim
     makes an edge just inside it), whichever lies better on a circle; each
     a circle fit that drops the worst quarter of the edge points three times
-    (the drop shadow, a touching ball)."""
+    (the drop shadow, a touching ball). With ``spread``: (x, y, spread of
+    the edge points kept about the circle, px; inf if not fitted)."""
     h, w = frame.shape[:2]
+    fail = (x, y, float("inf")) if spread else (x, y)
     reach = int(np.ceil(r * 1.4)) + 2
     x0, y0 = max(0, int(x) - reach), max(0, int(y) - reach)
     x1, y1 = min(w, int(x) + reach + 1), min(h, int(y) + reach + 1)
     if x1 - x0 < 2 * reach or y1 - y0 < 2 * reach:
-        return x, y
+        return fail
     lab = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2LAB).astype(np.float32)
     a = np.linspace(0, 2 * np.pi, angles, endpoint=False)
     step = .25
@@ -660,7 +745,7 @@ def refine_ball_centre(frame: np.ndarray, x: float, y: float, r: float, angles: 
     g, m = grad[:, inside], mids[inside]
     peak = g.max(axis=1, keepdims=True)
     if float(np.median(peak)) < RIM_CONTRAST:
-        return x, y
+        return fail
     left = np.concatenate([np.full((angles, 1), -np.inf), g[:, :-1]], axis=1)
     right = np.concatenate([g[:, 1:], np.full((angles, 1), -np.inf)], axis=1)
     edges = (g >= RIM_OUTER * peak) & (g >= left) & (g >= right)
@@ -669,9 +754,9 @@ def refine_ball_centre(frame: np.ndarray, x: float, y: float, r: float, angles: 
     fits = [_rim_circle(g, m, a, x, y, step, k) for k in (strongest, np.where(edges.any(axis=1), outermost, strongest))]
     fits = [f for f in fits if f is not None and np.hypot(f[0] - x, f[1] - y) <= .5 * r]
     if not fits:
-        return x, y
-    cx, cy, _ = min(fits, key=lambda f: f[2])
-    return float(cx), float(cy)
+        return fail
+    cx, cy, sp = min(fits, key=lambda f: f[2])
+    return (float(cx), float(cy), float(sp)) if spread else (float(cx), float(cy))
 
 
 def _rim_circle(g, m, a, x, y, step, k):
@@ -786,8 +871,26 @@ def ball_signature(frame: np.ndarray, x: float, y: float, r: float, packed: bool
 def _colour_sure(signature: dict) -> bool:
     """Whether a ball's colour was read from enough of it: not mostly white
     (a stripe turned end-on shows its colour only as a thin ring, in a rack
-    mixed with its neighbours')."""
-    return signature["white"] <= SURE_WHITE
+    mixed with its neighbours'), nor under the stick lying across it in the
+    still frame (the game's thin lines hardly change its colour)."""
+    return signature["white"] <= SURE_WHITE and not signature.get("covered")
+
+
+def under_graphics(x: float, y: float, r: float, graphics) -> bool:
+    """Whether a band of ``game_graphics`` crosses the coloured part of the
+    ball at (x, y)."""
+    for kind, a, b, width in graphics:
+        if kind == "line":
+            ax, ay = a
+            dx, dy = b[0] - ax, b[1] - ay
+            n = dx * dx + dy * dy
+            t = 0.0 if n < 1e-9 else min(1.0, max(0.0, ((x - ax) * dx + (y - ay) * dy) / n))
+            gap = float(np.hypot(x - ax - t * dx, y - ay - t * dy))
+        else:
+            gap = abs(float(np.hypot(x - a[0], y - a[1])) - b)
+        if gap < width / 2 + .8 * r:
+            return True
+    return False
 
 
 def rim_coloured(frame: np.ndarray, x: float, y: float, r: float) -> float:
@@ -840,17 +943,19 @@ def distinct_balls(balls):
     return kept
 
 
-def _balls_with_signatures(frame, detection: Detection, cue_xy=None):
+def _balls_with_signatures(frame, detection: Detection, cue_xy=None, graphics=()):
     """Every ball but the cue ball at ``cue_xy`` (None: the cue ball is not on
     the table, so none is left out, whatever the detection named the cue
-    ball), with its colour signature."""
+    ball), with its colour signature; ``covered`` where a band of
+    ``graphics`` (the stick) lies over it."""
     out = []
     balls = distinct_balls(detection.balls)
     for bx, by, br, kind in balls:
         if cue_xy is not None and np.hypot(bx - cue_xy[0], by - cue_xy[1]) < br * .6:
             continue
         packed = any(0 < np.hypot(bx - ox, by - oy) < PACKED * br for ox, oy, _, _ in balls)
-        out.append({"x": round(float(bx), 2), "y": round(float(by), 2), **ball_signature(frame, bx, by, br, packed)})
+        out.append({"x": round(float(bx), 2), "y": round(float(by), 2), **ball_signature(frame, bx, by, br, packed),
+                    "covered": under_graphics(bx, by, br, graphics)})
     return out
 
 
@@ -1160,6 +1265,9 @@ class ShotRecorder:
         # leave its spot), then followed.
         self.object_follower = None
         self.struck = None
+        # Frames since the shot began, before the struck ball left its spot
+        # (the guide is gone from them), with the cue ball's spot in each.
+        self.early = []
         # The fastest the cue ball has moved this shot (px/s): no ball it
         # hits can go faster.
         self.cue_top_speed = 0.0
@@ -1226,6 +1334,7 @@ class ShotRecorder:
         lines = self._lines_at(bx, by, r)
         if self.cloth is not None:
             follower = RollingFollower(self.rest_frame, bx, by, r, self.cloth, exclude=lines)
+            follower.table = self.rest.table
             follower.others = [(ox, oy) for ox, oy, _, _ in self.rest.balls if np.hypot(ox - bx, oy - by) > r * .5]
             follower.calibrate(self.rest_frame, bx, by, ghost=self.still_ghost)
             if follower.usable:
@@ -1233,6 +1342,31 @@ class ShotRecorder:
         follower = BallFollower(self.rest_frame, bx, by, r, exclude=lines)
         follower.calibrate(self.rest_frame, bx, by)
         return follower
+
+    def _struck_home(self, follower: BallFollower, bx: float, by: float) -> tuple[float, float]:
+        """Where the struck ball sat before it left, found as its follower
+        finds it, so that movement along its track is measured one way
+        throughout: in the frames since the shot began while it had not yet
+        moved (the game's guide over it in the still frame is gone from them;
+        with one such frame, near the detector's spot). Else the detector's
+        spot."""
+        if not isinstance(follower, RollingFollower):
+            return bx, by
+        r = self.shot["radius"]
+        rest_balls = [(ox, oy) for ox, oy, _, _ in self.rest.balls if np.hypot(ox - bx, oy - by) > r * .5]
+        saved, found = follower.others, []
+        for frame, cue in self.early:
+            follower.others = rest_balls + ([cue] if cue is not None else [])
+            got = follower.locate(frame, 0.0, reach=2, centre=(bx, by))
+            if got is None or got[2] > 1.0 or (
+                    found and np.hypot(got[0] - found[0][0], got[1] - found[0][1]) > HOME_STILL):
+                break
+            found.append(got[:2])
+        follower.others = saved
+        if len(found) >= 2 or (found and np.hypot(found[0][0] - bx, found[0][1] - by) <= HOME_ONE):
+            hx, hy = np.mean(found, axis=0)
+            return float(hx), float(hy)
+        return bx, by
 
     def _others_near(self, frame: np.ndarray, follower: BallFollower) -> list[tuple[float, float]]:
         """Balls next to the followed one now, to leave out of its ring: the
@@ -1290,7 +1424,8 @@ class ShotRecorder:
                         follower.others = self._others_near(frame, follower)
                     follower.start(self.prev_t)
                     self.object_follower = follower
-                    shot["object_track"].append([round(self.prev_t - shot["t_start"], 4), round(bx, 2), round(by, 2)])
+                    hx, hy = self._struck_home(follower, bx, by)
+                    shot["object_track"].append([round(self.prev_t - shot["t_start"], 4), round(hx, 2), round(hy, 2)])
                     # It leaves roughly along the line from the cue ball.
                     cx, cy = self.cue_follower.pos if self.cue_follower is not None else shot["cue"][:2]
                     n = float(np.hypot(bx - cx, by - cy))
@@ -1300,6 +1435,9 @@ class ShotRecorder:
                                                max_speed=self.cue_top_speed)
                     if found_at is not None:
                         shot["object_track"].append([rel, round(found_at[0], 2), round(found_at[1], 2)])
+        if self.struck is None and len(self.early) < EARLY_FRAMES:
+            cue = self.cue_follower
+            self.early.append((frame, None if cue is None or cue.lost else cue.pos))
         self.prev_t = t
         thumb = self._table_thumb(frame)
         if self.last_thumb is not None and not screen_changed(thumb, self.last_thumb):
@@ -1332,7 +1470,7 @@ class ShotRecorder:
             cue_after = [round(follow.pos[0], 2), round(follow.pos[1], 2)]
         elif after.cue is not None and not cue_potted:
             cue_after = [round(float(after.cue[0]), 2), round(float(after.cue[1]), 2)]
-        before_balls = _balls_with_signatures(shot["rest_frame"], rest, cue[:2])
+        before_balls = _balls_with_signatures(shot["rest_frame"], rest, cue[:2], stick_band(rest, r))
         after_balls = _balls_with_signatures(frame, after, cue_after) if after.balls else []
         object_index = None
         if self.struck is not None:
@@ -1360,6 +1498,20 @@ class ShotRecorder:
                 level = self._change_level(shot["rest_frame"], b["x"], b["y"], r)
                 if not self._spot_changed(shot["rest_frame"], frame, b["x"], b["y"], r, level):
                     after_balls.append({k: v for k, v in b.items() if k != "after"})
+                    matched[i] = len(after_balls) - 1
+        # A ball that moved and was not found afterwards (the detection can
+        # miss one, e.g. a stripe against a cushion) is looked for on the
+        # cloth by its colours before it counts as potted. (Not the struck
+        # ball if it was followed into a pocket.)
+        potted_object = object_index if objf is not None and objf.lost and near_pocket(*objf.pos, rest.table, r) else None
+        if self.cloth is not None:
+            for i, b in enumerate(before_balls):
+                if matched[i] is not None or i == potted_object:
+                    continue
+                taken = [(a["x"], a["y"]) for a in after_balls] + ([tuple(cue_after)] if cue_after is not None else [])
+                found = find_missing_ball(frame, self.cloth, rest.table, r, b, taken)
+                if found is not None:
+                    after_balls.append(found)
                     matched[i] = len(after_balls) - 1
         for b, m in zip(before_balls, matched):
             b["after"] = m
