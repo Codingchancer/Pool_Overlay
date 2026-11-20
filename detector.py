@@ -2362,6 +2362,60 @@ def _three_corner_fit(blobs, dark: np.ndarray):
     return best
 
 
+def _short_side_fit(blobs, holes):
+    """(error, tl, tr, bl, br) from the two corners of one short side and the
+    two middle pockets, the far corners mirrored about the middle pockets.
+
+    The game lights pockets up (red rings round a small dark core, e.g. when
+    a pocket is to be called): with both corners of one short side lit, only
+    two corner pockets are dark blobs and neither the four- nor the three-
+    corner fit holds. The middle pockets, which the cushion cuts into wide
+    shapes the corner filter drops, are taken from ``holes`` (x, y, width,
+    area of every dark blob near cloth). They sit halfway along the long
+    sides, a little outside the corner rows.
+    """
+    best = None
+    for a in blobs:
+        for c in blobs:
+            dy = c[1] - a[1]
+            if dy < 100 or abs(c[0] - a[0]) > dy * .06:
+                continue
+            if max(a[3], c[3]) > 2 * min(a[3], c[3]):
+                continue
+            for top in holes:
+                if top is a or top is c:
+                    continue
+                half = top[0] - (a[0] + c[0]) / 2
+                span = 2 * abs(half)
+                if span < 200 or not (.44 <= dy / span <= .58):
+                    continue
+                if not (.035 * span <= (a[2] + c[2]) / 2 <= .1 * span):
+                    continue
+                # A little outside the corner row (middle pockets sit further
+                # out: real .013 of the span, synthetic .009), never inside, and
+                # smaller than the corners (real: 1490 against 2540-2830 px):
+                # two corners are not taken for middle pockets.
+                if not (.003 * span <= a[1] - top[1] <= .04 * span):
+                    continue
+                if not (.025 * span <= top[2] <= .1 * span) or top[3] > 1.2 * min(a[3], c[3]):
+                    continue
+                for bottom in holes:
+                    if bottom is top or bottom is a or bottom is c:
+                        continue
+                    if abs(bottom[0] - top[0]) > .02 * span or not (.003 * span <= bottom[1] - c[1] <= .04 * span):
+                        continue
+                    if max(top[3], bottom[3]) > 2 * min(top[3], bottom[3]) or bottom[3] > 1.2 * min(a[3], c[3]):
+                        continue
+                    mid_x = (top[0] + bottom[0]) / 2
+                    b = (2 * mid_x - a[0], a[1], a[2], a[3])
+                    d = (2 * mid_x - c[0], c[1], c[2], c[3])
+                    error = (abs(c[0] - a[0]) + abs(bottom[0] - top[0]) + abs(dy / span - .51) * span * .2
+                             + span * .02)  # worse than any three-corner fit
+                    if best is None or error < best[0]:
+                        best = (error, a, b, c, d) if half > 0 else (error, b, a, d, c)
+    return best
+
+
 def table_from_pockets(frame: np.ndarray) -> tuple[int, int, int, int] | None:
     """Fit the playing area from the four dark corner pockets.
 
@@ -2389,10 +2443,12 @@ def table_from_pockets(frame: np.ndarray) -> tuple[int, int, int, int] | None:
     felt_like = felt_like.astype(np.uint8)
     count, labels, stats, centres = cv2.connectedComponentsWithStats(dark, connectivity=8)
     blobs = []
+    # Every dark blob near the cloth, wide ones too: middle pockets, which the
+    # cushion cuts into shapes the corner test below drops.
+    holes = []
     for i in range(1, count):
         x, y, bw, bh, area = stats[i]
-        # Pocket mouths are drop-shadowed discs; their blob fills ~50% of its box.
-        if area < 150 or not (.7 <= bw / max(1, bh) <= 1.43) or area < .4 * bw * bh:
+        if area < 150 or area < .4 * bw * bh or not (.5 <= bw / max(1, bh) <= 2.5):
             continue
         # A pocket opens onto the felt-coloured cushions. Requiring that keeps
         # dark wallpaper, letterbox bars and icons out of the candidates on a
@@ -2400,6 +2456,10 @@ def table_from_pockets(frame: np.ndarray) -> tuple[int, int, int, int] | None:
         pad = int(bw * .6)
         around = felt_like[max(0, y - pad):y + bh + pad, max(0, x - pad):x + bw + pad]
         if around.size == 0 or float(np.count_nonzero(around)) / around.size < .08:
+            continue
+        holes.append((float(centres[i][0]), float(centres[i][1]), float(bw), float(area)))
+        # Pocket mouths are drop-shadowed discs; their blob fills ~50% of its box.
+        if not (.7 <= bw / max(1, bh) <= 1.43):
             continue
         # Centre on the hole's darkest core: a darker display (lower
         # brightness, higher gamma) pulls the pocket's shaded rim under the
@@ -2447,6 +2507,8 @@ def table_from_pockets(frame: np.ndarray) -> tuple[int, int, int, int] | None:
         # pocket confirms the row that has both corners.
         best = _three_corner_fit(blobs, dark)
     if best is None:
+        best = _short_side_fit(blobs, sorted(holes, key=lambda b: -b[3])[:40])
+    if best is None:
         return None
     _, a, b, c, d = best
     span = ((b[0] - a[0]) + (d[0] - c[0])) / 2
@@ -2463,6 +2525,44 @@ def table_from_pockets(frame: np.ndarray) -> tuple[int, int, int, int] | None:
     return int(round(x0)), int(round(y0)), int(round(x1 - x0)), int(round(y1 - y0))
 
 
+# How far beyond a brightness drop (share of the table's width, at least 6
+# samples) the levels are compared to tell a cushion step from a bright line
+# on the cloth: wider than the stick (~half a ball radius), narrower than the
+# cushion (~2%). And how much brighter than the cloth the cushion must be: a
+# navy cushion is only 8-10 above its cloth, a line on the cloth 1 or less.
+EDGE_SIDE_SHARE = .012
+EDGE_STEP_MIN = 5.0
+
+
+def _edge_is_step(profile: np.ndarray, first: int, last: int, side: int = 6) -> bool:
+    """Is the drop over ``profile[first..last + 1]`` a step down from cushion to cloth?
+
+    Every real cushion nose is one: the cushion outside is far brighter than
+    the cloth inside (real frames: 100-120 against 50-65, Lucky Shot 60-80
+    against 6-10), even where a lit edge peaks on the nose. A thin bright
+    line lying on the cloth (the guide's own table border when a capture
+    still shows it, the game's aim line along a cushion, the stick and the
+    cue ball against a cushion, which fill most rows of their columns) drops
+    just as sharply, but back to the level it rose from: the cloth on both
+    sides. Taking that line as the nose made the table up to 40 px too small,
+    and the border, drawn there, then held it there. ``side``: how many
+    samples beyond the drop are looked at.
+    """
+    if first == 0 or last + 1 >= len(profile):
+        return True  # nothing to compare with: keep the drop
+    # The darkest level outside (cloth showing anywhere there: no cushion);
+    # inside, the level right after the drop (the cloth brightens quickly
+    # away from a cushion's shadow), the median of three samples so that a
+    # white line's 1 px dark outline is not taken for the cloth. Right after
+    # a real nose nothing is brighter than the drop's top.
+    near = profile[last + 1:last + 4]
+    if float(near.max()) > float(profile[first]):
+        return False  # a dark outline in front of something brighter (a white line)
+    outer = float(profile[max(0, first - side):first + 1].min())
+    inner = float(np.median(near))
+    return outer - inner >= EDGE_STEP_MIN
+
+
 def refine_table_edges(frame: np.ndarray, table: tuple[int, int, int, int]) -> tuple[int, int, int, int]:
     """Snap each side of a rough table fit onto the actual cushion nose.
 
@@ -2476,6 +2576,7 @@ def refine_table_edges(frame: np.ndarray, table: tuple[int, int, int, int]) -> t
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
     fh, fw = gray.shape
     reach = max(6, int(round(w * .03)))
+    side = max(6, int(round(w * EDGE_SIDE_SHARE)))
 
     def edge(profile_values: np.ndarray, start: int) -> float | None:
         # ``profile_values`` runs from outside (cushion) to inside (cloth).
@@ -2486,7 +2587,21 @@ def refine_table_edges(frame: np.ndarray, table: tuple[int, int, int, int]) -> t
         # The nose is the innermost strong drop: a chrome rail outside a
         # dark cushion bevel (black Lucky Shot table) drops first, and more.
         # (On a dark cloth the nose step can be small: navy cushion 32 -> cloth 21.)
-        strong = np.nonzero(drops >= max(8.0, drops[i] * .5))[0]
+        # Only a step down from cushion to cloth can be the nose, not a bright
+        # line on the cloth (``_edge_is_step``); each run of neighbouring
+        # drops is one edge. Strong is then measured among the steps: the
+        # game's white aim line along a cushion drops twice as far as the nose.
+        candidates = np.nonzero(drops >= 8.0)[0]
+        runs = np.split(candidates, np.nonzero(np.diff(candidates) > 1)[0] + 1)
+        steps = [run for run in runs if _edge_is_step(profile_values, int(run[0]), int(run[-1]), side)]
+        if steps:
+            in_steps = np.concatenate(steps)
+            peak = float(drops[in_steps].max())
+            if peak < 15:
+                return None
+            strong = in_steps[drops[in_steps] >= max(8.0, peak * .5)]
+        else:
+            strong = np.nonzero(drops >= max(8.0, drops[i] * .5))[0]
         last = int(strong[-1])
         # Step to that drop's own peak (the edge can span two samples).
         while last + 1 < len(drops) and drops[last + 1] > drops[last]:
