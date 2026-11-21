@@ -8,9 +8,9 @@ Each person only edits the files they own. That way both of you can work at the 
 
 | Owner | Area | Files |
 |---|---|---|
-| **Jartartarta** (+ his Claude, run on his Windows PC next to the real game) | **detector / precision**: everything that reads the game image | `detector.py`, `fake_game.py`, `stress_test.py`, `tests/test_synthetic_table.py` |
+| **Jartartarta** (+ his Claude, run on his Windows PC next to the real game) | **detector / precision**: everything that reads the game image | `detector.py`, `ball_net.py`, `train_ball_net.py`, `models/balls.onnx`, `fake_game.py`, `stress_test.py`, `tests/test_synthetic_table.py`, `tests/test_ball_net.py` |
 | **Codingchancer** (+ his Claude) | **overlay + simulator**: everything that draws, captures, or simulates | `capture.py`, `overlay.py`, `simulator_ui.py`, `pool_physics.py`, `pool_rules.py`, `live_check.py`, `tracking.py`, `window_capture.py`, `analysis_process.py`, `tests/test_realtime.py`, `tests/test_window_capture.py`, `tests/test_analysis_process.py`, `tests/test_pool_physics.py`, `tests/test_pool_rules.py`, `tests/test_guide_settings.py`, `tests/test_steady_guide.py` |
-| shared (tell the other first) | **repo** | `main.py`, `README.md`, `CLAUDE.md`, `TASKS.md`, `setup.bat`, `run.bat`, `requirements.txt`, the other test files |
+| shared (tell the other first) | **repo** | `main.py`, `README.md`, `CLAUDE.md`, `TASKS.md`, `setup.bat`, `run.bat`, `requirements.txt`, `requirements-train.txt`, the other test files |
 
 Border rules:
 - The `Detection` class in `detector.py` is what the overlay draws. Adding a field is fine; renaming or removing one breaks the overlay, so tell the other person first.

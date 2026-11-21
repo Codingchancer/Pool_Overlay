@@ -3,6 +3,7 @@
 Pure image analysis (OpenCV/numpy): no windows, no screen access."""
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from functools import lru_cache
 from itertools import product
@@ -10,6 +11,21 @@ from itertools import product
 import cv2
 import numpy as np
 
+import ball_net
+
+# Neural-network ball proposals (``ball_net``, proof of concept; off by
+# default, set POOL_OVERLAY_NN_BALLS): "" off, "add" (its peaks join circle
+# finding's proposals), "only" (they replace circle finding), "trust" (a
+# confident peak that looks like cloth inside is a ball anyway);
+# "only+trust" is the measured setting. Every proposal is judged and
+# refined the same way whatever found it. Off: synthetic frames much better,
+# real frames mixed (balls under the real stick missed; see CLAUDE.md).
+NN_BALLS = os.environ.get("POOL_OVERLAY_NN_BALLS", "").strip().lower()
+# Peak score above which "trust" takes a cloth-like proposal as a ball.
+NN_TRUST = .6
+# A network proposal keeps its own centre when the rim fit moves it further
+# than this (radii).
+NN_REFINE_REACH = .25
 
 
 
@@ -4279,7 +4295,8 @@ def _rings_nearby(lightness: np.ndarray, cx: float, cy: float, radius: float, mo
 
 
 def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared: dict | None = None,
-               sites: list[tuple[float, float, float]] | None = None, cloth_coloured: bool = True):
+               sites: list[tuple[float, float, float]] | None = None, cloth_coloured: bool = True,
+               net: bool = False):
     """Ball circles in the table ROI: (x, y, r, sat, val, white_fraction, red_spot).
 
     Candidates come from circle finding on grey levels and on colour distance
@@ -4315,6 +4332,10 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
     smooth = cv2.GaussianBlur(distance, (0, 0), 1.0)
     proposals: list[tuple[int, int, int]] = []
     from_badge: set[tuple[int, int]] = set()
+    # Network proposals it is sure of ("trust" mode).
+    from_net: set[tuple[int, int]] = set()
+    net_centres: list[tuple[float, float]] = []
+    mode = NN_BALLS if net and sites is None and ball_net.available() else ""
     if sites is not None:
         # Second pass: spots where a packed ball must be (see the end), each
         # snapped onto a rim nearby and then judged like any proposal.
@@ -4323,7 +4344,7 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
             proposals.append((int(round(fx)), int(round(fy)), int(round(sr))))
         typical = float(np.median([site[2] for site in sites])) if sites else (min_r + max_r) / 2
     else:
-        for image, edge_threshold in sources:
+        for image, edge_threshold in (sources if "only" not in mode else ()):
             circles = cv2.HoughCircles(image, cv2.HOUGH_GRADIENT, dp=1.25,
                                        minDist=max(12, min_r * 1.8), param1=edge_threshold,
                                        param2=20, minRadius=min_r, maxRadius=max_r)
@@ -4339,6 +4360,32 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
                 # The colour-distance proposal comes first and wins duplicates.
                 if all((cx - px) ** 2 + (cy - py) ** 2 > (min_r * .6) ** 2 for px, py, _ in proposals):
                     proposals.append((cx, cy, r))
+        if mode:
+            # The network's ball centres (within 0.3 px typical on synthetic
+            # frames, but ~1.5 px and biased upwards on real ones: it was
+            # trained only on fake_game's balls), each snapped onto the
+            # ball's rim like a circle-finding proposal. A fit that moves it
+            # more than NN_REFINE_REACH radii has locked onto a shadow, the
+            # ghost ring or a neighbour (a ball the cloth's colour shows
+            # almost no rim), and the network's centre stays. All balls are
+            # one size: the median of the fitted sizes (one ball's fit in a
+            # rack or on a cushion can be off, and the stick filter goes by
+            # size). Circle finding's proposal wins a duplicate.
+            guess = (float(np.median([p[2] for p in proposals])) if len(proposals) >= 3
+                     else min(max(th * .0305, min_r), max_r))
+            found = ball_net.propose(roi)
+            fits = [refine_circle(smooth, nx, ny, guess) for nx, ny, _, _ in found]
+            sizes = [fr for _, _, fr in fits if min_r * .8 <= fr <= max_r * 1.1]
+            r = int(round(float(np.median(sizes)) if len(sizes) >= 3 else guess))
+            for (nx, ny, score, _), (fx, fy, fr) in zip(found, fits):
+                net_centres.append((nx, ny))
+                if np.hypot(fx - nx, fy - ny) > guess * NN_REFINE_REACH or not min_r * .8 <= fr <= max_r * 1.1:
+                    fx, fy = nx, ny
+                cx, cy = int(round(fx)), int(round(fy))
+                if all((cx - px) ** 2 + (cy - py) ** 2 > (min_r * .6) ** 2 for px, py, _ in proposals):
+                    proposals.append((cx, cy, r))
+                    if "trust" in mode and score >= NN_TRUST:
+                        from_net.add((cx, cy))
         # A ball the same colour as the cloth (the black 8 on a black table) has
         # no edge for circle finding, but its white number badge (a disc ~0.45
         # radii) stands out. Propose a ball on each such disc; the checks below
@@ -4354,7 +4401,10 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
             if not (.7 <= bw / max(1, bh) <= 1.43) or area < .55 * bw * bh:
                 continue
             cx, cy = int(round(centres[i][0])), int(round(centres[i][1]))
-            if all((cx - px) ** 2 + (cy - py) ** 2 > (min_r * .6) ** 2 for px, py, _ in proposals):
+            # (A badge is printed off the centre of a turned ball: on a ball
+            # the network proposed it would only be a worse second circle.)
+            if (all((cx - px) ** 2 + (cy - py) ** 2 > (min_r * .6) ** 2 for px, py, _ in proposals)
+                    and all((cx - px) ** 2 + (cy - py) ** 2 > typical ** 2 for px, py in net_centres)):
                 proposals.append((cx, cy, int(round(typical))))
                 from_badge.add((cx, cy))
     # Pocket centres lie just outside the cushion noses (corners ~1 inset,
@@ -4507,7 +4557,7 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
         val = float(np.median(inner[:, 2]))
         white_fraction = float(np.mean((inner[:, 1] < 90) & (inner[:, 2] > 150)))
         red_spot = float(np.mean((centre[:, 0] < 30) & (centre[:, 1] > 70) & (centre[:, 2] < 90)))
-        if cloth_fraction > .35 and not badge:
+        if cloth_fraction > .35 and not badge and (cx, cy) not in from_net:
             # Judged again below, once the balls show where their
             # highlight sits (a ball the cloth's colour, number turned away).
             cloth_like.append((cloth_fraction, cx, cy, r, sat, val, white_fraction, red_spot))
@@ -4827,7 +4877,7 @@ def detect(frame: np.ndarray) -> Detection:
     confirmed_balls: set = set()
     white_cloth = None
     shared: dict = {}
-    for cx, cy, r, sat, val, white_fraction, red_spot, open_rim in find_balls(roi, gray, min_r, max_r, shared):
+    for cx, cy, r, sat, val, white_fraction, red_spot, open_rim in find_balls(roi, gray, min_r, max_r, shared, net=True):
         ball = (x + cx, y + cy, r)
         rim_open[(x + cx, y + cy)] = open_rim
         # Keep every detection eligible as an object ball until the actual
