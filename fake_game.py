@@ -72,6 +72,10 @@ class Scene:
     # to camera, row by row); a ball not in it is turned at random, by its
     # number and position (``ball_turn``).
     turns: dict[int, tuple[float, ...]] | None = None
+    # Draw the ghost here instead of where the cue ball meets a cushion: the
+    # real game puts it in a pocket's mouth, past the cushion line, when the
+    # cue ball lies beside the pocket aimed into it (no struck ball then).
+    ghost_at: tuple[float, float] | None = None
 
 
 @dataclass
@@ -296,6 +300,8 @@ def solve_truth(scene: Scene) -> Truth:
         if 0 < s < best_s:
             best_s, target = float(s), number
     ghost = (cx + ux * best_s, cy + uy * best_s)
+    if scene.ghost_at is not None:
+        ghost, target = (float(scene.ghost_at[0]), float(scene.ghost_at[1])), None
     object_dir = cue_dir = None
     if target is not None:
         bx, by = scene.balls[target]
