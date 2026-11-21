@@ -80,6 +80,29 @@ class Model(unittest.TestCase):
             detector.NN_BALLS = old
         self.assertGreaterEqual(found, 11)
 
+    @unittest.skipUnless((Path(__file__).resolve().parents[1] / "outputs" / "nn" / "data" / "real-8bd-scenes-test"
+                          / "frames.json").is_file(), "real test frames not imported (train_ball_net.py import-real)")
+    def test_real_frames(self):
+        """Held-out real screenshots (public set, scenes never trained on):
+        with the switch on, the first 30 frames' balls are found (main:
+        288 of 305, 7 false; network: 298, 1 false)."""
+        import json
+        import train_ball_net as tbn
+        frames = json.loads((tbn.DATA / "real-8bd-scenes-test" / "frames.json").read_text())[:30]
+        if not all(Path(f["file"]).is_file() for f in frames):
+            self.skipTest("downloaded dataset not in outputs/datasets")
+        import cv2
+        import detector
+        old, threads = detector.NN_BALLS, cv2.getNumThreads()
+        try:
+            res = [tbn._eval_real_frame(("only+trust", f)) for f in frames]
+        finally:
+            detector.NN_BALLS = old
+            cv2.setNumThreads(threads)
+        total, hit, false = (sum(r[i] for r in res) for i in range(3))
+        self.assertGreaterEqual(hit, total - 10)
+        self.assertLessEqual(false, 3)
+
     def test_off_by_default(self):
         import detector
         if not os.environ.get("POOL_OVERLAY_NN_BALLS"):
