@@ -98,13 +98,16 @@ The synthetic table approximates the real game's look. It cannot replace a check
 
 `ball_net.py` is a small trained network (60k weights, `models/balls.onnx`, 0.24 MB) that can propose where the balls are instead of circle finding. It looks at the table picture shrunk to 640x320 and marks every ball centre (cue ball, solid, 8, stripe) in 6 ms on the CPU, using OpenCV's own `cv2.dnn`, so the app needs nothing new. Its marks are only proposals: each is snapped onto the ball's rim and goes through every check and fit described above, exactly like a circle-finding proposal. It does not aim, click or touch the game.
 
-It is trained only on the synthetic table (`python train_ball_net.py render`, then `train` and `export` in a separate PyTorch environment, see `requirements-train.txt`; the training pictures stay in `outputs/nn/`). Switch it on with `set POOL_OVERLAY_NN_BALLS=only+trust` before starting the app or a test.
+It is trained on the synthetic table and on real screenshots (`train_ball_net.py`: `render` draws synthetic frames, `import-real` and `split-real` bring in a public set of real screenshots with hand-drawn ball boxes, `train` and `export` run in a separate PyTorch environment, see `requirements-train.txt`). All training pictures stay in `outputs/` and are never committed; only the model is. Switch it on with `set POOL_OVERLAY_NN_BALLS=only+trust` before starting the app or a test.
+
+The real screenshots come from the public "8 ball detector" dataset by "8ball" on Roboflow Universe (https://universe.roboflow.com/8ball/8-ball-detector-jcbfd), CC BY 4.0. They are frames of a few recorded games, so they were split by scene: 489 frames from 10 scenes for training and 218 frames from 34 other scenes for testing, never trained on.
 
 What it changes, measured frame by frame against the detector without it:
-- Synthetic table (19 cloths, frames it never saw): 2384 -> 2732 of 2850 frames pass every check; near shots 1498 -> 1730 of 1900; 300 random shots 281 -> 290 (old flat balls: 2630 -> 2772, 1658 -> 1736, 291 -> 293). The black 8 on the near-black cloth is found in 243 of 250 frames instead of 69, the purple 4 on purple cloth in 248 instead of 199, and packed racks pass 539 of 570 instead of 437.
-- Real screenshots: ball centres are as good as before (about 1 px from the ball's dark outline, fewer large misses), but it misses balls that the real cue stick lies across, takes one of the stick's round ornaments for a ball, and loses a cue ball lying against a cushion beside the ghost ring. Its synthetic training does not cover what the real game looks like there.
+- Real screenshots of that set (218 test frames, 2334 balls, shown at mirror size): balls found 94.5% -> 97.1%, false balls 108 -> 14, frames with every ball right 128 -> 182.
+- Synthetic table (19 cloths, frames it never saw): 2384 -> 2736 of 2850 frames pass every check; near shots 1498 -> 1723 of 1900; 300 random shots 281 -> 287 (old flat balls: 2630 -> 2769, 1658 -> 1721, 291 -> 293). The black 8 on the near-black cloth is found in 242 of 250 frames instead of 69, the purple 4 on purple cloth in 248 instead of 199, and packed racks pass 541 of 570 instead of 437.
+- Our own real screenshots (`outputs/bad`, at mirror resolution): ball centres are as good as before (about 1 px from the ball's dark outline, fewer large misses), but it still misses balls that the cue stick lies across and takes one of the stick's round ornaments for a ball. The public set rarely shows the stick across a ball. A cue ball pressed against a cushion beside the ghost ring is found by the network but still dropped by a later check (the detector without it picks the wrong cue ball there too).
 
-So it stays off until it is trained on real frames as well.
+So it stays off until frames with the stick across balls are in its training. `frame_collector.py` saves such frames from the mirror window while you play (it only reads the picture).
 
 ## Recording shots (for fitting the game's power)
 
@@ -137,5 +140,5 @@ The real game screenshots (`outputs/example_pool_screenshot.png` and `outputs/mi
 
 ```
 .venv\Scripts\python -m unittest discover -s tests -v
-.venv\Scripts\python -m py_compile main.py detector.py capture.py overlay.py simulator_ui.py pool_physics.py fake_game.py stress_test.py live_check.py ball_net.py train_ball_net.py
+.venv\Scripts\python -m py_compile main.py detector.py capture.py overlay.py simulator_ui.py pool_physics.py fake_game.py stress_test.py live_check.py ball_net.py train_ball_net.py frame_collector.py
 ```
