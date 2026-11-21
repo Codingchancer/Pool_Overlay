@@ -20,6 +20,7 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
+| Cue ball against a cushion beside the ghost ring (real frame picks the wrong cue ball) | detector | Jartartarta | `jartartarta/cue-at-cushion` |
 
 ## Next — Jartartarta (detector / precision)
 - [ ] **Ball-proposal network, stick cases:** collect own frames with `frame_collector.py` (slow aiming with the stick across balls, cue ball against a cushion), label them (detector + network, checked by eye, never committed), retrain; switch the network on once it beats circle finding on `outputs/bad` too. Also: a cue ball against a cushion beside the ghost ring is found by the network (0.93) but dropped later in `find_balls`.
