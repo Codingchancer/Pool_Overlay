@@ -207,6 +207,178 @@ def render(count: int, split: str, workers: int):
     print(f"{split}: {count} frames in {time.time() - t:.0f} s, radius ~{np.median([r[2] for r in rows]):.1f} px")
 
 
+# --- real frames ---------------------------------------------------------------
+
+# Real screenshots in public datasets are ~640-760 px wide; the detector is
+# made for the mirror's size (~1600-2500 px), so they are scaled up first.
+REAL_SCALE = 2.5
+
+
+def import_real(root: Path, name: str, ball_class: str = "ball"):
+    """Real 8 Ball Pool screenshots with hand-drawn ball boxes (a COCO export
+    with train/valid/test folders, e.g. from Roboflow Universe) -> table
+    crops at the network's input size with every labelled ball's centre
+    (class -1: the labels give no class), in DATA/real-<name>-<split>/, and
+    frames.json there: each whole frame's path and its ball centres (frame
+    px after REAL_SCALE) for measuring the detector on it.
+
+    A frame is left out when no table is found on it (menus, the spin
+    screen, a turned copy) or it has no ball label (some exports have
+    unlabelled frames, which would teach the network that balls are not
+    balls). The splits stay as the export made them (copies of one picture
+    are in one split only)."""
+    import detector
+    for split_dir in sorted(p for p in root.iterdir() if (p / "_annotations.coco.json").is_file()):
+        split = {"valid": "val"}.get(split_dir.name, split_dir.name)
+        coco = json.loads((split_dir / "_annotations.coco.json").read_text())
+        wanted = {c["id"] for c in coco["categories"] if c["name"] == ball_class}
+        boxes: dict[int, list] = {}
+        for a in coco["annotations"]:
+            if a["category_id"] in wanted:
+                boxes.setdefault(a["image_id"], []).append(a["bbox"])
+        out = DATA / f"real-{name}-{split}"
+        out.mkdir(parents=True, exist_ok=True)
+        rows, frames, skipped = [], [], {"no table": 0, "no labels": 0}
+        for im in coco["images"]:
+            bxs = boxes.get(im["id"], [])
+            if not bxs:
+                skipped["no labels"] += 1
+                continue
+            frame = cv2.imread(str(split_dir / im["file_name"]), cv2.IMREAD_COLOR)
+            big = cv2.resize(frame, None, fx=REAL_SCALE, fy=REAL_SCALE, interpolation=cv2.INTER_CUBIC)
+            table = detector.find_table_bounds(big)
+            if table is None or not 1.7 <= table[2] / max(1, table[3]) <= 2.3 or table[2] < big.shape[1] * .4:
+                skipped["no table"] += 1
+                continue
+            x, y, w, h = table
+            # Box centre in pixel-centre coordinates of the scaled frame.
+            centres = [((bx + bw / 2) * REAL_SCALE - .5, (by + bh / 2) * REAL_SCALE - .5) for bx, by, bw, bh in bxs]
+            radius = float(np.median([(bw + bh) / 4 for _, _, bw, bh in bxs])) * REAL_SCALE
+            centres = [(cx, cy) for cx, cy in centres if x - radius <= cx <= x + w + radius
+                       and y - radius <= cy <= y + h + radius]
+            if not centres:
+                skipped["no labels"] += 1
+                continue
+            roi = big[y:y + h, x:x + w]
+            small = np.clip(np.round(bn.preprocess(roi)[0].transpose(1, 2, 0) * 255), 0, 255).astype(np.uint8)
+            stem = Path(im["file_name"]).stem
+            cv2.imwrite(str(out / f"{stem}.png"), small, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+            sx, sy = w / bn.INPUT_W, h / bn.INPUT_H
+            rows.append((f"{stem}.png", [(bn.to_input(cx - x, sx), bn.to_input(cy - y, sy), -1) for cx, cy in centres],
+                         radius / sx))
+            frames.append({"file": str(split_dir / im["file_name"]), "scale": REAL_SCALE, "table": list(table),
+                           "radius": radius, "balls": centres})
+        (out / "labels.json").write_text(json.dumps(rows))
+        (out / "frames.json").write_text(json.dumps(frames))
+        print(f"{out.name}: {len(rows)} frames, {sum(len(r[1]) for r in rows)} balls; left out {skipped}")
+
+
+def _layout_match(a, b, reach: float = 10.0) -> float:
+    """Share of balls two frames have in the same spots (input px), the
+    smaller of the two directions."""
+    pa, pb = np.array([(u, v) for u, v, _ in a]), np.array([(u, v) for u, v, _ in b])
+    d = np.hypot(pa[:, None, 0] - pb[None, :, 0], pa[:, None, 1] - pb[None, :, 1])
+    return float(min((d.min(1) < reach).mean(), (d.min(0) < reach).mean()))
+
+
+def split_real(name: str, test_share: float = .3):
+    """Re-split an imported real set by scene: public sets are frames of a
+    few recorded games, and the export's picture-by-picture split puts the
+    same layout in train and test (8 ball detector: 414 of 577 train frames).
+    Frames with half their balls in the same spots are one scene (joined
+    transitively); whole scenes go to DATA/real-<name>-scenes-test until it
+    holds ``test_share`` of each table colour's frames, the rest to
+    -scenes-train (labels only; the crops stay where import_real put them).
+    Frames whose crop is no cloth (the spin screen's huge cue ball) are
+    dropped."""
+    rows, frames = [], []
+    for split in ("train", "val", "test"):
+        d = DATA / f"real-{name}-{split}"
+        if not d.is_dir():
+            continue
+        for row, frame in zip(json.loads((d / "labels.json").read_text()), json.loads((d / "frames.json").read_text())):
+            image = cv2.imread(str(d / row[0]), cv2.IMREAD_COLOR)
+            hsv = cv2.cvtColor(image[100:220, 200:440], cv2.COLOR_BGR2HSV).reshape(-1, 3)
+            h, sat, val = np.median(hsv, axis=0)
+            if sat < 40 and val > 200:
+                continue
+            rows.append([f"../{d.name}/{row[0]}", row[1], row[2]])
+            frames.append({**frame, "colour": f"{int(h) // 12}-{int(val) // 64}"})
+    parent = list(range(len(rows)))
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    for i in range(len(rows)):
+        for j in range(i + 1, len(rows)):
+            if root(i) != root(j) and _layout_match(rows[i][1], rows[j][1]) >= .5:
+                parent[root(i)] = root(j)
+    scenes: dict[int, list[int]] = {}
+    for i in range(len(rows)):
+        scenes.setdefault(root(i), []).append(i)
+    by_colour: dict[str, list[list[int]]] = {}
+    for members in scenes.values():
+        colour = max({frames[i]["colour"] for i in members}, key=[frames[i]["colour"] for i in members].count)
+        by_colour.setdefault(colour, []).append(members)
+    test: set[int] = set()
+    rng = np.random.default_rng(7)
+    for colour, groups in sorted(by_colour.items()):
+        total = sum(len(g) for g in groups)
+        for k in rng.permutation(len(groups)):
+            if sum(len(g) for g in groups if set(g) <= test) + len(groups[k]) <= total * test_share * 1.15:
+                test.update(groups[k])
+    for part, keep in (("train", lambda i: i not in test), ("test", lambda i: i in test)):
+        out = DATA / f"real-{name}-scenes-{part}"
+        out.mkdir(parents=True, exist_ok=True)
+        idx = [i for i in range(len(rows)) if keep(i)]
+        (out / "labels.json").write_text(json.dumps([rows[i] for i in idx]))
+        (out / "frames.json").write_text(json.dumps([frames[i] for i in idx]))
+        print(f"{out.name}: {len(idx)} frames, {sum(len(rows[i][1]) for i in idx)} balls, "
+              f"{len({root(i) for i in idx})} scenes, colours {sorted({frames[i]['colour'] for i in idx})}")
+
+
+def _eval_real_frame(job):
+    mode, frame = job
+    import os as _os
+    _os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    cv2.setNumThreads(1)
+    import detector
+    detector.NN_BALLS = "" if mode == "off" else mode
+    image = cv2.imread(frame["file"], cv2.IMREAD_COLOR)
+    big = cv2.resize(image, None, fx=frame["scale"], fy=frame["scale"], interpolation=cv2.INTER_CUBIC)
+    d = detector.detect(big)
+    found = [(x, y) for x, y, _, _ in d.balls or []]
+    r = frame["radius"]
+    used, errors = set(), []
+    for bx, by in frame["balls"]:
+        dist = [np.hypot(x - bx, y - by) if k not in used else 1e9 for k, (x, y) in enumerate(found)]
+        k = int(np.argmin(dist)) if dist else -1
+        if k >= 0 and dist[k] <= r * .5:
+            used.add(k)
+            errors.append(dist[k])
+    return len(frame["balls"]), len(errors), len(found) - len(used), errors
+
+
+def eval_real(split: str, modes, workers: int = 14):
+    """Whole real frames through detect() for each NN_BALLS mode: balls found
+    (within half a radius of a labelled centre), false balls (not near any
+    label; a ball the labels missed counts here too), frames with every ball
+    right, distance to the label's box centre (frame px after REAL_SCALE)."""
+    frames = json.loads((DATA / split / "frames.json").read_text())
+    with Pool(workers) as pool:
+        for mode in modes:
+            res = pool.map(_eval_real_frame, [(mode, f) for f in frames], chunksize=2)
+            total, hit, false = (sum(r[i] for r in res) for i in range(3))
+            perfect = sum(1 for r in res if r[0] == r[1] and r[2] == 0)
+            err = np.concatenate([np.array(r[3], float) for r in res]) if hit else np.zeros(1)
+            print(f"{mode:12s} {split}: balls found {hit}/{total} ({hit / total:.1%}), false {false}, "
+                  f"frames all right {perfect}/{len(frames)}, centre vs box median {np.median(err):.2f} "
+                  f"p90 {np.percentile(err, 90):.2f} px", flush=True)
+
+
 # --- training (PyTorch) ----------------------------------------------------
 
 def build_model():
@@ -262,8 +434,12 @@ SIGMA = .7    # heatmap gaussian (output cells; a ball radius is ~1.25 cells)
 
 
 def targets(labels, h, w):
-    """Heatmaps (C, h, w), offsets (2, h, w) and their mask (h, w)."""
-    heat = np.zeros((len(bn.CLASSES), h, w), np.float32)
+    """Heatmaps (C + 1, h, w), offsets (2, h, w) and their mask (h, w).
+
+    The last heatmap is every ball whatever its class: a real frame's labels
+    (class -1) say only where balls are. Offsets are learnt from synthetic
+    labels only (a hand-drawn box's centre is good to a pixel or two)."""
+    heat = np.zeros((len(bn.CLASSES) + 1, h, w), np.float32)
     offset = np.zeros((2, h, w), np.float32)
     mask = np.zeros((h, w), np.float32)
     yy, xx = np.mgrid[0:h, 0:w]
@@ -273,10 +449,12 @@ def targets(labels, h, w):
         if not (0 <= jx < w and 0 <= jy < h):
             continue
         g = np.exp(-((xx - gu + .5) ** 2 + (yy - gv + .5) ** 2) / (2 * SIGMA ** 2))
-        heat[c] = np.maximum(heat[c], g)
-        heat[c, jy, jx] = 1.0
-        offset[:, jy, jx] = (gu - jx, gv - jy)
-        mask[jy, jx] = 1.0
+        for k in ((c, -1) if c >= 0 else (-1,)):
+            heat[k] = np.maximum(heat[k], g)
+            heat[k, jy, jx] = 1.0
+        if c >= 0:
+            offset[:, jy, jx] = (gu - jx, gv - jy)
+            mask[jy, jx] = 1.0
     return heat, offset, mask
 
 
@@ -292,6 +470,7 @@ class Frames:
     def __getitem__(self, i):
         name, labels, _ = self.rows[i]
         image = cv2.imread(str(self.dir / name), cv2.IMREAD_COLOR).astype(np.float32)
+        real = any(c < 0 for _, _, c in labels)
         if self.augment:
             rng = np.random.default_rng()
             # Display tone / white balance a little off.
@@ -300,31 +479,48 @@ class Frames:
             if rng.random() < .3:
                 image = image + rng.normal(0, rng.uniform(1, 4), image.shape)
             image = np.clip(image, 0, 255)
-        x = image.transpose(2, 0, 1) / 255.0
+            if real and rng.random() < .5:
+                # (Only class-less labels: a mirrored ball is still a ball.)
+                image = image[:, ::-1]
+                labels = [(bn.INPUT_W - 1 - u, v, c) for u, v, c in labels]
+        x = np.ascontiguousarray(image.transpose(2, 0, 1)) / 255.0
         h, w = bn.INPUT_H // bn.STRIDE, bn.INPUT_W // bn.STRIDE
         heat, offset, mask = targets(labels, h, w)
-        return x.astype(np.float32), heat, offset, mask
+        return x.astype(np.float32), heat, offset, mask, np.float32(real)
 
 
 _FRAMES = {}
 
 
 def _load_batch(job):
-    split, augment, indices = job
-    key = (split, augment)
-    if key not in _FRAMES:
-        _FRAMES[key] = Frames(split, augment)
-    items = [_FRAMES[key][i] for i in indices]
-    return tuple(np.stack([item[k] for item in items]) for k in range(4))
+    augment, samples = job
+    items = []
+    for split, i in samples:
+        key = (split, augment)
+        if key not in _FRAMES:
+            _FRAMES[key] = Frames(split, augment)
+        items.append(_FRAMES[key][i])
+    return tuple(np.stack([item[k] for item in items]) for k in range(5))
 
 
-def batches(pool, split: str, augment: bool, batch: int, shuffle: bool):
+def batches(pool, split: str, augment: bool, batch: int, shuffle: bool, real=(), real_share: float = 0.0):
     """Batches as numpy arrays, decoded by a plain multiprocessing pool
-    (PyTorch's DataLoader workers die on Windows with Python 3.15)."""
+    (PyTorch's DataLoader workers die on Windows with Python 3.15). With
+    ``real`` splits, ``real_share`` of each batch is drawn from them (with
+    repeats: there are far fewer real frames)."""
     n = len(Frames(split, False))
     order = np.random.permutation(n) if shuffle else np.arange(n)
-    stop = n - n % batch if shuffle else n
-    jobs = [(split, augment, order[i:i + batch].tolist()) for i in range(0, stop, batch)]
+    k = int(round(batch * real_share)) if real else 0
+    step = batch - k
+    stop = n - n % step if shuffle else n
+    pool_real = [(s, i) for s in real for i in range(len(Frames(s, False)))]
+    jobs = []
+    for start in range(0, stop, step):
+        samples = [(split, int(i)) for i in order[start:start + step]]
+        if k:
+            picks = np.random.randint(len(pool_real), size=k)
+            samples += [pool_real[p] for p in picks]
+        jobs.append((augment, samples))
     yield from pool.imap(_load_batch, jobs, chunksize=1)
 
 
@@ -339,12 +535,31 @@ def focal_loss(pred, gt):
     return -(pos_loss.sum() + neg_loss.sum()) / n
 
 
-def train(epochs: int, batch: int, lr: float, workers: int):
+def heat_loss(ph, heat, real):
+    """Focal loss: synthetic frames per class, real frames (class-less labels)
+    on the strongest class at each spot against the any-ball heatmap."""
+    import torch
+    loss = ph.new_zeros(())
+    synth = real < .5
+    if synth.any():
+        loss = loss + focal_loss(ph[synth], heat[synth, :-1])
+    if (~synth).any():
+        loss = loss + focal_loss(ph[~synth].max(dim=1).values, heat[~synth, -1])
+    return loss
+
+
+def train(epochs: int, batch: int, lr: float, workers: int, real=(), real_share: float = .25,
+          init: str | None = None, val_real=()):
     import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = build_model().to(device)
-    print(f"{sum(p.numel() for p in model.parameters())} weights on {device}")
-    steps = len(Frames("train", False)) // batch
+    if init:
+        model.load_state_dict(torch.load(init, map_location=device))
+        print(f"starting from {init}")
+    print(f"{sum(p.numel() for p in model.parameters())} weights on {device}; real {list(real)} "
+          f"({real_share:.0%} of each batch)")
+    step = batch - (int(round(batch * real_share)) if real else 0)
+    steps = len(Frames("train", False)) // step
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.OneCycleLR(opt, lr, total_steps=epochs * steps, pct_start=.1)
     best = float("inf")
@@ -353,34 +568,37 @@ def train(epochs: int, batch: int, lr: float, workers: int):
     def to_device(arrays):
         return (torch.from_numpy(v).to(device, non_blocking=True) for v in arrays)
 
+    def loss_of(arrays):
+        x, heat, offset, mask, is_real = to_device(arrays)
+        with torch.autocast(device, dtype=torch.bfloat16, enabled=device == "cuda"):
+            ph, po = model(x)
+        ph, po = ph.float(), po.float()
+        return heat_loss(ph, heat, is_real) + ((po - offset).abs() * mask[:, None]).sum() / mask.sum().clamp(min=1)
+
     for epoch in range(epochs):
         model.train()
         t, total = time.time(), 0.0
-        for arrays in batches(pool, "train", True, batch, True):
-            x, heat, offset, mask = to_device(arrays)
-            with torch.autocast(device, dtype=torch.bfloat16, enabled=device == "cuda"):
-                ph, po = model(x)
-            ph, po = ph.float(), po.float()
-            loss = focal_loss(ph, heat) + ((po - offset).abs() * mask[:, None]).sum() / mask.sum().clamp(min=1)
+        for arrays in batches(pool, "train", True, batch, True, real, real_share):
+            loss = loss_of(arrays)
             opt.zero_grad(set_to_none=True)
             loss.backward()
             opt.step()
             sched.step()
             total += float(loss.detach())
         model.eval()
-        val, count = 0.0, 0
+        vals = []
         with torch.no_grad():
-            for arrays in batches(pool, "val", False, batch, False):
-                x, heat, offset, mask = to_device(arrays)
-                ph, po = model(x)
-                val += float(focal_loss(ph, heat) + ((po - offset).abs() * mask[:, None]).sum()
-                             / mask.sum().clamp(min=1))
-                count += 1
-        val /= count
-        print(f"epoch {epoch + 1}/{epochs}: train {total / steps:.4f} val {val:.4f} "
+            for split in ["val", *val_real]:
+                losses = [float(loss_of(arrays)) for arrays in batches(pool, split, False, batch, False)]
+                vals.append(float(np.mean(losses)))
+        val = float(sum(vals))
+        print(f"epoch {epoch + 1}/{epochs}: train {total / steps:.4f} val {' + '.join(f'{v:.4f}' for v in vals)} "
               f"({time.time() - t:.0f} s)", flush=True)
-        if val < best:
-            best = val
+        # Fine-tuning on real frames keeps the last epoch: the synthetic
+        # validation loss would favour forgetting them, and the real test
+        # frames must not choose the model.
+        if val < best or real:
+            best = min(best, val)
             CHECKPOINT.parent.mkdir(parents=True, exist_ok=True)
             torch.save(model.state_dict(), CHECKPOINT)
     pool.close()
@@ -441,6 +659,20 @@ def main():
     t.add_argument("--batch", type=int, default=32)
     t.add_argument("--lr", type=float, default=3e-3)
     t.add_argument("--workers", type=int, default=6)
+    t.add_argument("--real", default="", help="real splits to mix in, comma-separated (e.g. real-8bd-train)")
+    t.add_argument("--real-share", type=float, default=.25, help="share of each batch from the real splits")
+    t.add_argument("--val-real", default="", help="real splits to report validation loss on")
+    t.add_argument("--init", default=None, help="checkpoint to start from (fine-tuning)")
+    i = sub.add_parser("import-real")
+    i.add_argument("root", help="COCO export folder with train/valid/test subfolders")
+    i.add_argument("--name", required=True)
+    i.add_argument("--ball-class", default="ball")
+    er = sub.add_parser("eval-real")
+    er.add_argument("--split", default="real-8bd-scenes-test")
+    er.add_argument("--modes", default="off,only+trust")
+    sp = sub.add_parser("split-real")
+    sp.add_argument("--name", required=True)
+    sp.add_argument("--test-share", type=float, default=.3)
     e = sub.add_parser("export")
     e.add_argument("--out", default=str(bn.MODEL_PATH))
     v = sub.add_parser("eval")
@@ -452,7 +684,15 @@ def main():
         if args.val:
             render(args.val, "val", args.workers)
     elif args.cmd == "train":
-        train(args.epochs, args.batch, args.lr, args.workers)
+        split_list = lambda text: [p for p in text.split(",") if p]
+        train(args.epochs, args.batch, args.lr, args.workers, split_list(args.real), args.real_share, args.init,
+              split_list(args.val_real))
+    elif args.cmd == "import-real":
+        import_real(Path(args.root), args.name, args.ball_class)
+    elif args.cmd == "eval-real":
+        eval_real(args.split, args.modes.split(","))
+    elif args.cmd == "split-real":
+        split_real(args.name, args.test_share)
     elif args.cmd == "export":
         export(Path(args.out))
     elif args.cmd == "eval":
