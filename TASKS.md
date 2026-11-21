@@ -20,9 +20,9 @@ Border rules:
 ## In progress
 | Task | Area | Who | Branch |
 |---|---|---|---|
+| Ball-proposal network on real frames | detector | Jartartarta | `jartartarta/nn-real` |
 
 ## Next — Jartartarta (detector / precision)
-- [ ] **Ball-proposal network on real frames:** add real frames to its training (labelled by the detector, checked by eye, never committed), above all balls under the cue stick, the stick's ornaments and a cue ball against a cushion beside the ghost ring; switch it on only once it beats circle finding on the real screenshots too.
 - [ ] **Power needed for a shot:** record ~20-30 real shots (slider % at release + where the balls stop) to fit Miniclip's friction and the %-to-speed scale per cue; then compute the minimum power to pot and add it to `Detection` for Codingchancer to mark on the slider. Also confirm the slider reading on a mid-drag and a full-power frame.
 - [ ] **Real-game precision:** play with the guide on; wherever the guide's aim line, target ball or object/cue path does not sit exactly on the game's own white lines, save the frame (set `POOL_OVERLAY_DEBUG_DIR`, keep `capture.png`/`cleaned.png`) and have your Claude fix the detector. Keep real screenshots out of git (`outputs/` is ignored; the repo is public).
 - [ ] **Real-game tests:** turn the saved bad frames into tests that skip when the image is missing (like the existing screenshot tests), so fixes stay fixed.
