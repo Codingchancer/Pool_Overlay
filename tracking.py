@@ -138,7 +138,7 @@ class ShotTracker:
         x, y, w, h = base.table
         roi = frame[y:y + h, x:x + w]
         hint = self.hint if self.hinted_reads < self.FULL_READ_EVERY else None
-        shot = predict_shot(roi, base.table, base.balls, base.cue, hint=hint)
+        shot = predict_shot(roi, base.table, base.balls, base.cue, hint=hint, frame=frame)
         self.last_was_fast = bool(shot.get("fast"))
         self.hinted_reads = self.hinted_reads + 1 if self.last_was_fast else 0
         self.hint = shot.get("hint")

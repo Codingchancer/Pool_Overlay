@@ -721,6 +721,55 @@ def find_ghost_ring(roi: np.ndarray, radius: float, hsv: np.ndarray | None = Non
     return None if best is None else (best[0] + ox, best[1] + oy, best[2], best[3])
 
 
+# A ghost ring can lie past the cushion line, in a pocket's mouth: the cue
+# ball against a cushion beside a corner, aimed into the pocket (real frame:
+# the ring's centre 1 px outside the table, more than half of it beyond the
+# table crop, so neither the ray nor the ring was found and another ball was
+# taken for the cue ball). Ring lookups read the table with RING_MARGIN ball
+# radii round it, and take a ring centred within RING_REACH radii of it.
+RING_MARGIN = 2.5
+RING_REACH = 1.5
+# With no ghost found along a ray, a ring up to SHORT_RAY radii from the cue
+# ball is its ghost when its centre lies within EDGE_RING radii of the
+# cushion line (either side): a short ray at a cushion or into a pocket.
+EDGE_RING = 1.0
+
+
+def ring_view(frame: np.ndarray | None, table: tuple[int, int, int, int], radius: float, roi: np.ndarray):
+    """(picture, ox, oy, table size): the table with RING_MARGIN radii round
+    it (clipped to the frame) and where the table's top-left corner lies in
+    it. Without ``frame``, the table crop itself."""
+    x, y, w, h = table
+    if frame is None:
+        return roi, 0, 0, (w, h)
+    # (An even margin, where the frame allows: the ring search works at
+    # half size, and its grid then lies on the table crop's.)
+    m = 2 * int(np.ceil(radius * RING_MARGIN / 2))
+    fh, fw = frame.shape[:2]
+    x0, y0 = max(0, x - m), max(0, y - m)
+    x0, y0 = x0 + (x - x0) % 2, y0 + (y - y0) % 2
+    x1, y1 = min(fw, x + w + m), min(fh, y + h + m)
+    return frame[y0:y1, x0:x1], x - x0, y - y0, (w, h)
+
+
+def find_ring_in_view(view, radius: float, hsv: np.ndarray | None = None,
+                      around: tuple[float, float, float] | None = None):
+    """``find_ghost_ring`` on a ``ring_view``, in table-crop coordinates.
+    ``hsv`` (the table crop's) is used only when the view is the crop."""
+    image, ox, oy, (w, h) = view
+    if around is not None:
+        around = (around[0] + ox, around[1] + oy, around[2])
+    crop = ox == 0 and oy == 0 and image.shape[:2] == (h, w)
+    ring = find_ghost_ring(image, radius, hsv=hsv if crop else None, around=around)
+    if ring is None:
+        return None
+    rx, ry = ring[0] - ox, ring[1] - oy
+    reach = radius * RING_REACH
+    if not (-reach <= rx <= w + reach and -reach <= ry <= h + reach):
+        return None
+    return (rx, ry, ring[2], ring[3])
+
+
 # Ring search: at most this many proposed spots, each with at least this
 # share of a circle on (dilated) thin ridges.
 RING_PROPOSALS = 24
@@ -1597,7 +1646,7 @@ def stick_pull(roi: np.ndarray, cue_local: tuple[float, float], aim: tuple[float
 
 def predict_shot(roi: np.ndarray, table: tuple[int, int, int, int],
                  balls: list[tuple[int, int, int, str]], cue: tuple[int, int, int],
-                 hint: dict | None = None) -> dict:
+                 hint: dict | None = None, frame: np.ndarray | None = None) -> dict:
     """Follow the game's aim graphics and estimate cue/object paths.
 
     Returns a dict with aim/cue/object segments, target, ghost, blockers,
@@ -1609,9 +1658,12 @@ def predict_shot(roi: np.ndarray, table: tuple[int, int, int, int],
     ring is first looked for near where it was, along last frame's aim,
     instead of scanning every ray direction (most of the time).
     ``shot["fast"]`` says whether that worked.
+
+    ``frame`` (the whole frame ``roi`` was cut from) lets the ghost ring be
+    found past the cushion line, in a pocket's mouth (``ring_view``).
     """
     info: dict = {}
-    shot = _predict_paths(roi, table, balls, cue, hint, info)
+    shot = _predict_paths(roi, table, balls, cue, hint, info, frame)
     pull = None
     if shot.get("aim_dir") is not None:
         ball_r = float(np.median([br for _, _, br, _ in balls])) if balls else float(cue[2])
@@ -1779,7 +1831,8 @@ def ray_reaches(white: np.ndarray, cue: tuple[float, float, float], ghost: tuple
 
 def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
                    balls: list[tuple[int, int, int, str]], cue: tuple[int, int, int],
-                   hint: dict | None = None, info: dict | None = None) -> dict:
+                   hint: dict | None = None, info: dict | None = None,
+                   frame: np.ndarray | None = None) -> dict:
     """Follow the game's aim graphics and estimate cue/object paths.
 
     Returns a dict with aim/cue/object segments, target, ghost, blockers and a
@@ -1796,6 +1849,7 @@ def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
     # slightly noisy Hough radius.
     ball_r = float(np.median([br for _, _, br, _ in balls])) if balls else float(cr)
     roi_hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+    view = ring_view(frame, table, ball_r, roi)
     windows = None
     if hint is not None:
         # The hinted read only reads lines near last frame's aim: along the
@@ -1872,13 +1926,13 @@ def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
     if ghost is not None and np.hypot(ghost[0] - cue_local[0], ghost[1] - cue_local[1]) <= ball_r * RING_OVERLAP:
         # A ring overlapping the cue ball: the ring score is pulled by the
         # ball's face (3 px on synthetic near shots); fit it on its stroke.
-        exact = find_ghost_ring(roi, ball_r, hsv=roi_hsv, around=(ghost[0], ghost[1], ball_r * .5))
+        exact = find_ring_in_view(view, ball_r, hsv=roi_hsv, around=(ghost[0], ghost[1], ball_r * .5))
         if exact is not None:
             ghost = (exact[0], exact[1], exact[2], ghost[3])
     elif (ghost is not None and np.hypot(ghost[0] - cue_local[0], ghost[1] - cue_local[1]) <= ball_r * SHORT_RAY
-          and find_ghost_ring(roi, ball_r, hsv=roi_hsv, around=(ghost[0], ghost[1], ball_r * .5)) is None
-          and find_ghost_ring(roi, ball_r, hsv=roi_hsv,
-                              around=(cue_local[0], cue_local[1], ball_r * RING_OVERLAP)) is not None):
+          and find_ring_in_view(view, ball_r, hsv=roi_hsv, around=(ghost[0], ghost[1], ball_r * .5)) is None
+          and find_ring_in_view(view, ball_r, hsv=roi_hsv,
+                                around=(cue_local[0], cue_local[1], ball_r * RING_OVERLAP)) is not None):
         # A "ghost" a short ray away that is not the game's ring (white bits
         # of the struck ball and the ring's arc beside it can pass the ring
         # score), while the game's ring lies on the cue ball: a near shot.
@@ -1900,8 +1954,18 @@ def _predict_paths(roi: np.ndarray, table: tuple[int, int, int, int],
         # The ghost ring itself, found on its own stroke on top of the cue
         # ball, places the ghost exactly (0.05 px typical against 0.14 from
         # the object line, which can also not be read at all).
-        on_cue = find_ghost_ring(roi, ball_r, hsv=roi_hsv,
-                                 around=(cue_local[0], cue_local[1], ball_r * RING_OVERLAP))
+        on_cue = find_ring_in_view(view, ball_r, hsv=roi_hsv,
+                                   around=(cue_local[0], cue_local[1], ball_r * RING_OVERLAP))
+        if on_cue is None and near_ghost is None and ghost is None:
+            # The cue ball against a cushion beside a pocket, aimed into it:
+            # the ring lies in the pocket's mouth, past the cushion line, a
+            # little further than a ring on the cue ball, and the ray is
+            # mostly drawn on the cue ball itself (too short to scan).
+            beyond = find_ring_in_view(view, ball_r, hsv=roi_hsv,
+                                       around=(cue_local[0], cue_local[1], ball_r * SHORT_RAY))
+            if beyond is not None and min(beyond[0], width - beyond[0], beyond[1],
+                                          height - beyond[1]) <= ball_r * EDGE_RING:
+                on_cue = beyond
         if on_cue is not None and np.hypot(on_cue[0] - cue_local[0], on_cue[1] - cue_local[1]) >= ball_r * .2:
             agrees = near_ghost is not None and np.hypot(near_ghost[0] - on_cue[0],
                                                          near_ghost[1] - on_cue[1]) <= ball_r * .3
@@ -3024,6 +3088,16 @@ def stick_direction_near(roi: np.ndarray, cue_xy: tuple[float, float], ghost_xy:
         return None
     rough = (rx / norm, ry / norm)
     h, w = roi.shape[:2]
+    # The stick must lie on the cloth behind the cue ball: along a cushion
+    # (the cue ball against it, the stick over the cushion and off the
+    # table) the cushion's straight edge passes for the stick's side (real
+    # frame: 1.8 degrees read against 7.2 from the cue ball to the ring).
+    along = np.arange(1.5, 8.01, .5) * radius
+    sx, sy = cx - rough[0] * along, cy - rough[1] * along
+    margin = radius * STICK_CLOTH_MARGIN
+    on_cloth = (sx >= margin) & (sx <= w - margin) & (sy >= margin) & (sy <= h - margin)
+    if float(np.mean(on_cloth)) < STICK_ON_CLOTH:
+        return None
     reach = int(radius * 16)
     x0, x1 = max(0, int(cx) - reach), min(w, int(cx) + reach + 1)
     y0, y1 = max(0, int(cy) - reach), min(h, int(cy) + reach + 1)
@@ -3173,6 +3247,11 @@ def _stick_edge_direction(gray: np.ndarray, cue_xy, rough, radius: float) -> tup
 # How far (degrees) the stick may point from the ghost's direction when that
 # is read from a ghost on top of the cue ball.
 STICK_AIM_GATE = 45.0
+# The stick is read near the cue ball only when this share of its first 8
+# radii behind the ball lies on the cloth, STICK_CLOTH_MARGIN radii from
+# the table's edge.
+STICK_ON_CLOTH = .6
+STICK_CLOTH_MARGIN = .5
 # Off-cloth shade (grey levels) of the stick against the cloth around it,
 # and the shortest run of it (ball radii) behind the cue ball.
 STICK_SHADE = 20.0
@@ -4421,7 +4500,10 @@ def find_balls(roi: np.ndarray, gray: np.ndarray, min_r: int, max_r: int, shared
             continue
         # Ignore partial circles cut by the rail line. A ball frozen to a
         # cushion has its centre exactly one radius from the edge and stays.
-        if min(cx, cy, tw - cx, th - cy) < r * .75:
+        # (Not a ball the network is sure of: it marks whole balls only, and
+        # its centres on real frames sit 1-2 px high: a cue ball against the
+        # top cushion was put 11 px from it, radius 15, and dropped.)
+        if min(cx, cy, tw - cx, th - cy) < r * .75 and (cx, cy) not in from_net:
             continue
         # A ball sitting in the jaws of a pocket is about to drop.
         if min((cx - px) ** 2 + (cy - py) ** 2 for px, py in pockets_local) < (r * 1.6) ** 2:
@@ -5014,8 +5096,9 @@ def detect(frame: np.ndarray) -> Detection:
         # ball can end at a striped ball, and the ring overlapping the cue
         # ball can read as a ring further on (synthetic near shots 40053,
         # 40004 on blue).
-        ray_to_ghost = seen is not None and find_ghost_ring(roi, radius, hsv=roi_hsv,
-                                                            around=(seen[0], seen[1], radius * .5)) is not None
+        view = ring_view(frame, table, radius, roi)
+        ray_to_ghost = seen is not None and find_ring_in_view(view, radius, hsv=roi_hsv,
+                                                              around=(seen[0], seen[1], radius * .5)) is not None
         if not ray_to_ghost:
             # No ray was read out to a ghost: the struck ball may lie right
             # next to the cue ball, its ring on top of the cue ball and the
@@ -5024,7 +5107,7 @@ def detect(frame: np.ndarray) -> Detection:
             # struck ball only touches it. So the ball under the ring found
             # anywhere on the table is the cue ball (synthetic near shots on
             # blue: wrong cue ball in 9 of 100 before).
-            ring = find_ghost_ring(roi, radius, hsv=roi_hsv)
+            ring = find_ring_in_view(view, radius, hsv=roi_hsv)
             if ring is not None:
                 ghost_ring = (ring[0] + x, ring[1] + y, ring[2])
                 lines = guide if ray_candidates else white_guide_mask(
@@ -5046,6 +5129,16 @@ def detect(frame: np.ndarray) -> Detection:
                         rim_open[(bx, by)] = found[7]
                         cue_candidates.append(under)
                         balls.append((bx, by, found[2], "ball"))
+                if under is None and min(ring[0], tw - ring[0], ring[1], th - ring[1]) <= radius * EDGE_RING:
+                    # The ring at the cushion line or in a pocket's mouth with
+                    # the cue ball against the cushion beside it, a little
+                    # further than a ring on the cue ball (synthetic: 1.9-2.4
+                    # radii; the stick lies off the table and picked another
+                    # ball): the nearest white ball within a short ray.
+                    close = [c for c in cue_candidates if id(c) not in striped and c[5] >= .68
+                             and np.hypot(c[0] - ghost_ring[0], c[1] - ghost_ring[1]) <= radius * SHORT_RAY]
+                    if close:
+                        under = min(close, key=lambda c: np.hypot(c[0] - ghost_ring[0], c[1] - ghost_ring[1]))
                 if under is not None:
                     cue = under
         if cue:
@@ -5143,7 +5236,7 @@ def detect(frame: np.ndarray) -> Detection:
         return Detection(table=table, balls=[], power_slider=slider, power_percent=read_power_slider(frame, slider),
                          note=f"Table found · {len(balls)} circle candidates · too many to track confidently")
     if cue:
-        shot = predict_shot(roi, table, balls, cue[:3])
+        shot = predict_shot(roi, table, balls, cue[:3], frame=frame)
 
         def stick_pass(balls, shot, aim_before):
             """Filter the stick's rings along the aim just read when that
@@ -5169,7 +5262,7 @@ def detect(frame: np.ndarray) -> Detection:
                     offset=(x, y), body={(c[0], c[1]): (c[3], c[4], c[5]) for c in cue_candidates},
                     confirmed=confirmed_balls, white_cloth=white_cloth is not None, rings_only=not fresh)
                 if len(filtered) != len(balls):
-                    return filtered, predict_shot(roi, table, filtered, cue[:3])
+                    return filtered, predict_shot(roi, table, filtered, cue[:3], frame=frame)
             return balls, shot
 
         # The aim used for the cue-stick filter above can be wrong (the ghost
@@ -5190,7 +5283,7 @@ def detect(frame: np.ndarray) -> Detection:
             cleaned = [b for b in balls if b[3] == "cue" or np.hypot(b[0] - gx, b[1] - gy) > gr * GHOST_OVERLAP]
             if len(cleaned) == len(balls):
                 return balls, shot
-            return cleaned, predict_shot(roi, table, cleaned, cue[:3])
+            return cleaned, predict_shot(roi, table, cleaned, cue[:3], frame=frame)
 
         balls, shot = drop_ring_ball(balls, shot)
         ring_on_cue = None
@@ -5239,7 +5332,7 @@ def detect(frame: np.ndarray) -> Detection:
             if moved != tuple(cue[:2]) and np.hypot(moved[0] - cue[0], moved[1] - cue[1]) <= radius * 1.2:
                 balls = [(moved[0], moved[1], b[2], b[3]) if b[3] == "cue" else b for b in balls]
                 cue = (moved[0], moved[1], *cue[2:])
-                shot = predict_shot(roi, table, balls, cue[:3])
+                shot = predict_shot(roi, table, balls, cue[:3], frame=frame)
                 # The aim is read from the real cue ball now (it was read
                 # from the ring before): its stick's rings go along it.
                 balls, shot = stick_pass(balls, shot, None)
