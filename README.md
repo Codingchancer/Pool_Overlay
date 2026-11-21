@@ -94,6 +94,18 @@ Known limits found this way:
 
 The synthetic table approximates the real game's look. It cannot replace a check on the real AirPlay mirror.
 
+## Neural-network ball finder (experiment, off)
+
+`ball_net.py` is a small trained network (60k weights, `models/balls.onnx`, 0.24 MB) that can propose where the balls are instead of circle finding. It looks at the table picture shrunk to 640x320 and marks every ball centre (cue ball, solid, 8, stripe) in 6 ms on the CPU, using OpenCV's own `cv2.dnn`, so the app needs nothing new. Its marks are only proposals: each is snapped onto the ball's rim and goes through every check and fit described above, exactly like a circle-finding proposal. It does not aim, click or touch the game.
+
+It is trained only on the synthetic table (`python train_ball_net.py render`, then `train` and `export` in a separate PyTorch environment, see `requirements-train.txt`; the training pictures stay in `outputs/nn/`). Switch it on with `set POOL_OVERLAY_NN_BALLS=only+trust` before starting the app or a test.
+
+What it changes, measured frame by frame against the detector without it:
+- Synthetic table (19 cloths, frames it never saw): 2384 -> 2732 of 2850 frames pass every check; near shots 1498 -> 1730 of 1900; 300 random shots 281 -> 290 (old flat balls: 2630 -> 2772, 1658 -> 1736, 291 -> 293). The black 8 on the near-black cloth is found in 243 of 250 frames instead of 69, the purple 4 on purple cloth in 248 instead of 199, and packed racks pass 539 of 570 instead of 437.
+- Real screenshots: ball centres are as good as before (about 1 px from the ball's dark outline, fewer large misses), but it misses balls that the real cue stick lies across, takes one of the stick's round ornaments for a ball, and loses a cue ball lying against a cushion beside the ghost ring. Its synthetic training does not cover what the real game looks like there.
+
+So it stays off until it is trained on real frames as well.
+
 ## Recording shots (for fitting the game's power)
 
 `shot_recorder.py` logs real shots so the game's power and friction can be fitted. It only reads the mirror window's picture: it never clicks, aims or sends input.
@@ -125,5 +137,5 @@ The real game screenshots (`outputs/example_pool_screenshot.png` and `outputs/mi
 
 ```
 .venv\Scripts\python -m unittest discover -s tests -v
-.venv\Scripts\python -m py_compile main.py detector.py capture.py overlay.py simulator_ui.py pool_physics.py fake_game.py stress_test.py live_check.py
+.venv\Scripts\python -m py_compile main.py detector.py capture.py overlay.py simulator_ui.py pool_physics.py fake_game.py stress_test.py live_check.py ball_net.py train_ball_net.py
 ```
